@@ -11,8 +11,9 @@ from typing import Tuple
 import torch
 import torch.nn.functional as F
 
+from pithtrain.contexts import training
 from pithtrain.operators.grouped_linear import GroupedLinear
-from pithtrain.operators.token_scatter import _GEMM_ALLOC_ALIGNMENT, scatter_for_grouped_gemm
+from pithtrain.operators.token_scatter import scatter_for_grouped_gemm
 
 
 def reference_grouped_linear_forward(
@@ -402,22 +403,23 @@ def test_scatter_for_grouped_gemm():
         assert offs_new.shape == (num_groups,), f"offs shape {offs_new.shape} != ({num_groups},)"
         assert offs_new.dtype == torch.int32
 
-        # Verify output shape: over-allocated up to _GEMM_ALLOC_ALIGNMENT for
-        # allocator-friendliness, and rows in [offs[-1], out.shape[0]) zeroed
-        # by the scatter kernel so downstream grouped_mm is safe.
-        m_padded = offs_new[-1].item()
-        assert out_new.shape[0] >= m_padded, f"output rows {out_new.shape[0]} < offs[-1]={m_padded}"
-        assert out_new.shape[0] % _GEMM_ALLOC_ALIGNMENT == 0, (
-            f"output rows {out_new.shape[0]} not aligned to {_GEMM_ALLOC_ALIGNMENT}"
+        # The allocation is rounded up internally, but the public result is
+        # narrowed to the sum of per-expert padded token counts. Derive that
+        # contract from the input assignments, independently of the kernel.
+        counts = torch.bincount(expert_idxs, minlength=num_groups).tolist()
+        expected_ks = [
+            (count + padding_alignment - 1) // padding_alignment * padding_alignment
+            for count in counts
+        ]
+        expected_ks_tensor = torch.tensor(expected_ks, device=device, dtype=torch.int32)
+        expected_offs = expected_ks_tensor.cumsum(0, dtype=torch.int32)
+        assert ks_new == expected_ks, f"{test_name}: incorrect per-expert sizes"
+        assert torch.equal(ks_tensor_new, expected_ks_tensor), test_name
+        assert torch.equal(offs_new, expected_offs), test_name
+        expected_shape = (sum(expected_ks), hidden_size)
+        assert out_new.shape == expected_shape, (
+            f"{test_name}: output shape {out_new.shape} != {expected_shape}"
         )
-        assert out_new.shape[1] == hidden_size, (
-            f"output cols {out_new.shape[1]} != hidden_size={hidden_size}"
-        )
-        if out_new.shape[0] > m_padded:
-            tail = out_new[m_padded:]
-            assert torch.all(tail == 0), (
-                f"over-allocated tail [{m_padded}:{out_new.shape[0]}) must be zero"
-            )
 
         # Verify reverse_shuffle_idxs
         assert reverse_new.shape == (m,)
@@ -645,7 +647,7 @@ def test_grouped_linear_weight_grad_store():
         WeightGradStore.clear()
 
 
-def test_gpt_oss_experts_weight_grad_store_matches_direct():
+def test_gpt_oss_experts_weight_grad_store_matches_direct(monkeypatch):
     """
     End-to-end sanity check: GptOssExperts (now backed by GroupedLinearFunc for
     the expert GEMMs) produces the same input / weight / bias gradients whether
@@ -657,6 +659,10 @@ def test_gpt_oss_experts_weight_grad_store_matches_direct():
     """
     from pithtrain.models.gpt_oss import GptOssExperts
     from pithtrain.pipeline.execution import WeightGradStore
+
+    # This standalone BF16 test does not call setup_training. Restore the
+    # previous context value (or its absence) when the test finishes.
+    monkeypatch.setattr(training, "fp8", False, raising=False)
 
     device = torch.device("cuda")
     dtype = torch.bfloat16
