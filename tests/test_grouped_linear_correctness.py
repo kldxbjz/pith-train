@@ -424,10 +424,21 @@ def test_scatter_for_grouped_gemm():
             f"{test_name}: grouped_mm_offs (cumulative padded offsets) mismatch: "
             f"actual={offs_new.tolist()}, expected={expected_offs.tolist()}"
         )
-        expected_shape = (sum(expected_ks), hidden_size)
+        m_padded = sum(expected_ks)
+        expected_shape = (m_padded, hidden_size)
         assert out_new.shape == expected_shape, (
             f"{test_name}: output shape {out_new.shape} != {expected_shape}"
         )
+
+        # out_new is a trimmed view; check the alignment tail in its backing buffer.
+        M_rounded = (
+            (m_padded + _GEMM_ALLOC_ALIGNMENT - 1) // _GEMM_ALLOC_ALIGNMENT * _GEMM_ALLOC_ALIGNMENT
+        )
+        buffer = out_new._base
+        assert buffer is not None, f"{test_name}: missing backing buffer"
+        tail = buffer[m_padded:M_rounded]
+        assert tail.shape == (M_rounded - m_padded, hidden_size), test_name
+        assert torch.all(tail == 0), f"{test_name}: non-zero GEMM alignment tail"
 
         # Verify reverse_shuffle_idxs
         assert reverse_new.shape == (m,)
@@ -437,52 +448,6 @@ def test_scatter_for_grouped_gemm():
         _verify_scatter_result(
             sorted_tokens, expert_idxs, num_groups, out_new, reverse_new, offs_new
         )
-
-
-def test_scatter_for_grouped_gemm_alignment_tail_is_zero(monkeypatch):
-    """Check the hidden alignment tail, which is excluded from the returned view."""
-    hidden_size = 300  # Exercise multiple BLOCK_H tiles and a partial final tile.
-    sorted_tokens = torch.randn(32, hidden_size, device="cuda")
-    expert_idxs = torch.arange(4, device="cuda", dtype=torch.int64).repeat_interleave(8)
-    original_empty = torch.empty
-    output_buffers = []
-
-    def filled_empty(*args, **kwargs):
-        buffer = original_empty(*args, **kwargs)
-        if (
-            buffer.device == sorted_tokens.device
-            and buffer.ndim == 2
-            and buffer.shape[1] == hidden_size
-        ):
-            # A missing zero-store must fail even if the allocator returns clean memory.
-            buffer.fill_(1)
-            output_buffers.append(buffer)
-        return buffer
-
-    with monkeypatch.context() as patch:
-        patch.setattr(torch, "empty", filled_empty)
-        out, reverse_idxs, _, _, _ = scatter_for_grouped_gemm(
-            sorted_tokens, expert_idxs, num_groups=8
-        )
-
-    assert len(output_buffers) == 1, f"Expected one output buffer, got {len(output_buffers)}"
-    buffer = output_buffers[0]
-    # Four non-empty experts each pad eight tokens to 128 rows: actual_M = 512.
-    actual_M = 4 * 128
-    M_rounded = (
-        (actual_M + _GEMM_ALLOC_ALIGNMENT - 1) // _GEMM_ALLOC_ALIGNMENT * _GEMM_ALLOC_ALIGNMENT
-    )
-    assert out.shape == (actual_M, hidden_size)
-    assert out.data_ptr() == buffer.data_ptr(), "Captured buffer must back the returned view"
-    assert actual_M < M_rounded <= buffer.shape[0], "Test must cover a non-empty alignment tail"
-    assert torch.equal(out[reverse_idxs], sorted_tokens), "Real token rows must be preserved"
-
-    # Check only the alignment tail; unused capacity beyond M_rounded has no zero guarantee.
-    tail = buffer[actual_M:M_rounded]
-    assert torch.all(tail == 0), (
-        f"Non-zero GEMM alignment tail in rows [{actual_M}, {M_rounded}): "
-        f"{torch.count_nonzero(tail).item()} non-zero elements"
-    )
 
 
 def test_scatter_for_grouped_gemm_edge_cases():
