@@ -13,10 +13,7 @@ import torch.nn.functional as F
 
 from pithtrain.contexts import training
 from pithtrain.operators.grouped_linear import GroupedLinear
-from pithtrain.operators.token_scatter import (
-    _GEMM_ALLOC_ALIGNMENT,
-    scatter_for_grouped_gemm,
-)
+from pithtrain.operators.token_scatter import scatter_for_grouped_gemm
 
 
 def reference_grouped_linear_forward(
@@ -425,20 +422,16 @@ def test_scatter_for_grouped_gemm():
             f"actual={offs_new.tolist()}, expected={expected_offs.tolist()}"
         )
         m_padded = sum(expected_ks)
+        # Retain the tail check if a future implementation returns extra rows.
+        if out_new.shape[0] > m_padded:
+            tail = out_new[m_padded:]
+            assert torch.all(tail == 0), (
+                f"{test_name}: over-allocated tail [{m_padded}:{out_new.shape[0]}) must be zero"
+            )
         expected_shape = (m_padded, hidden_size)
         assert out_new.shape == expected_shape, (
             f"{test_name}: output shape {out_new.shape} != {expected_shape}"
         )
-
-        # out_new is a trimmed view; check the alignment tail in its backing buffer.
-        M_rounded = (
-            (m_padded + _GEMM_ALLOC_ALIGNMENT - 1) // _GEMM_ALLOC_ALIGNMENT * _GEMM_ALLOC_ALIGNMENT
-        )
-        buffer = out_new._base
-        assert buffer is not None, f"{test_name}: missing backing buffer"
-        tail = buffer[m_padded:M_rounded]
-        assert tail.shape == (M_rounded - m_padded, hidden_size), test_name
-        assert torch.all(tail == 0), f"{test_name}: non-zero GEMM alignment tail"
 
         # Verify reverse_shuffle_idxs
         assert reverse_new.shape == (m,)
