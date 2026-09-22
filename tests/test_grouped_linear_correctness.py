@@ -13,7 +13,10 @@ import torch.nn.functional as F
 
 from pithtrain.contexts import training
 from pithtrain.operators.grouped_linear import GroupedLinear
-from pithtrain.operators.token_scatter import scatter_for_grouped_gemm
+from pithtrain.operators.token_scatter import (
+    _GEMM_ALLOC_ALIGNMENT,
+    scatter_for_grouped_gemm,
+)
 
 
 def reference_grouped_linear_forward(
@@ -334,8 +337,7 @@ def _verify_scatter_result(sorted_tokens, expert_idxs, num_groups, out, reverse_
     1. grouped_mm_offs has correct shape and values (padded cumsum)
     2. reverse_idxs correctly maps: out[reverse_idxs[i]] == sorted_tokens[i]
     3. Within each expert group, the correct set of token rows exists
-    4. Padding rows are all zeros
-    5. Rows beyond offs[-1] (over-allocation) are all zeros
+    4. Padding rows within each expert group are all zeros
     """
     # Check reverse_idxs recovers original tokens
     recovered = out[reverse_idxs]
@@ -435,6 +437,52 @@ def test_scatter_for_grouped_gemm():
         _verify_scatter_result(
             sorted_tokens, expert_idxs, num_groups, out_new, reverse_new, offs_new
         )
+
+
+def test_scatter_for_grouped_gemm_alignment_tail_is_zero(monkeypatch):
+    """Check the hidden alignment tail, which is excluded from the returned view."""
+    hidden_size = 300  # Exercise multiple BLOCK_H tiles and a partial final tile.
+    sorted_tokens = torch.randn(32, hidden_size, device="cuda")
+    expert_idxs = torch.arange(4, device="cuda", dtype=torch.int64).repeat_interleave(8)
+    original_empty = torch.empty
+    output_buffers = []
+
+    def filled_empty(*args, **kwargs):
+        buffer = original_empty(*args, **kwargs)
+        if (
+            buffer.device == sorted_tokens.device
+            and buffer.ndim == 2
+            and buffer.shape[1] == hidden_size
+        ):
+            # A missing zero-store must fail even if the allocator returns clean memory.
+            buffer.fill_(1)
+            output_buffers.append(buffer)
+        return buffer
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "empty", filled_empty)
+        out, reverse_idxs, _, _, _ = scatter_for_grouped_gemm(
+            sorted_tokens, expert_idxs, num_groups=8
+        )
+
+    assert len(output_buffers) == 1, f"Expected one output buffer, got {len(output_buffers)}"
+    buffer = output_buffers[0]
+    # Four non-empty experts each pad eight tokens to 128 rows: actual_M = 512.
+    actual_M = 4 * 128
+    M_rounded = (
+        (actual_M + _GEMM_ALLOC_ALIGNMENT - 1) // _GEMM_ALLOC_ALIGNMENT * _GEMM_ALLOC_ALIGNMENT
+    )
+    assert out.shape == (actual_M, hidden_size)
+    assert out.data_ptr() == buffer.data_ptr(), "Captured buffer must back the returned view"
+    assert actual_M < M_rounded <= buffer.shape[0], "Test must cover a non-empty alignment tail"
+    assert torch.equal(out[reverse_idxs], sorted_tokens), "Real token rows must be preserved"
+
+    # Check only the alignment tail; unused capacity beyond M_rounded has no zero guarantee.
+    tail = buffer[actual_M:M_rounded]
+    assert torch.all(tail == 0), (
+        f"Non-zero GEMM alignment tail in rows [{actual_M}, {M_rounded}): "
+        f"{torch.count_nonzero(tail).item()} non-zero elements"
+    )
 
 
 def test_scatter_for_grouped_gemm_edge_cases():
