@@ -414,8 +414,14 @@ def test_scatter_for_grouped_gemm():
         expected_ks_tensor = torch.tensor(expected_ks, device=device, dtype=torch.int32)
         expected_offs = expected_ks_tensor.cumsum(0, dtype=torch.int32)
         assert ks_new == expected_ks, f"{test_name}: incorrect per-expert sizes"
-        assert torch.equal(ks_tensor_new, expected_ks_tensor), test_name
-        assert torch.equal(offs_new, expected_offs), test_name
+        assert torch.equal(ks_tensor_new, expected_ks_tensor), (
+            f"{test_name}: ks_tensor (per-expert padded sizes) mismatch: "
+            f"actual={ks_tensor_new.tolist()}, expected={expected_ks}"
+        )
+        assert torch.equal(offs_new, expected_offs), (
+            f"{test_name}: grouped_mm_offs (cumulative padded offsets) mismatch: "
+            f"actual={offs_new.tolist()}, expected={expected_offs.tolist()}"
+        )
         expected_shape = (sum(expected_ks), hidden_size)
         assert out_new.shape == expected_shape, (
             f"{test_name}: output shape {out_new.shape} != {expected_shape}"
