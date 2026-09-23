@@ -1,12 +1,16 @@
-"""Offline CPU/FP32 reference for the Qwen3-Omni Thinker text training path.
+"""Offline HF reference for the Qwen3-Omni Thinker text decoder and LM head.
 
-Run: python -m tools.qwen3_omni_reference --output workspace/omni-reference
+Run the tiny CPU/FP32 forward and backward reference:
+    python -m tools.qwen3_omni_reference --config tiny --output workspace/omni-reference
+Inspect the full text model's configuration and shapes without allocating weights:
+    python -m tools.qwen3_omni_reference --config full --describe
 
-Uses Transformers' actual Thinker decoder plus its untied, bias-free LM head.
+Both presets use the same HF model construction. The JSON files contain the tiny
+and full Thinker text configurations; full preserves the checkpoint's dimensions.
+RoPE uses Transformers' normalized rope_parameters format. Caching and router
+outputs are disabled for this next-token CE reference. Full execution is deferred;
+--describe constructs meta tensors only, with no forward/backward or weight load.
 This does not exercise PithTrain, media encoders, DeepStack, or the Talker.
-The tiny config preserves GQA, Q/K normalization, routed SwiGLU experts,
-head_dim=128, and interleaved MRoPE sections [24, 20, 20] from the checkpoint
-below. Width, depth, vocabulary, expert count/top-k, and context are reduced.
 No model weights, tokenizer, dataset, or network connection are required.
 Validated with Transformers 5.17.0 and PyTorch 2.13.0.
 """
@@ -26,43 +30,22 @@ MODEL_ID = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 CONFIG_REVISION = "26291f793822fb6be9555850f06dfe95f2d7e695"
 
 
-def build_reference(seed: int = 0) -> nn.ModuleDict:
-    """Construct the HF text decoder and head without allocating the media encoders."""
-    config = Qwen3OmniMoeTextConfig(
-        vocab_size=256,
-        hidden_size=128,
-        intermediate_size=64,
-        num_hidden_layers=2,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=128,
-        moe_intermediate_size=64,
-        num_experts=4,
-        num_experts_per_tok=2,
-        max_position_embeddings=64,
-        hidden_act="silu",
-        initializer_range=0.02,
-        rms_norm_eps=1e-6,
-        attention_bias=False,
-        attention_dropout=0.0,
-        use_qk_norm=True,
-        norm_topk_prob=True,
-        decoder_sparse_step=1,
-        mlp_only_layers=[],
-        tie_word_embeddings=False,
-        use_cache=False,
-        output_router_logits=False,
-        rope_parameters={
-            "rope_type": "default",
-            "rope_theta": 1000000.0,
-            "mrope_section": [24, 20, 20],
-            "interleaved": True,
-            "mrope_interleaved": True,
-        },
-    )
+def load_config(name: str = "tiny") -> Qwen3OmniMoeTextConfig:
+    """Read a local text-config preset; no Hub access or model allocation."""
+    if name not in ("tiny", "full"):
+        raise ValueError(f"Unknown reference config: {name}")
+    path = Path(__file__).with_name("qwen3_omni_configs") / f"{name}.json"
+    config = Qwen3OmniMoeTextConfig(**json.loads(path.read_text()))
     config._attn_implementation = "eager"
+    return config
+
+
+def build_reference(
+    config: Qwen3OmniMoeTextConfig, seed: int = 0, *, device: str = "cpu"
+) -> nn.ModuleDict:
+    """Construct the decoder/head on CPU, or on meta for shape-only inspection."""
     # Do not change the caller's RNG state or depend on a default GPU device.
-    with torch.random.fork_rng(devices=[]), torch.device("cpu"):
+    with torch.random.fork_rng(devices=[]), torch.device(device):
         torch.manual_seed(seed)
         decoder = Qwen3OmniMoeThinkerTextModel(config).float()
         head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=torch.float32)
@@ -70,10 +53,10 @@ def build_reference(seed: int = 0) -> nn.ModuleDict:
     return nn.ModuleDict({"model": decoder, "lm_head": head})
 
 
-def make_tokens(seed: int = 0) -> torch.Tensor:
+def make_tokens(config: Qwen3OmniMoeTextConfig, seed: int = 0) -> torch.Tensor:
     """Two sequences with 16 inputs plus one final next-token target each."""
     generator = torch.Generator(device="cpu").manual_seed(seed + 1)
-    return torch.randint(0, 256, (2, 17), generator=generator, device="cpu")
+    return torch.randint(0, config.vocab_size, (2, 17), generator=generator, device="cpu")
 
 
 def forward_logits(model: nn.ModuleDict, input_ids: torch.Tensor) -> torch.Tensor:
@@ -81,10 +64,10 @@ def forward_logits(model: nn.ModuleDict, input_ids: torch.Tensor) -> torch.Tenso
     return model["lm_head"](hidden)
 
 
-def run_reference(seed: int = 0) -> dict:
-    model = build_reference(seed)
+def run_reference(config: Qwen3OmniMoeTextConfig, seed: int = 0) -> dict:
+    model = build_reference(config, seed)
     model.train()
-    tokens = make_tokens(seed)
+    tokens = make_tokens(config, seed)
     # Match MemmapDataset: targets are shifted once, before the objective.
     input_ids, labels = tokens[:, :-1].contiguous(), tokens[:, 1:].contiguous()
     logits = forward_logits(model, input_ids)
@@ -129,11 +112,32 @@ def run_reference(seed: int = 0) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--config", choices=("tiny", "full"), default="tiny")
+    parser.add_argument("--describe", action="store_true", help="Print config/shapes on meta only")
+    parser.add_argument("--output", type=Path, help="Output directory for the tiny reference")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+    if not args.describe:
+        if args.config == "full":
+            parser.error("full execution is not implemented; use --config full --describe")
+        if args.output is None:
+            parser.error("--output is required when running the tiny reference")
     torch.set_num_threads(1)
-    result = run_reference(args.seed)
+    config = load_config(args.config)
+    if args.describe:
+        model = build_reference(config, args.seed, device="meta")
+        description = {
+            "model_id": MODEL_ID,
+            "config_revision": CONFIG_REVISION,
+            "preset": args.config,
+            "scope": "Thinker text decoder and LM head only; shapes, not execution",
+            "config": config.to_dict(),
+            "parameter_count": sum(p.numel() for p in model.parameters()),
+            "parameter_shapes": {name: list(p.shape) for name, p in model.named_parameters()},
+        }
+        print(json.dumps(description, indent=2))
+        return
+    result = run_reference(config, args.seed)
     args.output.mkdir(parents=True, exist_ok=True)
     torch.save(result, args.output / "reference.pt")
     summary = {
