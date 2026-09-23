@@ -138,6 +138,7 @@ def objective(
     """
     Cross-entropy objective for language-model pretraining.
 
+    Labels are already next-token targets from MemmapDataset; do not shift them here.
     Returns the loss summed over the tokens of this micro-batch, so gradients accumulate across
     micro-batches; the training step divides by the global non-ignored token count for a correct
     token-weighted mean. The second return value is the same loss detached, which the step
