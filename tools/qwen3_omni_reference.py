@@ -5,10 +5,11 @@ Run the tiny CPU/FP32 forward and backward reference:
 Inspect the full text model's configuration and shapes without allocating weights:
     python -m tools.qwen3_omni_reference --config full --describe
 
-Both presets use the same HF model construction. The JSON files contain the tiny
-and full Thinker text configurations; full preserves the checkpoint's dimensions.
-RoPE uses Transformers' normalized rope_parameters format. Caching and router
-outputs are disabled for this next-token CE reference. Full execution is deferred;
+Both presets in qwen3_omni_configs/text use the same HF model construction. They
+describe Thinker text only; tiny/full select size, not the supported modalities.
+RoPE uses Transformers' normalized rope_parameters format. Runtime choices
+(CPU/FP32, eager attention, no cache/router outputs) belong to this reference,
+not the config loader. Full execution is deferred;
 --describe constructs meta tensors only, with no forward/backward or weight load.
 This does not exercise PithTrain, media encoders, DeepStack, or the Talker.
 No model weights, tokenizer, dataset, or network connection are required.
@@ -16,6 +17,7 @@ Validated with Transformers 5.17.0 and PyTorch 2.13.0.
 """
 
 import argparse
+import copy
 import json
 from pathlib import Path
 
@@ -31,43 +33,64 @@ CONFIG_REVISION = "26291f793822fb6be9555850f06dfe95f2d7e695"
 
 
 def load_config(name: str = "tiny") -> Qwen3OmniMoeTextConfig:
-    """Read a local text-config preset; no Hub access or model allocation."""
+    """Read only the text config; apply execution choices in the reference itself."""
     if name not in ("tiny", "full"):
         raise ValueError(f"Unknown reference config: {name}")
-    path = Path(__file__).with_name("qwen3_omni_configs") / f"{name}.json"
-    config = Qwen3OmniMoeTextConfig(**json.loads(path.read_text()))
-    config._attn_implementation = "eager"
-    return config
+    path = Path(__file__).with_name("qwen3_omni_configs") / "text" / f"{name}.json"
+    return Qwen3OmniMoeTextConfig(**json.loads(path.read_text()))
 
 
 def build_reference(
     config: Qwen3OmniMoeTextConfig, seed: int = 0, *, device: str = "cpu"
 ) -> nn.ModuleDict:
     """Construct the decoder/head on CPU, or on meta for shape-only inspection."""
+    if device not in ("cpu", "meta"):
+        raise ValueError("The reference currently supports only cpu execution or meta inspection")
+    # HF construction sets runtime fields; keep the caller's architecture config reusable.
+    config = copy.deepcopy(config)
+    config._attn_implementation = "eager"
     # Do not change the caller's RNG state or depend on a default GPU device.
     with torch.random.fork_rng(devices=[]), torch.device(device):
         torch.manual_seed(seed)
         decoder = Qwen3OmniMoeThinkerTextModel(config).float()
         head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=torch.float32)
         nn.init.normal_(head.weight, std=config.initializer_range)
+        if config.tie_word_embeddings:
+            head.weight = decoder.embed_tokens.weight
     return nn.ModuleDict({"model": decoder, "lm_head": head})
 
 
-def make_tokens(config: Qwen3OmniMoeTextConfig, seed: int = 0) -> torch.Tensor:
-    """Two sequences with 16 inputs plus one final next-token target each."""
+def make_tokens(
+    config: Qwen3OmniMoeTextConfig,
+    seed: int = 0,
+    *,
+    batch_size: int = 2,
+    sequence_length: int = 16,
+) -> torch.Tensor:
+    """Synthetic text batch with one extra token for next-token targets."""
+    if batch_size < 1 or sequence_length < 1:
+        raise ValueError("batch_size and sequence_length must be positive")
     generator = torch.Generator(device="cpu").manual_seed(seed + 1)
-    return torch.randint(0, config.vocab_size, (2, 17), generator=generator, device="cpu")
+    return torch.randint(
+        0, config.vocab_size, (batch_size, sequence_length + 1), generator=generator, device="cpu"
+    )
 
 
 def forward_logits(model: nn.ModuleDict, input_ids: torch.Tensor) -> torch.Tensor:
-    hidden = model["model"](input_ids=input_ids, use_cache=False).last_hidden_state
+    hidden = model["model"](
+        input_ids=input_ids, use_cache=False, output_router_logits=False, return_dict=True
+    ).last_hidden_state
     return model["lm_head"](hidden)
 
 
-def run_reference(config: Qwen3OmniMoeTextConfig, seed: int = 0) -> dict:
+def run_reference(config: Qwen3OmniMoeTextConfig, tokens: torch.Tensor, seed: int = 0) -> dict:
+    """Run CPU/FP32 next-token CE on a caller-provided [batch, sequence + 1] text batch."""
+    if tokens.ndim != 2 or tokens.shape[0] == 0 or tokens.shape[1] < 2:
+        raise ValueError("tokens must have shape [batch >= 1, sequence + 1 >= 2]")
+    if tokens.device.type != "cpu" or tokens.dtype != torch.long:
+        raise ValueError("tokens must be a CPU torch.long tensor")
     model = build_reference(config, seed)
     model.train()
-    tokens = make_tokens(config, seed)
     # Match MemmapDataset: targets are shifted once, before the objective.
     input_ids, labels = tokens[:, :-1].contiguous(), tokens[:, 1:].contiguous()
     logits = forward_logits(model, input_ids)
@@ -95,6 +118,10 @@ def run_reference(config: Qwen3OmniMoeTextConfig, seed: int = 0) -> dict:
             "device": "cpu",
             "dtype": "float32",
             "attention": "eager",
+            "use_cache": False,
+            "output_router_logits": False,
+            "initialization": "random",
+            "config_scope": "thinker_config.text_config",
             "loss": "next-token cross-entropy, mean over targets, no router auxiliary loss",
             "scope": "HF Thinker text decoder and LM head only; no PithTrain or media path",
         },
@@ -116,12 +143,16 @@ def main() -> None:
     parser.add_argument("--describe", action="store_true", help="Print config/shapes on meta only")
     parser.add_argument("--output", type=Path, help="Output directory for the tiny reference")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=2, help="Synthetic text batch size")
+    parser.add_argument("--sequence-length", type=int, default=16, help="Input tokens per sequence")
     args = parser.parse_args()
     if not args.describe:
         if args.config == "full":
             parser.error("full execution is not implemented; use --config full --describe")
         if args.output is None:
             parser.error("--output is required when running the tiny reference")
+        if args.batch_size < 1 or args.sequence_length < 1:
+            parser.error("--batch-size and --sequence-length must be positive")
     torch.set_num_threads(1)
     config = load_config(args.config)
     if args.describe:
@@ -137,7 +168,10 @@ def main() -> None:
         }
         print(json.dumps(description, indent=2))
         return
-    result = run_reference(config, args.seed)
+    tokens = make_tokens(
+        config, args.seed, batch_size=args.batch_size, sequence_length=args.sequence_length
+    )
+    result = run_reference(config, tokens, args.seed)
     args.output.mkdir(parents=True, exist_ok=True)
     torch.save(result, args.output / "reference.pt")
     summary = {

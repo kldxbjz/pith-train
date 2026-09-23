@@ -47,7 +47,8 @@ def test_hf_label_shift_matches_pretraining(seed, vocab_size):
 
 
 def test_reference_artifact_can_be_replayed(tmp_path):
-    result = run_reference(load_config(), seed=0)
+    config = load_config()
+    result = run_reference(config, make_tokens(config), seed=0)
     path = tmp_path / "reference.pt"
     torch.save(result, path)
     saved = torch.load(path, weights_only=True)
@@ -65,13 +66,44 @@ def test_reference_artifact_can_be_replayed(tmp_path):
 
 
 def test_reference_is_deterministic():
-    first = run_reference(load_config(), seed=0)
-    second = run_reference(load_config(), seed=0)
+    config = load_config()
+    tokens = make_tokens(config)
+    first = run_reference(config, tokens, seed=0)
+    second = run_reference(config, tokens, seed=0)
     for key in ("input_ids", "labels", "logits", "loss"):
         torch.testing.assert_close(first[key], second[key], rtol=0, atol=0)
     for key in ("state_dict", "gradients"):
         for name in first[key]:
             torch.testing.assert_close(first[key][name], second[key][name], rtol=0, atol=0)
+
+
+def test_reference_uses_caller_batch_without_changing_config():
+    config = load_config()
+    assert config.use_cache
+    config._attn_implementation = "sdpa"
+    config.output_router_logits = True
+    original_config = config.to_dict()
+    tokens = make_tokens(config, seed=17, batch_size=3, sequence_length=7)
+    original_tokens = tokens.clone()
+
+    result = run_reference(config, tokens)
+
+    torch.testing.assert_close(result["input_ids"], original_tokens[:, :-1])
+    torch.testing.assert_close(result["labels"], original_tokens[:, 1:])
+    torch.testing.assert_close(tokens, original_tokens)
+    assert result["logits"].shape == (3, 7, config.vocab_size)
+    assert config.to_dict() == original_config
+    assert config._attn_implementation == "sdpa"
+    assert result["metadata"]["attention"] == "eager"
+    assert not result["metadata"]["use_cache"]
+    assert not result["metadata"]["output_router_logits"]
+
+
+def test_reference_honors_tied_embeddings():
+    config = load_config()
+    config.tie_word_embeddings = True
+    model = build_reference(config)
+    assert model["lm_head"].weight is model["model"].embed_tokens.weight
 
 
 @pytest.mark.parametrize(

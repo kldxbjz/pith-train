@@ -21,8 +21,12 @@
   "decoder_sparse_step": 1,
   "mlp_only_layers": [],
   "tie_word_embeddings": false,
-  "use_cache": false,
+  "use_cache": true,
   "output_router_logits": false,
+  "router_aux_loss_coef": 0.001,
+  "shared_expert_intermediate_size": 0,
+  "sliding_window": null,
+  "use_sliding_window": false,
   "rope_parameters": {
     "rope_type": "default",
     "rope_theta": 1000000.0,
