@@ -1,17 +1,137 @@
-"""Check the offline Omni reference before using it to validate a PithTrain port."""
+"""Offline HF checks for the Qwen3-Omni Thinker text decoder and LM head.
+
+Run: python -m pytest tests/test_qwen3_omni_reference.py
+
+The tiny fixture runs random-weight CPU/FP32 forward and backward; full is built
+on meta for shape checks only. Both fixtures describe text model size, not media
+support. RoPE uses normalized rope_parameters; runtime choices (eager attention,
+no cache/router outputs) are applied by the helpers, leaving the fixtures intact.
+Replay artifacts live in pytest's tmp_path. No Hub access, released weights,
+tokenizer or dataset is required. Native PithTrain and DualPipeV comparisons will
+be added when the native Omni model is implemented.
+Validated with Transformers 5.17.0 and PyTorch 2.13.0.
+"""
+
+import copy
+import json
+from pathlib import Path
 
 import pytest
 import torch
 import torch.nn.functional as F
+import transformers
+from torch import nn
 from transformers.loss.loss_utils import ForCausalLMLoss
+from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeTextConfig
+from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeThinkerTextModel
 
-from tools.qwen3_omni_reference import (
-    build_reference,
-    forward_logits,
-    load_config,
-    make_tokens,
-    run_reference,
-)
+MODEL_ID = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+CONFIG_REVISION = "26291f793822fb6be9555850f06dfe95f2d7e695"
+
+
+def load_config(name: str = "tiny") -> Qwen3OmniMoeTextConfig:
+    """Read only the text config; apply execution choices in the reference itself."""
+    if name not in ("tiny", "full"):
+        raise ValueError(f"Unknown reference config: {name}")
+    path = Path(__file__).parent / "configs" / "qwen3_omni_text" / f"{name}.json"
+    return Qwen3OmniMoeTextConfig(**json.loads(path.read_text()))
+
+
+def build_reference(
+    config: Qwen3OmniMoeTextConfig, seed: int = 0, *, device: str = "cpu"
+) -> nn.ModuleDict:
+    """Construct the decoder/head on CPU, or on meta for shape-only inspection."""
+    if device not in ("cpu", "meta"):
+        raise ValueError("The reference currently supports only cpu execution or meta inspection")
+    # HF construction sets runtime fields; keep the caller's architecture config reusable.
+    config = copy.deepcopy(config)
+    config._attn_implementation = "eager"
+    # Do not change the caller's RNG state or depend on a default GPU device.
+    with torch.random.fork_rng(devices=[]), torch.device(device):
+        torch.manual_seed(seed)
+        decoder = Qwen3OmniMoeThinkerTextModel(config).float()
+        head = nn.Linear(config.hidden_size, config.vocab_size, bias=False, dtype=torch.float32)
+        nn.init.normal_(head.weight, std=config.initializer_range)
+        if config.tie_word_embeddings:
+            head.weight = decoder.embed_tokens.weight
+    return nn.ModuleDict({"model": decoder, "lm_head": head})
+
+
+def make_tokens(
+    config: Qwen3OmniMoeTextConfig,
+    seed: int = 0,
+    *,
+    batch_size: int = 2,
+    sequence_length: int = 16,
+) -> torch.Tensor:
+    """Synthetic text batch with one extra token for next-token targets."""
+    if batch_size < 1 or sequence_length < 1:
+        raise ValueError("batch_size and sequence_length must be positive")
+    generator = torch.Generator(device="cpu").manual_seed(seed + 1)
+    return torch.randint(
+        0, config.vocab_size, (batch_size, sequence_length + 1), generator=generator, device="cpu"
+    )
+
+
+def forward_logits(model: nn.ModuleDict, input_ids: torch.Tensor) -> torch.Tensor:
+    hidden = model["model"](
+        input_ids=input_ids, use_cache=False, output_router_logits=False, return_dict=True
+    ).last_hidden_state
+    return model["lm_head"](hidden)
+
+
+def run_reference(config: Qwen3OmniMoeTextConfig, tokens: torch.Tensor, seed: int = 0) -> dict:
+    """Run CPU/FP32 next-token CE on a caller-provided [batch, sequence + 1] text batch."""
+    if tokens.ndim != 2 or tokens.shape[0] == 0 or tokens.shape[1] < 2:
+        raise ValueError("tokens must have shape [batch >= 1, sequence + 1 >= 2]")
+    if tokens.device.type != "cpu" or tokens.dtype != torch.long:
+        raise ValueError("tokens must be a CPU torch.long tensor")
+    model = build_reference(config, seed)
+    model.train()
+    # Match MemmapDataset: targets are shifted once, before the objective.
+    input_ids, labels = tokens[:, :-1].contiguous(), tokens[:, 1:].contiguous()
+    logits = forward_logits(model, input_ids)
+    # Pure next-token CE; no auxiliary router loss in this initial comparison.
+    loss = F.cross_entropy(logits.flatten(0, 1), labels.flatten())
+    loss.backward()
+
+    if not torch.isfinite(logits).all() or not torch.isfinite(loss):
+        raise RuntimeError("Non-finite reference output or loss")
+    gradients = {}
+    for name, parameter in model.named_parameters():
+        if parameter.grad is None or not torch.isfinite(parameter.grad).all():
+            raise RuntimeError(f"Missing or non-finite gradient: {name}")
+        if not torch.count_nonzero(parameter.grad):
+            raise RuntimeError(f"Entire parameter has zero gradient: {name}")
+        gradients[name] = parameter.grad.detach().clone()
+
+    return {
+        "metadata": {
+            "model_id": MODEL_ID,
+            "config_revision": CONFIG_REVISION,
+            "torch_version": str(torch.__version__),
+            "transformers_version": transformers.__version__,
+            "seed": seed,
+            "device": "cpu",
+            "dtype": "float32",
+            "attention": "eager",
+            "use_cache": False,
+            "output_router_logits": False,
+            "initialization": "random",
+            "config_scope": "thinker_config.text_config",
+            "loss": "next-token cross-entropy, mean over targets, no router auxiliary loss",
+            "scope": "HF Thinker text decoder and LM head only; no PithTrain or media path",
+        },
+        "config": model["model"].config.to_dict(),
+        "input_ids": input_ids,
+        "labels": labels,
+        "logits": logits.detach(),
+        "loss": loss.detach(),
+        "state_dict": {
+            name: tensor.detach().clone() for name, tensor in model.state_dict().items()
+        },
+        "gradients": gradients,
+    }
 
 
 @pytest.fixture(autouse=True)
