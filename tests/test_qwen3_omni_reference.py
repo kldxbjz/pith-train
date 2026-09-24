@@ -41,6 +41,9 @@ def build_reference(
     config: Qwen3OmniMoeTextConfig, seed: int = 0, *, device: str = "cpu"
 ) -> nn.ModuleDict:
     """Construct the decoder/head on CPU, or on meta for shape-only inspection."""
+    # TODO: Add CUDA/dtype support to construction, input placement and run_reference
+    # metadata, preserving CUDA RNG state. Compare GPU FP32/BF16 with the CPU baseline
+    # using identical weights/inputs and dtype-appropriate tolerances.
     if device not in ("cpu", "meta"):
         raise ValueError("The reference currently supports only cpu execution or meta inspection")
     # HF construction sets runtime fields; keep the caller's architecture config reusable.
@@ -142,6 +145,10 @@ def cpu_threads():
     torch.set_num_threads(previous)
 
 
+# TODO: Once native Omni exists, map the same HF weights into its reference_forward
+# and compare logits, next-token loss and parameter gradients on GPU.
+# TODO: Add Omni to tests/test_dualpipev.py and tests/test_dualpipev.sh to compare the
+# native reference with DualPipeV across PP/EP/CP layouts, using the same weights/inputs.
 @pytest.mark.parametrize("seed", [0, 17])
 @pytest.mark.parametrize("vocab_size", [17, 256])
 def test_hf_label_shift_matches_pretraining(seed, vocab_size):
@@ -234,6 +241,8 @@ def test_preset_model_shapes_on_meta(
     preset, layers, vocab, hidden, query_width, experts, expert_width
 ):
     """Exercise both actual HF constructors without allocating full-size weights."""
+    # TODO: Add an opt-in full-size GPU forward/backward test when the execution path
+    # and hardware are ready. Keep this meta test for fast, allocation-free shape checks.
     model = build_reference(load_config(preset), device="meta")
     assert all(t.is_meta for t in model.parameters())
     assert all(t.is_meta for t in model.buffers())
