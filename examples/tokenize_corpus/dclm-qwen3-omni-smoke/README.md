@@ -73,5 +73,13 @@ copy those fields into `cfg.training`. The preparation script requires at least
 The native model implementation and model/optimizer/checkpoint configuration
 still belong to the model integration task. A tiny model consuming these real
 tokens must keep the full **152064-entry vocabulary** while shrinking layers and
-hidden dimensions. The 256-entry synthetic HF comparison fixture cannot consume
-this corpus; do not clamp or take token IDs modulo its vocabulary size.
+hidden dimensions. The existing 256-entry HF comparison fixture uses synthetic IDs, so it
+can keep using the existing synthetic data for basic model correctness and
+training smoke. It is not required to consume this real-text corpus. To test
+the real Omni tokenizer-to-model path, use a small architecture with the
+152064-entry vocabulary; preserve the tokenizer's IDs unchanged.
+
+For image/text, audio/transcript and video/text inputs, use the
+[multimodal data recipe](../../prepare_omni_data/qwen3-omni-smoke/README.md).
+That reader keeps media, grids, lengths and timing attached to each sample;
+this token-only recipe does not provide multimodal inputs.

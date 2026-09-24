@@ -1,0 +1,41 @@
+{
+  "model_id": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+  "revision": "26291f793822fb6be9555850f06dfe95f2d7e695",
+  "batch": {
+    "max_length": 2048,
+    "min_pixels": 4096,
+    "max_pixels": 65536,
+    "video_fps": 2.0,
+    "max_video_frames": 32,
+    "max_audio_seconds": 30.0
+  },
+  "sources": [
+    {
+      "kind": "image",
+      "repo_id": "hf-internal-testing/fixtures_image_utils",
+      "revision": "4539dd3e9faa39d54e606b4c875f85c7561f5423",
+      "file": "cats.jpg",
+      "sha256": "dea9e7ef97386345f7cff32f9055da4982da5471c48d575146c796ab4563b04e",
+      "text": "Two cats are resting on a pink couch beside remote controls.",
+      "annotation": "Caption written for this integration sample after viewing the image."
+    },
+    {
+      "kind": "audio",
+      "repo_id": "hf-internal-testing/librispeech_asr_dummy",
+      "revision": "5be91486e11a2d616f4ec5db8d3fd248585ac07a",
+      "file": "clean/validation-00000-of-00001.parquet",
+      "sha256": "4e69a06fa5edc90921e5e7e39a7084881f8b3ed9c805c574f4f39c6fde27c603",
+      "sample_ids": ["1272-128104-0000", "1272-128104-0001"],
+      "annotation": "Original LibriSpeech transcripts from the pinned validation fixture."
+    },
+    {
+      "kind": "video",
+      "repo_id": "raushan-testing-hf/videos-test",
+      "revision": "4cba700bd771f44d72b549253da025c32e944d42",
+      "file": "Big_Buck_Bunny_720_10s_10MB.mp4",
+      "sha256": "881e507cecf827e5abb5da3b4ac86b105af4dea8fa8eb2934b6dded495577fdd",
+      "text": "A large tree stands above a grassy burrow in an animated forest.",
+      "annotation": "Caption written for this integration sample after inspecting frames. This clip has no audio track."
+    }
+  ]
+}
