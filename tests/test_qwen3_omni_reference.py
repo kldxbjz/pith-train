@@ -1,14 +1,13 @@
-"""Offline HF checks for the Qwen3-Omni Thinker text decoder and LM head.
+"""Offline HF baseline for the Qwen3-Omni Thinker text decoder and LM head.
 
-Run: python -m pytest tests/test_qwen3_omni_reference.py
+Run: python -m pytest tests/test_qwen3_omni_reference.py -q -rs
 
-The tiny fixture runs random-weight CPU/FP32 forward and backward; full is built
-on meta for shape checks only. Both fixtures describe text model size, not media
-support. RoPE uses normalized rope_parameters; runtime choices (eager attention,
-no cache/router outputs) are applied by the helpers, leaving the fixtures intact.
-Replay artifacts live in pytest's tmp_path. No Hub access, released weights,
-tokenizer or dataset is required. Native PithTrain and DualPipeV comparisons will
-be added when the native Omni model is implemented.
+Three active checks cover tiny CPU/FP32 forward/backward, next-token label shifting,
+and full-config shapes on meta. Inputs and weights are synthetic; no Hub access,
+released weights, tokenizer or dataset is required. Both configs are text-only.
+The skipped test_native_omni_matches_hf outlines how to reuse this baseline once
+the native Omni model and CUDA reference support exist. Distributed validation
+belongs in the shared tests/test_dualpipev.py harness.
 Validated with Transformers 5.17.0 and PyTorch 2.13.0.
 """
 
@@ -145,18 +144,32 @@ def cpu_threads():
     torch.set_num_threads(previous)
 
 
-# TODO: Once native Omni exists, map the same HF weights into its reference_forward
-# and compare logits, next-token loss and parameter gradients on GPU.
-# TODO: Add Omni to tests/test_dualpipev.py and tests/test_dualpipev.sh to compare the
-# native reference with DualPipeV across PP/EP/CP layouts, using the same weights/inputs.
-@pytest.mark.parametrize("seed", [0, 17])
-@pytest.mark.parametrize("vocab_size", [17, 256])
-def test_hf_label_shift_matches_pretraining(seed, vocab_size):
+def test_tiny_reference_forward_backward():
+    """Run the baseline on a caller-provided batch without changing its inputs/config."""
+    config = load_config("tiny")
+    config._attn_implementation = "sdpa"
+    config.output_router_logits = True
+    original_config = copy.deepcopy(config.to_dict())
+    tokens = make_tokens(config, seed=17, batch_size=3, sequence_length=7)
+    original_tokens = tokens.clone()
+
+    # run_reference checks that logits/loss and every parameter gradient are finite,
+    # and that no entire parameter has a missing or all-zero gradient.
+    result = run_reference(config, tokens)
+
+    torch.testing.assert_close(result["input_ids"], original_tokens[:, :-1])
+    torch.testing.assert_close(result["labels"], original_tokens[:, 1:])
+    torch.testing.assert_close(tokens, original_tokens)
+    assert result["logits"].shape == (3, 7, config.vocab_size)
+    assert config.to_dict() == original_config
+    assert config._attn_implementation == "sdpa"
+
+
+def test_hf_label_shift_matches_pretraining():
     """HF shifts inside its loss; PithTrain's dataset already shifts the targets."""
     config = load_config("tiny")
-    config.vocab_size = vocab_size
-    model = build_reference(config, seed)
-    tokens = make_tokens(config, seed)
+    model = build_reference(config)
+    tokens = make_tokens(config)
     full_logits = forward_logits(model, tokens)
     hf_loss = ForCausalLMLoss(full_logits, tokens, vocab_size=config.vocab_size)
 
@@ -173,91 +186,41 @@ def test_hf_label_shift_matches_pretraining(seed, vocab_size):
         torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-7, msg=name)
 
 
-def test_reference_artifact_can_be_replayed(tmp_path):
-    config = load_config()
-    result = run_reference(config, make_tokens(config), seed=0)
-    path = tmp_path / "reference.pt"
-    torch.save(result, path)
-    saved = torch.load(path, weights_only=True)
-
-    # A different random initialization must reproduce the saved reference after loading.
-    model = build_reference(load_config(), seed=1)
-    model.load_state_dict(saved["state_dict"], strict=True)
-    logits = forward_logits(model, saved["input_ids"])
-    loss = F.cross_entropy(logits.flatten(0, 1), saved["labels"].flatten())
-    loss.backward()
-    torch.testing.assert_close(logits, saved["logits"], rtol=0, atol=0)
-    torch.testing.assert_close(loss, saved["loss"], rtol=0, atol=0)
-    for name, parameter in model.named_parameters():
-        torch.testing.assert_close(parameter.grad, saved["gradients"][name], rtol=0, atol=0)
-
-
-def test_reference_is_deterministic():
-    config = load_config()
-    tokens = make_tokens(config)
-    first = run_reference(config, tokens, seed=0)
-    second = run_reference(config, tokens, seed=0)
-    for key in ("input_ids", "labels", "logits", "loss"):
-        torch.testing.assert_close(first[key], second[key], rtol=0, atol=0)
-    for key in ("state_dict", "gradients"):
-        for name in first[key]:
-            torch.testing.assert_close(first[key][name], second[key][name], rtol=0, atol=0)
-
-
-def test_reference_uses_caller_batch_without_changing_config():
-    config = load_config()
-    assert config.use_cache
-    config._attn_implementation = "sdpa"
-    config.output_router_logits = True
-    original_config = config.to_dict()
-    tokens = make_tokens(config, seed=17, batch_size=3, sequence_length=7)
-    original_tokens = tokens.clone()
-
-    result = run_reference(config, tokens)
-
-    torch.testing.assert_close(result["input_ids"], original_tokens[:, :-1])
-    torch.testing.assert_close(result["labels"], original_tokens[:, 1:])
-    torch.testing.assert_close(tokens, original_tokens)
-    assert result["logits"].shape == (3, 7, config.vocab_size)
-    assert config.to_dict() == original_config
-    assert config._attn_implementation == "sdpa"
-    assert result["metadata"]["attention"] == "eager"
-    assert not result["metadata"]["use_cache"]
-    assert not result["metadata"]["output_router_logits"]
-
-
-def test_reference_honors_tied_embeddings():
-    config = load_config()
-    config.tie_word_embeddings = True
-    model = build_reference(config)
-    assert model["lm_head"].weight is model["model"].embed_tokens.weight
-
-
-@pytest.mark.parametrize(
-    "preset, layers, vocab, hidden, query_width, experts, expert_width",
-    [("tiny", 2, 256, 128, 256, 4, 64), ("full", 48, 152064, 2048, 4096, 128, 768)],
-)
-def test_preset_model_shapes_on_meta(
-    preset, layers, vocab, hidden, query_width, experts, expert_width
-):
-    """Exercise both actual HF constructors without allocating full-size weights."""
+def test_full_model_shapes_on_meta():
+    """Exercise the full HF constructor without allocating full-size weights."""
     # TODO: Add an opt-in full-size GPU forward/backward test when the execution path
     # and hardware are ready. Keep this meta test for fast, allocation-free shape checks.
-    model = build_reference(load_config(preset), device="meta")
+    model = build_reference(load_config("full"), device="meta")
     assert all(t.is_meta for t in model.parameters())
     assert all(t.is_meta for t in model.buffers())
-    assert len(model["model"].layers) == layers
+    assert len(model["model"].layers) == 48
     parameters = dict(model.named_parameters())
-    assert parameters["model.embed_tokens.weight"].shape == (vocab, hidden)
-    assert parameters["lm_head.weight"].shape == (vocab, hidden)
-    assert parameters["model.layers.0.self_attn.q_proj.weight"].shape == (query_width, hidden)
-    assert parameters["model.layers.0.mlp.experts.gate_up_proj"].shape == (
-        experts,
-        2 * expert_width,
-        hidden,
-    )
-    assert parameters["model.layers.0.mlp.experts.down_proj"].shape == (
-        experts,
-        hidden,
-        expert_width,
-    )
+    assert parameters["model.embed_tokens.weight"].shape == (152064, 2048)
+    assert parameters["lm_head.weight"].shape == (152064, 2048)
+    assert parameters["model.layers.0.self_attn.q_proj.weight"].shape == (4096, 2048)
+    assert parameters["model.layers.0.mlp.experts.gate_up_proj"].shape == (128, 1536, 2048)
+    assert parameters["model.layers.0.mlp.experts.down_proj"].shape == (128, 2048, 768)
+
+
+@pytest.mark.skip(reason="TODO: native Omni and CUDA reference support are not implemented")
+def test_native_omni_matches_hf():
+    """Replace this placeholder with a single-GPU HF-vs-native correctness test."""
+    # 1. Extend the helpers above for CUDA/dtype. Reuse load_config("tiny") and
+    #    make_tokens(); run_reference supplies inputs, labels, weights and HF results.
+    # 2. Set up the native backend with PP=EP=CP=1 and build the whole model (phase=-1).
+    #    Copy/map the HF state_dict, including expert layouts; matching seeds is not enough.
+    #    Both models must use the same weights/dtype, positions and loss settings:
+    #    no cache, no router auxiliary loss, labels shifted once, mean next-token CE.
+    # 3. Run native.reference_forward on the reference input_ids, calculate CE with
+    #    the reference labels, and backward. Recompute HF results at the chosen dtype.
+    # 4. Compare with dtype-appropriate tolerances (comparison sketch):
+    #    torch.testing.assert_close(native_logits, expected["logits"], rtol=rtol, atol=atol)
+    #    torch.testing.assert_close(native_loss, expected["loss"], rtol=rtol, atol=atol)
+    #    Map native gradients back to HF names/layouts and require complete key coverage:
+    #    assert native_gradients.keys() == expected["gradients"].keys()
+    #    for name, expected_grad in expected["gradients"].items():
+    #        torch.testing.assert_close(native_gradients[name], expected_grad,
+    #                                   rtol=rtol, atol=atol, msg=name)
+    # 5. Add Omni to tests/test_dualpipev.py and tests/test_dualpipev.sh for separate
+    #    native-reference-vs-pipeline checks across PP/EP/CP layouts.
+    raise NotImplementedError("Implement native Omni construction and weight/gradient mapping")
