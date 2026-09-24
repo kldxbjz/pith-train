@@ -237,6 +237,17 @@ def test_training_preparation_splits_resume_and_integrity(tmp_path, processor_co
     assert (Path(cfg.output) / "tokens/train/00000.bin").exists()
     assert (Path(cfg.output) / "tokens/validation/00000.bin").exists()
     assert prep.launch(cfg) == bundle
+    # The GPU batch checker consumes this same train-only export; verify its file
+    # reference path on CPU without importing CUDA-dependent training modules.
+    import runpy
+
+    read_reference = runpy.run_path(str(Path(__file__).with_name("test_pretrain_data.py")))[
+        "read_text_reference"
+    ]
+    inputs, labels, metadata = read_reference(cfg.output, 4)
+    assert len(inputs) > 0 and inputs.shape == labels.shape
+    torch.testing.assert_close(inputs[:, 1:], labels[:, :-1])
+    assert metadata["vocab_size"] == processor_config[1].text_config.vocab_size
     processor, config = processor_config
     loader = create_omni_dataloader(cfg.output, processor, config, stage="text", split="validation")
     assert [sample_id for batch in loader for sample_id in batch.sample_ids] == ["three"]
@@ -273,8 +284,8 @@ def test_interrupted_preparation_repairs_partial_media(
         Path(__file__).parents[1] / "examples/prepare_omni_data/qwen3-omni-training/config.json"
     )
     recipe = json.loads(recipe_path.read_text())
-    recipe["stages"]["image"] = ["image"]
-    recipe["samples_per_modality"] = {"train": 1, "validation": 1}
+    recipe["samples_per_modality"] = {"train": 2, "validation": 1}
+    recipe["modality_sample_limits"] = {"image": {"train": 1}}
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps(recipe))
     Image.new("RGB", (64, 64), color=(0, 0, 255)).save(tmp_path / "validation.png")
@@ -286,7 +297,12 @@ def test_interrupted_preparation_repairs_partial_media(
     def records(modality, split, source, cache, max_scan):
         if split == "validation" and interrupted:
             raise RuntimeError("Simulated interruption")
-        yield dict(id=split, group=split, text="A colored square.", origin=split, url=split)
+        count = 2 if modality == "text" and split == "train" else 1
+        for index in range(count):
+            identity = f"{modality}-{split}-{index}"
+            yield dict(
+                id=identity, group=identity, text="A colored square.", origin=split, url=split
+            )
 
     monkeypatch.setattr(prep, "records", records)
     cfg = prep.PrepareOmniDataCfg()
@@ -303,6 +319,9 @@ def test_interrupted_preparation_repairs_partial_media(
     interrupted = False
     bundle = prep.launch(cfg)
     assert partial_media.read_bytes() == source_paths["train"].read_bytes()
+    assert bundle["statistics"]["train"]["text"]["samples"] == 2
+    assert bundle["statistics"]["train"]["image"]["samples"] == 1
+    assert bundle["statistics"]["validation"]["image"]["samples"] == 1
     assert prep.verify_bundle(cfg.output) == bundle
     partial_media.write_bytes(b"corruption after completion")
     with pytest.raises(ValueError, match="hash mismatch"):

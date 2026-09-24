@@ -13,6 +13,7 @@ Each script downloads one shard of [DCLM Baseline 1.0](https://huggingface.co/da
 
 Once finished, the tokenized dataset is ready for use in [pretrain_lm](../pretrain_lm/).
 
-For a bounded Omni text smoke corpus (128 pinned DCLM documents), see
-[the Omni smoke recipe](dclm-qwen3-omni-smoke/README.md). It includes a real
-pretraining batch check and does not download model weights.
+For Omni text and multimodal train/validation data, use the unified
+[Omni training recipe](../prepare_omni_data/qwen3-omni-training/README.md).
+Its `--stage text` mode exports `.bin` shards for the existing text loader;
+later stages add paired image, audio and visual-video data without a second recipe.

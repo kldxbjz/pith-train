@@ -56,6 +56,10 @@ audio-in-video merely because `video` is enabled.
 Copy `config.json` and change:
 
 - `samples_per_modality.train` / `.validation`: accepted records per modality.
+- `modality_sample_limits`: optional per-modality train/validation overrides.
+  For example, `{"text": {"train": 10000}, "video": {"train": 500}}` keeps the
+  default validation count while preparing different amounts of text and video.
+  This prevents a small source from limiting the other modalities.
 - `max_scan_per_modality`: scanning budget; raise it along with sample counts.
 - Source `files`: add pinned shard paths or globs. Audio already lists all
   train-clean-100 shards; text starts with one DCLM shard.
@@ -69,6 +73,19 @@ Changing limits/stages in an existing output is rejected rather than mixing old
 and new files. Selection is deterministic source order up to the requested count;
 the runtime sampler supplies shuffling/mixture. Small subsets are not statistically
 representative of the full sources (e.g. early LibriSpeech records share a speaker).
+
+Expansion has source and implementation limits. The configured MSVD source has
+1200 training clips and 100 validation clips before our filters. Increasing a
+quota beyond the available usable records fails; a larger/new-format source
+needs a source adapter in `records`, not just a new repository name. The current
+corpus covers captioning/transcription, not OCR, multilingual speech, sound-event
+understanding or aligned audio/video. Source selection for those tasks is future
+work alongside their model paths.
+
+This path supports incremental development-scale expansion. Preparation is
+single-process and publication uses one archive per bundle; JSONL indices and
+deduplication state still grow with sample count. Multi-terabyte production
+preparation, distributed streaming/staging and throughput have not been validated.
 
 Source data is read incrementally. Parquet downloads are limited to needed row
 groups, which may contain more records than requested. DCLM caches a bounded
@@ -116,6 +133,21 @@ Both use the real Omni tokenizer: a reduced training model must retain its
 152064-entry vocabulary. A 256-entry synthetic comparison fixture cannot consume
 these IDs; changing model depth/width does not require changing the tokenizer.
 
+Each JSONL record has an ID, paired text and ordered media, for example:
+
+```json
+{"id":"image-1","text":"A description of the picture.","media":[{"type":"image","path":"media/image/example.jpg"}]}
+```
+
+Empty `media` denotes text-only; a sample may contain multiple media items. The
+collator returns `Qwen3OmniBatch` with sample IDs, HF-named model inputs, shifted
+labels and media timing/shape information. Sequences are a tokenizer EOS boundary,
+media prefix, paired text, and final EOS. Only paired text/EOS are loss targets;
+media wrappers, placeholders and padding have labels `-100`. For an HF reference,
+pass model inputs without these labels and compute CE externally to avoid a second
+label shift. The native model must handle padding and construct multimodal positions
+from the retained grids and timing.
+
 `create_omni_dataloader` in `pithtrain/modules/qwen3_omni_data.py` reads a bundle,
 selects a stage/split and returns `Qwen3OmniBatch` values. It checks catalog and
 selected manifest hashes. JSONL shards are indexed by byte offset; the runtime
@@ -138,7 +170,23 @@ python examples/prepare_omni_data/qwen3-omni-training/script.py check \
 This verifies all bundle hashes and exercises train/validation loaders for every
 available stage. Native Omni, DualPipeV media routing, global valid-target loss
 normalization and optimizer updates are still model-integration work; this
-command does not claim to train a model.
+command does not claim to train a model. `pretrain_lm` still calls its existing
+`.bin` loader; it does not import `create_omni_dataloader`. Its current multi-rank
+gradient scaling assumes equal valid-token counts per rank, which must be adapted
+when multimodal masks give ranks different target counts.
+
+For the existing **text** distributed batch path, use the same bundle's train-only
+token export (requires GPUs and the small processor files cached by preparation):
+
+```bash
+torchrun --standalone --nproc-per-node=1 tests/test_pretrain_data.py \
+  --dataset workspace/datasets/omni-training
+```
+
+The checker accepts `--sequence-length`, `--global-batch-size`, `--micro-batch-size`,
+`--steps`, and `--pp/--cp/--ep`. This only verifies data partitioning, not an Omni
+model update. The former text-only smoke and five-fixture download recipes have
+been consolidated here; unit-test media fixtures stay inside the tests.
 
 ## Orchard storage
 

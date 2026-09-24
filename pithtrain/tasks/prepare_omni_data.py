@@ -246,9 +246,17 @@ class PrepareOmniDataCfg(SlottedDefault):
 def launch(cfg: PrepareOmniDataCfg):
     recipe = json.loads(Path(cfg.recipe).read_text())
     modalities = recipe["stages"][cfg.stage]
-    limits = recipe["samples_per_modality"]
-    if any(not isinstance(n, int) or n <= 0 for n in limits.values()):
-        raise ValueError("Train/validation sample counts must be positive integers")
+    overrides = recipe.get("modality_sample_limits", {})
+    if set(overrides) - set(recipe["sources"]):
+        raise ValueError("Sample limits name an unknown modality")
+    limits = {
+        kind: dict(recipe["samples_per_modality"], **overrides.get(kind, {})) for kind in modalities
+    }
+    for counts in limits.values():
+        if set(counts) != {"train", "validation"} or any(
+            type(n) is not int or n <= 0 for n in counts.values()
+        ):
+            raise ValueError("Train/validation sample counts must be positive integers")
     if recipe["records_per_shard"] <= 0 or recipe["max_scan_per_modality"] <= 0:
         raise ValueError("Shard size and scan limits must be positive")
     effective = dict(recipe=recipe, stage=cfg.stage, format_version=3)
@@ -386,12 +394,12 @@ def launch(cfg: PrepareOmniDataCfg):
                     accepted += 1
                     if len(shard_rows) == recipe["records_per_shard"]:
                         flush()
-                    if accepted == limits[split]:
+                    if accepted == limits[modality][split]:
                         break
                 flush()
-                if accepted != limits[split]:
+                if accepted != limits[modality][split]:
                     raise ValueError(
-                        f"{split}/{modality}: only {accepted}/{limits[split]} usable samples after scanning {scanned}; increase scan/source limits. Rejections: {dict(reasons)}"
+                        f"{split}/{modality}: only {accepted}/{limits[modality][split]} usable samples after scanning {scanned}; increase scan/source limits. Rejections: {dict(reasons)}"
                     )
                 manifests[split][modality] = shard_paths
                 statistics[split][modality] = dict(
