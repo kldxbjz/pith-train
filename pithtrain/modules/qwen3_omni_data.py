@@ -1,7 +1,8 @@
 """Read local media/text pairs and build Qwen3-Omni Thinker pretraining inputs.
 
-The batch keeps HF's media field names. It is not yet a DualPipeV Microbatch:
-native Omni must consume these fields and construct multimodal positions.
+The batch keeps HF's media field names. The training data adapter wraps these
+inputs in a DualPipeV Microbatch; native Omni must consume the features and
+construct multimodal positions.
 """
 
 import hashlib
@@ -233,6 +234,10 @@ class Qwen3OmniCollator:
         )
 
     def __call__(self, samples):
+        with torch.device("cpu"):
+            return self._collate(samples)
+
+    def _collate(self, samples):
         if not samples:
             raise ValueError("Cannot collate an empty batch")
         processor = self.processor
@@ -385,6 +390,8 @@ def create_omni_dataloader(
     world_size=1,
     start_sample=0,
     num_workers=0,
+    seed=None,
+    batch_cfg=None,
 ):
     """Read a prepared bundle and select only modalities supported by this stage.
 
@@ -423,7 +430,9 @@ def create_omni_dataloader(
     for path in manifests:
         verify_metadata(path)
     dataset = Qwen3OmniDataset(manifests, media_root=root, allowed_modalities=modalities)
-    collator = Qwen3OmniCollator(processor, thinker_config, **recipe["batch"])
+    collator = Qwen3OmniCollator(
+        processor, thinker_config, **(recipe["batch"] if batch_cfg is None else batch_cfg)
+    )
     if split == "train":
         selected_weights = (
             weights
@@ -434,7 +443,7 @@ def create_omni_dataloader(
             dataset.groups,
             selected_weights,
             num_samples if num_samples is not None else len(dataset),
-            seed=recipe["seed"],
+            seed=recipe["seed"] if seed is None else seed,
             epoch=epoch,
             rank=rank,
             world_size=world_size,
@@ -459,4 +468,8 @@ def create_omni_dataloader(
         shuffle=False,
         collate_fn=collator,
         num_workers=num_workers,
+        multiprocessing_context="spawn" if num_workers else None,
+        generator=torch.Generator(device="cpu").manual_seed(
+            recipe["seed"] if seed is None else seed
+        ),
     )

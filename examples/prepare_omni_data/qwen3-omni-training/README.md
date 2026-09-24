@@ -167,13 +167,14 @@ python examples/prepare_omni_data/qwen3-omni-training/script.py check \
   --report workspace/omni-training-batches.json
 ```
 
-This verifies all bundle hashes and exercises train/validation loaders for every
-available stage. Native Omni, DualPipeV media routing, global valid-target loss
-normalization and optimizer updates are still model-integration work; this
-command does not claim to train a model. `pretrain_lm` still calls its existing
-`.bin` loader; it does not import `create_omni_dataloader`. Its current multi-rank
-gradient scaling assumes equal valid-token counts per rank, which must be adapted
-when multimodal masks give ranks different target counts.
+This command verifies bundle hashes and exercises train/validation loaders; it
+does not train a model. The [training entry point](../../pretrain_lm/omni-data/README.md)
+now connects these stages to `pretrain_lm`, including device transfer, Microbatch
+context in normal/overlapped DualPipeV execution, global valid-target normalization
+and checkpointed consumption. Text retains the existing dense `.bin` loader.
+Media requires micro-batch size 1, CP=1 and a registered model that declares support
+for the selected modalities. Native Omni encoders/positions are not implemented;
+existing text-only models reject media stages before model allocation.
 
 For the existing **text** distributed batch path, use the same bundle's train-only
 token export (requires GPUs and the small processor files cached by preparation):
