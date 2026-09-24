@@ -148,3 +148,162 @@ def test_rejects_reserved_placeholder_in_paired_text(manifest, processor_config)
     sample = dict(Qwen3OmniDataset(manifest)[0], text="Unexpected <|image_pad|> token")
     with pytest.raises(ValueError, match="reserved media tokens"):
         Qwen3OmniCollator(processor, config)([sample])
+
+
+def test_indexed_shards_and_stage_guard(manifest, tmp_path):
+    rows = [json.loads(line) for line in manifest.read_text().splitlines()]
+    shards = [tmp_path / "one.jsonl", tmp_path / "two.jsonl"]
+    shards[0].write_text("\n".join(json.dumps(row) for row in rows[:2]))
+    shards[1].write_text("\n".join(json.dumps(row) for row in rows[2:]))
+    dataset = Qwen3OmniDataset(shards, media_root=tmp_path)
+    assert [dataset[i]["id"] for i in range(len(dataset))] == [row["id"] for row in rows]
+    assert dataset[-1]["id"] == "video"
+    assert len(dataset.offsets) == 2
+    with pytest.raises(ValueError, match="not enabled for this stage"):
+        Qwen3OmniDataset(shards, media_root=tmp_path, allowed_modalities={"text", "image"})
+
+
+def test_weighted_sampling_reproduces_dp_and_resume():
+    from collections import Counter
+
+    from pithtrain.modules.qwen3_omni_data import OmniMixtureSampler
+
+    groups, weights = {"text": [0, 1], "image": [2, 3]}, {"text": 1, "image": 3}
+    full = list(OmniMixtureSampler(groups, weights, 2000))
+    ranks = [
+        list(OmniMixtureSampler(groups, weights, 2000, rank=rank, world_size=2))
+        for rank in range(2)
+    ]
+    assert [value for pair in zip(*ranks) for value in pair] == full
+    assert list(OmniMixtureSampler(groups, weights, 2000, start_sample=12)) == full[12:]
+    assert (
+        list(OmniMixtureSampler(groups, weights, 2000, rank=1, world_size=2, start_sample=12))
+        == ranks[1][6:]
+    )
+    counts = Counter("text" if index < 2 else "image" for index in full)
+    assert 0.70 < counts["image"] / len(full) < 0.80
+    assert list(OmniMixtureSampler(groups, weights, 2000, epoch=1)) != full
+    with pytest.raises(ValueError, match="positive finite weight"):
+        OmniMixtureSampler(groups, {"text": 1, "image": -1}, 10)
+
+
+def test_training_preparation_splits_resume_and_integrity(tmp_path, processor_config, monkeypatch):
+    from pathlib import Path
+
+    import pithtrain.tasks.prepare_omni_data as prep
+    from pithtrain.modules.qwen3_omni_data import create_omni_dataloader
+
+    recipe_path = (
+        Path(__file__).parents[1] / "examples/prepare_omni_data/qwen3-omni-training/config.json"
+    )
+    recipe = json.loads(recipe_path.read_text())
+    recipe["samples_per_modality"] = {"train": 2, "validation": 1}
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(recipe))
+    monkeypatch.setattr(prep, "processor_for", lambda *args: processor_config)
+
+    def source_records(modality, split, source, cache, max_scan):
+        rows = (
+            [("one", "speaker-a"), ("one", "speaker-a"), ("two", "speaker-b")]
+            if split == "train"
+            else [("leak", "speaker-a"), ("three", "speaker-c")]
+        )
+        for sample_id, group in rows:
+            yield dict(id=sample_id, group=group, text=f"Text for {sample_id}.", origin=sample_id)
+
+    def interrupted(*args):
+        if args[1] == "validation":
+            raise RuntimeError("Simulated interrupted preparation")
+        yield from source_records(*args)
+
+    cfg = prep.PrepareOmniDataCfg()
+    cfg.recipe, cfg.output, cfg.cache = (
+        str(config_path),
+        str(tmp_path / "bundle"),
+        str(tmp_path / "cache"),
+    )
+    cfg.stage, cfg.offline = "text", True
+    monkeypatch.setattr(prep, "records", interrupted)
+    with pytest.raises(RuntimeError, match="interrupted"):
+        prep.launch(cfg)
+    assert not (Path(cfg.output) / "bundle.json").exists()
+    monkeypatch.setattr(prep, "records", source_records)
+    bundle = prep.launch(cfg)
+    assert bundle["statistics"]["train"]["text"]["samples"] == 2
+    assert bundle["statistics"]["train"]["text"]["rejected"] == {"duplicate sample": 1}
+    assert bundle["statistics"]["validation"]["text"]["rejected"] == {
+        "source group overlaps train/validation": 1
+    }
+    assert (Path(cfg.output) / "tokens/train/00000.bin").exists()
+    assert (Path(cfg.output) / "tokens/validation/00000.bin").exists()
+    assert prep.launch(cfg) == bundle
+    processor, config = processor_config
+    loader = create_omni_dataloader(cfg.output, processor, config, stage="text", split="validation")
+    assert [sample_id for batch in loader for sample_id in batch.sample_ids] == ["three"]
+    with pytest.raises(ValueError, match="not been prepared"):
+        create_omni_dataloader(cfg.output, processor, config, stage="image", split="train")
+    manifest = Path(cfg.output) / bundle["manifests"]["train"]["text"][0]
+    manifest.write_text(manifest.read_text() + "\n")
+    with pytest.raises(ValueError, match="hash mismatch"):
+        prep.verify_bundle(cfg.output)
+
+
+def test_source_cache_detects_changes_and_offline_misses(tmp_path):
+    from pithtrain.tasks.prepare_omni_data import SourceCache
+
+    cache = SourceCache(tmp_path)
+    path = cache.cached("source", ".txt", lambda dest: dest.write_text("original"))
+    offline = SourceCache(tmp_path, offline=True)
+    assert offline.cached("source", ".txt", None).read_text() == "original"
+    with pytest.raises(FileNotFoundError, match="Offline source cache miss"):
+        offline.cached("missing", ".txt", None)
+    path.write_text("changed")
+    with pytest.raises(RuntimeError, match="Corrupt source cache"):
+        offline.cached("source", ".txt", None)
+
+
+def test_interrupted_preparation_repairs_partial_media(
+    tmp_path, manifest, processor_config, monkeypatch
+):
+    from pathlib import Path
+
+    import pithtrain.tasks.prepare_omni_data as prep
+
+    recipe_path = (
+        Path(__file__).parents[1] / "examples/prepare_omni_data/qwen3-omni-training/config.json"
+    )
+    recipe = json.loads(recipe_path.read_text())
+    recipe["stages"]["image"] = ["image"]
+    recipe["samples_per_modality"] = {"train": 1, "validation": 1}
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(recipe))
+    Image.new("RGB", (64, 64), color=(0, 0, 255)).save(tmp_path / "validation.png")
+    source_paths = {"train": tmp_path / "image.png", "validation": tmp_path / "validation.png"}
+    monkeypatch.setattr(prep, "processor_for", lambda *args: processor_config)
+    monkeypatch.setattr(prep.SourceCache, "http_file", lambda self, url: source_paths[url])
+    interrupted = True
+
+    def records(modality, split, source, cache, max_scan):
+        if split == "validation" and interrupted:
+            raise RuntimeError("Simulated interruption")
+        yield dict(id=split, group=split, text="A colored square.", origin=split, url=split)
+
+    monkeypatch.setattr(prep, "records", records)
+    cfg = prep.PrepareOmniDataCfg()
+    cfg.recipe, cfg.output, cfg.cache = (
+        str(config_path),
+        str(tmp_path / "bundle"),
+        str(tmp_path / "cache"),
+    )
+    cfg.stage, cfg.offline = "image", True
+    with pytest.raises(RuntimeError, match="interruption"):
+        prep.launch(cfg)
+    partial_media = next((Path(cfg.output) / "media/image").iterdir())
+    partial_media.write_bytes(b"interrupted media write")
+    interrupted = False
+    bundle = prep.launch(cfg)
+    assert partial_media.read_bytes() == source_paths["train"].read_bytes()
+    assert prep.verify_bundle(cfg.output) == bundle
+    partial_media.write_bytes(b"corruption after completion")
+    with pytest.raises(ValueError, match="hash mismatch"):
+        prep.launch(cfg)

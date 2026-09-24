@@ -27,7 +27,9 @@ annotations, not claimed to be original dataset labels. Source cards and origina
 asset terms remain applicable; downloaded media is not committed to this repo.
 These five examples are integration data, not a production training corpus or a
 model-quality evaluation set. Larger local media/text collections use the same
-reader; this first map-style reader loads the manifest into memory.
+reader, which now indexes JSONL shards by byte offset. For source-labeled
+train/validation splits, scalable limits, mixture sampling and GCS publication,
+use the [training recipe](../qwen3-omni-training/README.md).
 
 Outputs go under ignored `workspace/datasets/omni-multimodal-smoke/`:
 
