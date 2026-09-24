@@ -1,0 +1,23 @@
+{
+  "dataset": {
+    "repo_id": "mlfoundations/dclm-baseline-1.0",
+    "revision": "a3b142c183aebe5af344955ae20836eb34dcf69b",
+    "filename": "global-shard_03_of_10/local-shard_1_of_10/shard_00000000_processed.jsonl.zst",
+    "num_documents": 128,
+    "documents_per_shard": 64,
+    "text_sha256": "608bcbe92298f007796745b518973d196dd61a58cb65f29664da872a5a7f1171"
+  },
+  "tokenizer": {
+    "repo_id": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+    "revision": "26291f793822fb6be9555850f06dfe95f2d7e695",
+    "eos_token": "<|im_end|>",
+    "eos_token_id": 151645
+  },
+  "pretraining": {
+    "sequence_length": 128,
+    "micro_batch_size": 1,
+    "global_batch_size": 8,
+    "max_steps": 4,
+    "seed": 1234
+  }
+}
