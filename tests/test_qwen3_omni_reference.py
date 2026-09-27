@@ -92,7 +92,10 @@ def test_native_omni_matches_hf(variant):
     tokens = torch.randint(0, config.vocab_size, (batch, 33), generator=generator, device="cpu").to(
         device
     )
-    inputs, labels = tokens[:, :-1].contiguous(), tokens[:, 1:].contiguous()
+    inputs = tokens[:, :-1].contiguous()
+    # With batch=1 both slices are already contiguous views of tokens. Boundary
+    # masking must not overwrite the next document's input with label ignore=-100.
+    labels = tokens[:, 1:].clone()
     cu, kwargs = None, {}
     if variant == "packed":
         cu = torch.tensor([0, 7, 19, 32], device=device, dtype=torch.int32)
