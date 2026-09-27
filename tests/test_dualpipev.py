@@ -4,6 +4,7 @@ The loss and gradients are compared with the reference implementation.
 """
 
 import argparse
+import math
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -61,9 +62,18 @@ def fill_weights(module: nn.Module):
 
 
 def calculate_difference(x: torch.Tensor, y: torch.Tensor) -> float:
-    x, y = x.double(), y.double()
-    cos_diff = 1 - 2 * (x * y).sum().item() / (x * x + y * y).sum().item()
-    return cos_diff
+    # Expert tensors contain hundreds of millions of elements in the original Qwen case.
+    # Keep the same FP64 normalized squared-error metric without several full-size copies.
+    assert x.shape == y.shape, f"Gradient shapes differ: {x.shape} != {y.shape}"
+    x, y = x.reshape(-1), y.reshape(-1)
+    dot, squared_norm = 0.0, 0.0
+    for start in range(0, x.numel(), 1 << 20):
+        x_chunk = x[start : start + (1 << 20)].double()
+        y_chunk = y[start : start + (1 << 20)].double()
+        dot += torch.dot(x_chunk, y_chunk).item()
+        squared_norm += torch.dot(x_chunk, x_chunk).item() + torch.dot(y_chunk, y_chunk).item()
+    assert math.isfinite(dot) and math.isfinite(squared_norm), "Non-finite gradient comparison"
+    return 0.0 if squared_norm == 0 else 1 - 2 * dot / squared_norm
 
 
 def criterion(output: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -429,6 +439,7 @@ def main(model_name: str):
         torch.distributed.barrier()
 
     # Validate the gradients.
+    print(f"[INFO] rank-{distributed.rank}: comparing gradients on CPU.", flush=True)
     eps = 1e-2
     largest_diff = 0
     largest_diff_param = None
