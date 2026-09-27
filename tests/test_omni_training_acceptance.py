@@ -110,6 +110,36 @@ def main():
     # exercises device transport and context association; it is not a vision/audio
     # encoder and cannot certify Omni semantics. No production capability is changed.
     seen, normal_calls, posemb_calls = Counter(), Counter(), Counter()
+    view_checks = []
+
+    def audit_method(method):
+        def checked(self, *a, **kw):
+            from torch.utils._pytree import tree_leaves
+
+            outputs = method(self, *a, **kw)
+            for output in tree_leaves(outputs):
+                if (
+                    not isinstance(output, torch.Tensor)
+                    or not output.requires_grad
+                    or output._base is None
+                ):
+                    continue
+                record = dict(tensor=output, version=output._version, backward=False)
+                view_checks.append(record)
+
+                def before_backward(gradient, record=record):
+                    tensor = record.pop("tensor")
+                    assert tensor._version == record["version"], (
+                        "A decoder view was modified in place"
+                    )
+                    record["backward"] = True
+                    return gradient
+
+                output.register_hook(before_backward)
+            return outputs
+
+        return checked
+
     original_prolog = Qwen3MoeModel.forward_prolog
     original_posemb = Qwen3MoeModel.forward_posemb
 
@@ -138,6 +168,19 @@ def main():
         return original_posemb(self, length, cu_seqlens)
 
     with ExitStack() as stack:
+        if not args.legacy:
+            from pithtrain.models.qwen3_moe import Qwen3MoeDecoderLayer
+
+            # Validate the condition in FSDP's view warning instead of suppressing
+            # it: every view's hook must run and its version must stay unchanged.
+            for method in ("forward_stage1", "forward_stage3", "forward_stage5"):
+                stack.enter_context(
+                    patch.object(
+                        Qwen3MoeDecoderLayer,
+                        method,
+                        audit_method(getattr(Qwen3MoeDecoderLayer, method)),
+                    )
+                )
         if args.media:
             stack.enter_context(
                 patch.object(
@@ -250,7 +293,13 @@ def main():
                 assert sum(posemb_calls.values()) > sum(normal_calls.values()), (
                     "No overlap context calls"
                 )
+        assert all(record["backward"] for record in view_checks), (
+            "A decoder view lost its backward hook"
+        )
         report = dict(
+            audited_view_hooks=len(view_checks),
+            source_file=str(Path(pretrain_lm.__file__).resolve()),
+            source_sha256=hashlib.sha256(Path(pretrain_lm.__file__).read_bytes()).hexdigest(),
             result="PASSED",
             start=start,
             steps=args.steps,

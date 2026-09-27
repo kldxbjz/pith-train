@@ -1,5 +1,6 @@
 """CPU tests for the training data boundary, checkpoint state and rank reductions."""
 
+import copy
 import hashlib
 import json
 from datetime import timedelta
@@ -134,6 +135,8 @@ def test_checkpoint_restores_model_optimizer_and_next_data(
     optimizer.step()
     scheduler.step()
     expected_weights = {name: value.detach().clone() for name, value in model.state_dict().items()}
+    expected_optimizer = copy.deepcopy(optimizer.state_dict())
+    expected_scheduler = copy.deepcopy(scheduler.state_dict())
     checkpoint = tmp_path / "checkpoint"
     state = CheckpointState(model, (optimizer,), (scheduler,), data_state=data)
     dcp.save({"app": state}, checkpoint_id=checkpoint)
@@ -147,7 +150,8 @@ def test_checkpoint_restores_model_optimizer_and_next_data(
     )
     dcp.load({"app": restored}, checkpoint_id=checkpoint)
     assert restored_data.consumed_samples == 4
-    assert restored_optimizer.state and restored_scheduler.last_epoch == scheduler.last_epoch
+    torch.testing.assert_close(restored_optimizer.state_dict(), expected_optimizer, rtol=0, atol=0)
+    assert restored_scheduler.state_dict() == expected_scheduler
     for name, value in restored_model.state_dict().items():
         torch.testing.assert_close(value, expected_weights[name])
     compare_batches(consume(restored_data, 1), expected_batch)

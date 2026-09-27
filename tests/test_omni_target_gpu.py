@@ -28,16 +28,23 @@ def main():
     group = mesh["dp_cp"].get_group()
     local = rank % 2
     device = torch.device("cuda", torch.cuda.current_device())
-    for empty_rank in (False, True):
+    for empty_rank, dtype in (
+        (False, torch.float32),
+        (True, torch.float32),
+        (False, torch.bfloat16),
+        (True, torch.bfloat16),
+    ):
         model = torch.nn.Linear(8, 32, bias=False, device=device)
         with torch.no_grad():
             model.weight.copy_(torch.linspace(-0.2, 0.2, 256, device=device).reshape(32, 8))
+        initial = model.weight.detach().clone()
         reference = torch.nn.Linear(8, 32, bias=False, device=device)
         reference.load_state_dict(model.state_dict())
+        reference.to(dtype=dtype)
         fully_shard(
             model,
             mesh=mesh["dp_cp"],
-            mp_policy=MixedPrecisionPolicy(param_dtype=torch.float32, reduce_dtype=torch.float32),
+            mp_policy=MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=torch.float32),
         )
         model.set_gradient_divide_factor(1.0)
         inputs = torch.arange(64, device=device).reshape(8, 8).float() / 64
@@ -53,18 +60,22 @@ def main():
             assert loss.item() == 0, loss
         loss.backward()
         model.weight.grad.div_(count)
-        expected = F.cross_entropy(reference(inputs), labels)
+        expected = F.cross_entropy(reference(inputs.to(dtype)).float(), labels)
         expected.backward()
+        rtol, atol = (1e-5, 1e-6) if dtype == torch.float32 else (1e-2, 1e-4)
         torch.testing.assert_close(
-            global_loss_mean(loss, count, group), expected.detach(), rtol=1e-5, atol=1e-6
+            global_loss_mean(loss, count, group), expected.detach(), rtol=rtol, atol=atol
         )
         torch.testing.assert_close(
-            model.weight.grad.full_tensor(), reference.weight.grad, rtol=1e-5, atol=1e-6
+            model.weight.grad.full_tensor(), reference.weight.grad.float(), rtol=rtol, atol=atol
         )
+        reference.float()
+        with torch.no_grad():
+            reference.weight.copy_(initial)
         torch.optim.SGD(model.parameters(), lr=0.1).step()
         torch.optim.SGD(reference.parameters(), lr=0.1).step()
         torch.testing.assert_close(
-            model.weight.full_tensor(), reference.weight, rtol=1e-5, atol=1e-6
+            model.weight.full_tensor(), reference.weight, rtol=rtol, atol=atol
         )
         # A globally empty batch must fail consistently on every PP-stage rank.
         mb.objective_inputs = (torch.full_like(y, -100),)
