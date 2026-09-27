@@ -67,8 +67,14 @@ torchrun --standalone --nproc-per-node=4 tests/test_omni_training_gpu.py \
 ```
 
 Use a fresh output directory. The test builds a reduced existing Qwen3 model with
-the real vocabulary, updates parameters, saves/restores training plus data state,
-and checks that replaying the second step reproduces its batch and parameters.
+the real vocabulary and takes two optimizer steps. Loading the first checkpoint
+must exactly restore model parameters, AdamW state, scheduler state and CUDA RNG.
+Replaying the second step must reproduce token IDs, labels and sequence boundaries,
+advance the data cursor, and produce finite nonzero gradients and a parameter
+update. Its loss is compared using the existing DualPipeV BF16 tolerance
+(`rtol=1e-3`, `atol=1e-3`). Post-update parameters are not compared elementwise:
+repeated GPU reductions can change gradients even without saving or loading.
+This is a data/checkpoint integration check, not a model numerical-regression test.
 `--context` uses a test-only consumer to check normal and overlapped context
 transport; it does not implement or validate an Omni encoder. CPU coverage is in
 `tests/test_omni_training.py`; GPU checks require Hopper/Blackwell hardware.
