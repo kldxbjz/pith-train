@@ -2,6 +2,8 @@
 
 Uses a reduced existing Qwen3 model with the real Omni vocabulary. This tests the
 training connection, not native Omni encoders or their numerical correctness.
+Checkpoint state and next inputs must restore exactly. The following BF16 step
+checks loss and a finite, nonzero update; GPU reductions are not bit-reproducible.
 Run with torchrun; --context also exercises a test-only model_context consumer.
 """
 
@@ -76,27 +78,67 @@ def main():
     data = pretrain_lm.setup_dataset(cfg)
     setup_training(cfg)
 
+    def snapshot(value):
+        if isinstance(value, torch.Tensor):
+            if hasattr(value, "to_local"):
+                value = value.to_local()
+            return value.detach().cpu().clone()
+        if isinstance(value, dict):
+            return {key: snapshot(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return type(value)(snapshot(item) for item in value)
+        return value
+
+    def runtime_state():
+        return snapshot(
+            {
+                "weights": dict(training.model.named_parameters()),
+                "optimizers": [opt.state_dict() for opt in training.optimizers],
+                "schedulers": [scheduler.state_dict() for scheduler in training.schedulers],
+                "cuda_rng": torch.cuda.get_rng_state(),
+            }
+        )
+
     def weights():
         return {
             name: p.detach().to_local().cpu().clone()
             for name, p in training.model.named_parameters()
         }
 
-    def check_weights(expected):
-        for name, value in weights().items():
+    def check_update(before):
+        after = weights()
+        for name, value in after.items():
             assert torch.isfinite(value).all(), name
-            torch.testing.assert_close(value, expected[name], rtol=1e-4, atol=1e-6, msg=name)
+        assert any(not torch.equal(value, before[name]) for name, value in after.items()), (
+            "Optimizer step did not change any model parameter"
+        )
 
     # Instrument the existing model only inside this test. Each normal/overlapped
     # posemb call must receive the context for that very microbatch; this consumer
     # deliberately has no audio/vision behavior and declares no media capability.
-    seen, normal_calls, batches_seen = Counter(), Counter(), []
+    seen, normal_calls, batches_seen, losses_seen = Counter(), Counter(), [], []
     original_prolog, original_posemb = Qwen3MoeModel.forward_prolog, Qwen3MoeModel.forward_posemb
     original_batch = pretrain_lm.get_global_batch
+    original_step = training.model.step
+    original_clip = pretrain_lm.clip_grad_norm
+
+    def model_step(*a, **kw):
+        losses = original_step(*a, **kw)
+        losses_seen.append(snapshot(losses))
+        return losses
+
+    def clip_grad_norm(*a, **kw):
+        norm = original_clip(*a, **kw)
+        assert torch.isfinite(norm) and norm > 0, f"Invalid training gradient norm: {norm}"
+        return norm
 
     def get_batch(*a, **kw):
         batches = original_batch(*a, **kw)
-        batches_seen.append([mb.model_inputs[0].cpu().clone() for mb in batches])
+        batches_seen.append(
+            snapshot([(mb.model_inputs, mb.objective_inputs, mb.cu_seqlens) for mb in batches])
+        )
+        if len(batches_seen) == 3:
+            torch.testing.assert_close(batches_seen[2], batches_seen[1], rtol=0, atol=0)
         if args.context:
             for i, mb in enumerate(batches):
                 mb.model_context = {
@@ -131,6 +173,8 @@ def main():
 
     with ExitStack() as stack:
         stack.enter_context(patch.object(pretrain_lm, "get_global_batch", get_batch))
+        stack.enter_context(patch.object(training.model, "step", model_step))
+        stack.enter_context(patch.object(pretrain_lm, "clip_grad_norm", clip_grad_norm))
         if args.context:
             for name, method in [
                 ("forward", forward),
@@ -140,23 +184,27 @@ def main():
                 stack.enter_context(patch.object(Qwen3MoeModel, name, method))
         initial = weights()
         pretrain_lm.train_step(cfg, data, 0)
-        saved = weights()
-        assert any(not torch.equal(value, initial[name]) for name, value in saved.items())
+        saved = runtime_state()
+        check_update(initial)
         del initial
         assert data.consumed_samples == t.global_batch_size
         pretrain_lm.train_step(cfg, data, 1)
-        expected = weights()
+        check_update(saved["weights"])
         restored = pretrain_lm.setup_dataset(cfg)
         load_checkpoint(t.save_location, 1, data_state=restored)
-        check_weights(saved)
-        del saved
+        torch.testing.assert_close(runtime_state(), saved, rtol=0, atol=0)
         assert restored.consumed_samples == t.global_batch_size
         t.save_interval = None
         pretrain_lm.train_step(cfg, restored, 1)
-        check_weights(expected)
+        check_update(saved["weights"])
+        # Same BF16 loss tolerance as test_dualpipev. Exact post-update weights
+        # are not a resume invariant: repeating backward without any checkpoint
+        # also changes a few expert gradients through nondeterministic reductions.
+        # Exact restore of the weights, AdamW, scheduler, RNG and data is checked
+        # above, before the replay performs any computation.
+        torch.testing.assert_close(losses_seen[2], losses_seen[1], rtol=1e-3, atol=1e-3)
         assert restored.consumed_samples == 2 * t.global_batch_size
-    for left, right in zip(batches_seen[1], batches_seen[2], strict=True):
-        torch.testing.assert_close(left, right, rtol=0, atol=0)
+    assert len(batches_seen) == len(losses_seen) == 3
     if args.context:
         chunks = t.global_batch_size // distributed.dp_size
         for module in training.model.module:
@@ -176,6 +224,9 @@ def main():
                     ep=args.ep,
                     context=args.context,
                     optimizer_steps=3,
+                    checkpoint_state_exact=True,
+                    resumed_batch_exact=True,
+                    replay_loss_close=True,
                     consumed_samples=restored.consumed_samples,
                 )
             ),
