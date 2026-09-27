@@ -1,6 +1,6 @@
 {
   "model_type": "qwen3_omni_moe_text",
-  "vocab_size": 256,
+  "vocab_size": 152064,
   "hidden_size": 128,
   "intermediate_size": 64,
   "num_hidden_layers": 4,

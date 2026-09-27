@@ -435,12 +435,8 @@ def main(model_name: str):
     failed = False
 
     for (n, p), p_ref in zip(local_modules.named_parameters(), local_full_modules.parameters()):
-        if p.grad is None:
-            print(
-                "[warn] rank-%d, Parameter %s doesn't have a gradient, skipping."
-                % (distributed.rank, n)
-            )
-            continue
+        assert p_ref.grad is not None, f"Reference parameter {n} has no gradient"
+        assert p.grad is not None, f"rank-{distributed.rank}: pipeline lost gradient for {n}"
         # Both parameter classes reduce with a plain sum over their own replica group, and either
         # sum spans every global chunk exactly once: the attn group is the whole dp x cp stage,
         # and the expt replica group covers all the data too, since every member receives the
