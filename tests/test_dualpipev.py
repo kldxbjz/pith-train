@@ -73,14 +73,13 @@ def objective(
 
 def reference_step(chunks, model: DeepSeekV2Model):
     """Run the reference forward/backward over the same micro-batches DualPipeV will see."""
-    ys, ls = [], []
+    ls = []
     for micro_x, micro_l, cu in chunks:
         micro_y = model.reference_forward(micro_x, cu)
         loss = criterion(micro_y, micro_l)
         loss.backward()
-        ys.append(micro_y)
-        ls.append(loss)
-    return torch.stack(ls), ys
+        ls.append(loss.detach())
+    return torch.stack(ls)
 
 
 def zigzag_shard(x: torch.Tensor, cp_rank: int, cp_size: int) -> torch.Tensor:
@@ -322,7 +321,11 @@ def main(model_name: str):
         print("[INFO] Running the reference step.", flush=True)
     torch.distributed.barrier()
 
-    loss_refs = [reference_step(chunks, full_modules)[0] for chunks in chunk_steps]
+    loss_refs = [reference_step(chunks, full_modules) for chunks in chunk_steps]
+    # Reference gradients stay available on host for comparison. Keeping both
+    # full copies and their gradients on GPU makes the 8-layer Qwen case OOM.
+    full_modules.cpu()
+    torch.cuda.empty_cache()
     distributed.pp_size, distributed.ep_size = pp_size, ep_size
     distributed.cp_size, distributed.cp_rank = cp_size, cp_rank
 
@@ -334,8 +337,9 @@ def main(model_name: str):
     num_stages = pp_size * 2
     local_full_modules = []
 
-    local_full_modules.append(ModelClass(config, phase=0))
-    local_full_modules.append(ModelClass(config, phase=1))
+    with torch.device("meta"):
+        local_full_modules.append(ModelClass(config, phase=0))
+        local_full_modules.append(ModelClass(config, phase=1))
 
     local_full_modules = nn.Sequential(*local_full_modules)
     if pp_rank == 0:
@@ -347,8 +351,9 @@ def main(model_name: str):
         full_modules.layers, num_stages - 1 - pp_rank, num_stages, config
     )
     if ep_size > 1:
-        shard_experts(local_full_modules[0], ep_rank=ep_rank, ep_size=ep_size)
-        shard_experts(local_full_modules[1], ep_rank=ep_rank, ep_size=ep_size)
+        with torch.device("cpu"):
+            shard_experts(local_full_modules[0], ep_rank=ep_rank, ep_size=ep_size)
+            shard_experts(local_full_modules[1], ep_rank=ep_rank, ep_size=ep_size)
 
     # Create the local modules with the same weights but zero gradients.
     local_modules = []
@@ -434,6 +439,7 @@ def main(model_name: str):
         p_grad = p.grad
         if isinstance(p_grad, torch.distributed.tensor.DTensor):
             p_grad = p_grad.full_tensor()
+        p_grad = p_grad.cpu()
         if cp_size > 1:
             # Each CP rank takes a mean over S/cp tokens, which is cp times its share of the
             # full-sequence mean, so the summed gradient overshoots the reference by exactly cp.
