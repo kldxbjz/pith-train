@@ -13,9 +13,10 @@ torchrun --standalone --nproc-per-node=1 examples/pretrain_lm/omni-data/script.p
 ```
 
 `--model` must name a model registered in PithTrain with a vocabulary of at least
-152064 entries. Reduced depth/width is fine; the 256-token HF comparison fixture
-and the unmodified Qwen3 example vocabulary are incompatible. This recipe does
-not download model weights. Native Qwen3-Omni is not registered yet.
+152064 entries. A reduced model must keep that vocabulary while reducing depth,
+width or expert count; never clamp token IDs or take them modulo a smaller
+vocabulary. This recipe does not download model weights. Native Qwen3-Omni
+registration and numerical validation are a separate model change.
 
 ## Data stages and model contract
 
@@ -78,3 +79,62 @@ This is a data/checkpoint integration check, not a model numerical-regression te
 `--context` uses a test-only consumer to check normal and overlapped context
 transport; it does not implement or validate an Omni encoder. CPU coverage is in
 `tests/test_omni_training.py`; GPU checks require Hopper/Blackwell hardware.
+
+## Independent-process acceptance
+
+`tests/test_omni_training_acceptance.py` complements the short integration check.
+Run the same reduced Qwen3 config and data through two unchanged-base processes,
+one feature process, and a fourth process restoring the feature's checkpoint 1.
+Each process must have a separate output directory. The base arms use `--legacy`
+and import an immutable archive of the PR base via `PYTHONPATH`; the feature
+uses the prepared bundle through `OmniPretrainData`.
+
+```bash
+# Example feature arm; the base arms use --legacy and the base source archive.
+torchrun --standalone --nproc-per-node=1 tests/test_omni_training_acceptance.py \
+  --dataset /tmp/omni-training --output /tmp/feature --report /tmp/feature-report
+torchrun --standalone --nproc-per-node=1 tests/test_omni_training_acceptance.py \
+  --dataset /tmp/omni-training --output /tmp/resumed --report /tmp/resumed-report \
+  --restore /tmp/feature/checkpoints --expected /tmp/feature-report
+python tests/compare_omni_acceptance.py \
+  /tmp/base0-report /tmp/base1-report /tmp/feature-report \
+  --resume /tmp/resumed-report --output /tmp/comparison.json
+```
+
+The default 12 steps at sequence length 128 and global batch 8 consume 96 of the
+small bundle's 97 complete text sequences. LR warms from 1e-6 to 1e-5. The reports
+include full-precision CE, load-balancing loss and gradient norms. The comparator
+requires every expected step/rank and identical input hashes; it rejects feature
+or resume drift at or above 3 times the repeated-base drift. A zero baseline with
+nonzero feature drift requires investigation. This is a short regression check,
+not evidence about long-run convergence.
+
+Fresh-process recovery requires exact hashes for every model parameter, AdamW
+entry, scheduler entry, CUDA RNG and committed data state, then exact hashes for
+every subsequent input. Post-update parameter equivalence is not asserted by
+this test. Decoder view outputs are audited: their versions must remain unchanged
+and every registered backward hook must run. The conditional FSDP warning is not
+silenced.
+
+`--media --steps 4 --sequence-length 1024 --pp 2 --ep 2` reads real prepared
+image/audio/video features and uses a test-only GPU consumer to exercise prolog,
+normal/overlapped position calls and fresh-process data replay. All four modalities
+must be observed. The scalar media injection is deliberately a transport test,
+not an Omni encoder or model-correctness reference.
+
+```bash
+torchrun --standalone --nproc-per-node=4 tests/test_omni_target_gpu.py
+```
+
+That independent test checks the actual fused CE and FSDP summed gradients in
+FP32 and BF16, with unequal labels, a rank containing only ignored labels and a
+globally empty batch. Two separate pipeline-stage groups catch accidental PP
+double-counting. Loss, gradients and an SGD update are compared with a global
+single-device reference.
+
+For recovery after the allocation ends, archive the completed checkpoint to
+durable storage, retain its SHA256 and per-rank expected reports, then stage it
+under a new local directory and run the same `--restore` command in a new job.
+The Orchard validation harness does this through personal GCS; local `/tmp`
+contents alone cannot survive node reclamation. A queued validation job is not
+a passing result; see the PR's current validation record before merging.
