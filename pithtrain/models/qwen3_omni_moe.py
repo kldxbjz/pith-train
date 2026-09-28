@@ -17,7 +17,6 @@ from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
 from pithtrain.operators.grouped_linear import GroupedLinearFunc
 from pithtrain.operators.ring_attention import ring_attention_func
-from pithtrain.operators.silu_mul import silu_mul
 from pithtrain.operators.token_scatter import padded_index_gather, scatter_for_grouped_gemm
 from pithtrain.pipeline.dualpipev import layer_partition
 from pithtrain.pipeline.execution import ChunkRecord, model_forward
@@ -86,7 +85,9 @@ class Qwen3OmniMoeThinkerTextExperts(nn.Module):
             gate, up = F.linear(x, self.gate_up_proj[0]).chunk(2, dim=-1)
             return F.linear(F.silu(gate) * up, self.down_proj[0])
         gate, up = GroupedLinearFunc.apply(x, self.gate_up_proj, grouped_mm_offs).chunk(2, dim=-1)
-        activated = silu_mul(gate.contiguous(), up.contiguous())
+        # Match HF's BF16 SiLU output before multiplication. Fusing the two
+        # roundings can perturb later top-k routes and their expert gradients.
+        activated = F.silu(gate) * up
         return GroupedLinearFunc.apply(activated, self.down_proj, grouped_mm_offs)
 
 
@@ -151,7 +152,7 @@ class Qwen3OmniMoeThinkerTextMLP(nn.Module):
         self.down_proj = training.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x):
-        return self.down_proj(silu_mul(self.gate_proj(x), self.up_proj(x)))
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
     reference_forward = forward
 
