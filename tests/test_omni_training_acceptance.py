@@ -325,7 +325,8 @@ def main():
             ),
             flush=True,
         )
-    torch.distributed.destroy_process_group()
+    # setup_default_process_group owns teardown through its atexit callback.
+    # Destroying it here as well makes that callback fail on a clean exit.
 
 
 if __name__ == "__main__":
