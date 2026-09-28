@@ -27,10 +27,19 @@ def main():
     assert [p.name for p in ranks] == sorted(p.name for p in args.base1.glob("rank*.json"))
     assert [p.name for p in ranks] == sorted(p.name for p in args.feature.glob("rank*.json"))
     for rank in ranks:
-        batches = [
-            json.loads((path / rank.name).read_text())["batches"]
+        arms = [
+            json.loads((path / rank.name).read_text())
             for path in (args.base0, args.base1, args.feature)
         ]
+        for arm in arms:
+            assert arm["result"] == "PASSED" and arm["steps"] == steps and arm["start"] == 0
+        initial = [arm["initial_state"] for arm in arms]
+        assert initial[0] == initial[1] == initial[2], f"Unmatched initial weights on {rank.name}"
+        hooks = [arm["audited_view_hooks"] for arm in arms]
+        assert hooks[0] == hooks[1] == hooks[2] and hooks[0] > 0, (
+            f"Unmatched or missing decoder view audits on {rank.name}: {hooks}"
+        )
+        batches = [arm["batches"] for arm in arms]
         assert batches[0] == batches[1] == batches[2], f"Unmatched inputs on {rank.name}"
     metrics = {}
     passed = True

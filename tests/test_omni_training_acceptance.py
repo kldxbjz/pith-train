@@ -168,19 +168,20 @@ def main():
         return original_posemb(self, length, cu_seqlens)
 
     with ExitStack() as stack:
-        if not args.legacy:
-            from pithtrain.models.qwen3_moe import Qwen3MoeDecoderLayer
+        from pithtrain.models.qwen3_moe import Qwen3MoeDecoderLayer
 
-            # Validate the condition in FSDP's view warning instead of suppressing
-            # it: every view's hook must run and its version must stay unchanged.
-            for method in ("forward_stage1", "forward_stage3", "forward_stage5"):
-                stack.enter_context(
-                    patch.object(
-                        Qwen3MoeDecoderLayer,
-                        method,
-                        audit_method(getattr(Qwen3MoeDecoderLayer, method)),
-                    )
+        # Audit every arm identically: registering autograd hooks only on the
+        # feature changes the comparison, even when each hook returns its input.
+        # Validate the condition in FSDP's view warning instead of suppressing
+        # it: every view's hook must run and its version must stay unchanged.
+        for method in ("forward_stage1", "forward_stage3", "forward_stage5"):
+            stack.enter_context(
+                patch.object(
+                    Qwen3MoeDecoderLayer,
+                    method,
+                    audit_method(getattr(Qwen3MoeDecoderLayer, method)),
                 )
+            )
         if args.media:
             stack.enter_context(
                 patch.object(
@@ -293,10 +294,12 @@ def main():
                 assert sum(posemb_calls.values()) > sum(normal_calls.values()), (
                     "No overlap context calls"
                 )
+        assert view_checks, "No decoder views were audited"
         assert all(record["backward"] for record in view_checks), (
             "A decoder view lost its backward hook"
         )
         report = dict(
+            initial_state=initial,
             audited_view_hooks=len(view_checks),
             source_file=str(Path(pretrain_lm.__file__).resolve()),
             source_sha256=hashlib.sha256(Path(pretrain_lm.__file__).read_bytes()).hexdigest(),
