@@ -2,7 +2,8 @@
 
 Run each arm in a NEW torchrun process. Reports retain full precision metrics,
 input hashes and exact checkpoint-state hashes. --legacy also runs on the PR's
-base archive so data/normalization changes are compared against unchanged code.
+base archive. Record rank-local objective sums/counts separately from the training
+logger: the base logs DP0, while the feature logs a global DP x CP mean.
 """
 
 import argparse
@@ -222,11 +223,22 @@ def main():
             )
             start = args.checkpoint_step
 
-        rows, batches = [], []
+        rows, batches, loss_statistics = [], [], []
         original_batch = pretrain_lm.get_global_batch
+        original_step = training.model.step
+        objective_outputs, local_target_count = None, None
+
+        def model_step(microbatches, objective):
+            nonlocal objective_outputs
+            objective_outputs = original_step(microbatches, objective)
+            return objective_outputs
 
         def get_batch(*a, **kw):
+            nonlocal local_target_count
             result = original_batch(*a, **kw)
+            local_target_count = sum(
+                int((mb.objective_inputs[0] != -100).sum().item()) for mb in result
+            )
             batch = digest(
                 [
                     (
@@ -263,6 +275,7 @@ def main():
             assert row["train/gradient-norm"] > 0, row
             rows.append(row)
 
+        stack.enter_context(patch.object(training.model, "step", model_step))
         stack.enter_context(patch.object(pretrain_lm, "get_global_batch", get_batch))
         stack.enter_context(patch.object(pretrain_lm, "activate_wandb", lambda _: None))
         stack.enter_context(patch.object(logging, "wandb", object()))
@@ -271,6 +284,24 @@ def main():
         initial = digest(dict(training.model.named_parameters()))
         for step in range(start, args.steps):
             pretrain_lm.train_step(cfg, data, step)
+            # Observe the same detached objective outputs in every arm. Do not
+            # replace the training logger or change its reduction/gradients.
+            # The offline comparator can then form a global token-weighted mean
+            # independently, excluding PP copies and validating the raw logs.
+            assert objective_outputs is not None and local_target_count is not None
+            if distributed.pp_rank == 0:
+                assert (
+                    len(objective_outputs)
+                    == t.global_batch_size // distributed.dp_size // t.micro_batch_size
+                )
+                loss_statistics.append(
+                    dict(
+                        loss_sum=float(torch.stack(objective_outputs).double().sum().item()),
+                        target_count=local_target_count,
+                    )
+                )
+            else:
+                assert not objective_outputs
             if not args.legacy and args.restore is None and step + 1 == args.checkpoint_step:
                 save_checkpoint(t.save_location, step + 1, data_state=data)
                 checkpoint_state = runtime_state()
@@ -307,6 +338,17 @@ def main():
             start=start,
             steps=args.steps,
             rows=rows,
+            loss_statistics=loss_statistics,
+            legacy=args.legacy,
+            mesh=dict(
+                rank=distributed.rank,
+                pp_rank=distributed.pp_rank,
+                dp_rank=distributed.dp_rank,
+                cp_rank=distributed.cp_rank,
+                pp_size=distributed.pp_size,
+                dp_size=distributed.dp_size,
+                cp_size=distributed.cp_size,
+            ),
             batches=batches,
             checkpoint_state=checkpoint_state,
             exact_restore=expected is not None,
