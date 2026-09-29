@@ -35,7 +35,9 @@ def native_name(name):
     return name if name.startswith("lm_head.") else "model." + name
 
 
-@pytest.mark.parametrize("variant", ["moe", "dense-and-unnormalized-router", "packed"])
+@pytest.mark.parametrize(
+    "variant", ["moe", "dense-and-unnormalized-router", "packed", "odd-length"]
+)
 def test_native_omni_matches_hf(variant):
     from pithtrain.contexts import distributed, training
     from pithtrain.models.qwen3_omni_moe import Qwen3OmniMoeThinkerTextModel
@@ -88,10 +90,12 @@ def test_native_omni_matches_hf(variant):
             assert value.shape == expected_params[name].shape, name
             value.copy_(expected_params[name])
     generator = torch.Generator(device="cpu").manual_seed(7)
-    batch = 1 if variant == "packed" else 2
-    tokens = torch.randint(0, config.vocab_size, (batch, 33), generator=generator, device="cpu").to(
-        device
-    )
+    batch = 1 if variant in {"packed", "odd-length"} else 2
+    # Real media exposed CP1 dropping the last RoPE position at odd lengths.
+    length = 69 if variant == "odd-length" else 32
+    tokens = torch.randint(
+        0, config.vocab_size, (batch, length + 1), generator=generator, device="cpu"
+    ).to(device)
     inputs = tokens[:, :-1].contiguous()
     # With batch=1 both slices are already contiguous views of tokens. Boundary
     # masking must not overwrite the next document's input with label ignore=-100.
