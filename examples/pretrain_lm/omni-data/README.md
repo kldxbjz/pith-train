@@ -116,11 +116,14 @@ this test. Decoder view outputs are audited: their versions must remain unchange
 and every registered backward hook must run. The conditional FSDP warning is not
 silenced.
 
-`--media --steps 4 --sequence-length 1024 --pp 2 --ep 2` reads real prepared
+`--media --steps 4 --sequence-length 2048 --pp 2 --ep 2` reads real prepared
 image/audio/video features and uses a test-only GPU consumer to exercise prolog,
 normal/overlapped position calls and fresh-process data replay. All four modalities
 must be observed. The scalar media injection is deliberately a transport test,
-not an Omni encoder or model-correctness reference.
+not an Omni encoder or model-correctness reference. Use the same sequence length
+for the producer and every recovery process. The default recipe accepts expanded
+media/text sequences up to 2048 tokens; a smaller training limit can reject an
+otherwise valid prepared sample. Media placeholders must not be truncated to fit.
 
 ```bash
 torchrun --standalone --nproc-per-node=4 tests/test_omni_target_gpu.py
