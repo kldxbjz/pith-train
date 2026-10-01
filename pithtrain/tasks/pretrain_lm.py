@@ -21,19 +21,19 @@ from pithtrain.modules.checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
-from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
 from pithtrain.modules.logging import LoggingCfg, activate_wandb, setup_logging
 from pithtrain.modules.optimizer import clip_grad_norm
 from pithtrain.modules.training import TrainingCfg, model_class_for_config, setup_training
 from pithtrain.modules.training_data import (
+    DensePretrainData,
     OmniDataCfg,
     OmniPretrainData,
+    PretrainData,
     global_loss_mean,
     global_target_count,
 )
-from pithtrain.operators.cp_sequence import zigzag_spans
 from pithtrain.operators.cross_entropy import cross_entropy
 from pithtrain.pipeline import Microbatch
 
@@ -68,103 +68,27 @@ class PretrainLMCfg(SlottedDefault):
     """
 
 
-def setup_dataset(cfg: PretrainLMCfg) -> ConcatDataset | OmniPretrainData:
-    """
-    Build the legacy dense corpus or the configured stage of a prepared Omni bundle.
-    """
-    data = None
-    root = cfg.dataset
-    if cfg.omni_data is not None:
-        data = OmniPretrainData(
-            root,
-            cfg.omni_data,
-            cfg.training,
-            dp_rank=distributed.dp_rank,
-            dp_size=distributed.dp_size,
-            cp_size=distributed.cp_size,
-        )
-        config = AutoConfig.from_pretrained(cfg.training.model)
-        data.validate_model(model_class_for_config(config), config)
-        if not data.is_text:
-            return data
-        root = Path(root) / "tokens/train"
-    files = sorted(root.rglob("*.bin"))
-    if not files:
-        raise ValueError(f"No token shards under {root}")
-    memmaps = [MemmapDataset(file, cfg.training.sequence_length) for file in files]
-    dataset = ConcatDataset(memmaps, cfg.training.seed)
-    required = cfg.training.max_steps * cfg.training.global_batch_size
-    assert len(dataset) >= required, f"corpus has {len(dataset)} samples, run needs {required}"
-    if data is not None:
-        data.dense = dataset
-        return data
-    return dataset
+def setup_dataset(cfg: PretrainLMCfg) -> PretrainData:
+    """Choose a data source once; the training loop uses the same interface for each."""
+    ranks = dict(
+        dp_rank=distributed.dp_rank,
+        dp_size=distributed.dp_size,
+        cp_rank=distributed.cp_rank,
+        cp_size=distributed.cp_size,
+    )
+    if cfg.omni_data is None:
+        return DensePretrainData(cfg.dataset, cfg.training, **ranks)
+    data = OmniPretrainData(cfg.dataset, cfg.omni_data, cfg.training, **ranks)
+    config = AutoConfig.from_pretrained(cfg.training.model)
+    data.validate_model(model_class_for_config(config), config)
+    return data
 
 
 def get_global_batch(
-    cfg: PretrainLMCfg, dataset: ConcatDataset | OmniPretrainData, step: int, device: torch.device
+    cfg: PretrainLMCfg, dataset: PretrainData, step: int, device: torch.device
 ) -> List[Microbatch]:
-    """
-    Gather the portion of the global batch belonging to this rank, already split into micro-batches.
-
-    dp_rank alone decides which data this rank loads: the expert rank names the experts a rank
-    hosts, never the data it sees. Every pipeline rank loads the same samples, since the offsets
-    below follow the step and the data and context ranks and never the pipeline rank, so each
-    builds an identical list and DualPipeV needs no broadcast to learn the shapes. Only the first
-    rank consumes the tensors, since under the V-shape it holds both the embedding and the loss.
-    """
-    if isinstance(dataset, OmniPretrainData):
-        dataset.begin_step(step)
-        if not dataset.is_text:
-            return dataset.media_microbatches(device)
-        dataset = dataset.dense
-    # short-hands
-    micro_batch_size = cfg.training.micro_batch_size
-    global_batch_size = cfg.training.global_batch_size
-    dp_size = distributed.dp_size
-    dp_rank = distributed.dp_rank
-    sequence_length = cfg.training.sequence_length
-
-    # arithmetic for dataset indices
-    effective_batch_size = micro_batch_size * dp_size
-    local_batch_size = global_batch_size // dp_size
-    start0 = step * global_batch_size + dp_rank * micro_batch_size
-
-    # two blocks per rank under zigzag CP; at cp_size 1 this is one contiguous read
-    front, back = zigzag_spans(distributed.cp_rank, distributed.cp_size, sequence_length)
-    block = len(front)
-    local_seq_len = 2 * block
-
-    # single allocation on host, then one HtoD transfer per tensor
-    local_tokens = torch.empty((local_batch_size, local_seq_len), dtype=torch.long)
-    local_labels = torch.empty((local_batch_size, local_seq_len), dtype=torch.long)
-
-    # fill in one pass: k iterates over our rank-local batch rows. Each sample
-    # is two memmap reads (front block + back block) followed by an in-place
-    # concat into the pre-allocated host buffer.
-    for k in range(local_batch_size):
-        acc, off = divmod(k, micro_batch_size)
-        index = start0 + acc * effective_batch_size + off
-        tokens_a, labels_a = dataset.get_chunk(index, front.start, block)
-        tokens_b, labels_b = dataset.get_chunk(index, back.start, block)
-        local_tokens[k, :block] = tokens_a
-        local_tokens[k, block:] = tokens_b
-        local_labels[k, :block] = labels_a
-        local_labels[k, block:] = labels_b
-
-    local_tokens = local_tokens.to(device, non_blocking=True)
-    local_labels = local_labels.to(device, non_blocking=True)
-
-    # Rows are already micro-batch major, so a plain split reproduces the partitioning the pipeline
-    # applies itself: rows [i * mbs, (i + 1) * mbs) belong to micro-batch i.
-    return [
-        Microbatch(
-            model_inputs=(local_tokens[i : i + micro_batch_size],),
-            cu_seqlens=None,
-            objective_inputs=(local_labels[i : i + micro_batch_size],),
-        )
-        for i in range(0, local_batch_size, micro_batch_size)
-    ]
+    """Get this rank's microbatches; retained as the task's batch observation point."""
+    return dataset.get_batch(step, device)
 
 
 def objective(
@@ -189,7 +113,7 @@ def objective(
     return loss, loss.detach()
 
 
-def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset | OmniPretrainData, step: int) -> None:
+def train_step(cfg: PretrainLMCfg, dataset: PretrainData, step: int) -> None:
     """
     Execute one step of training.
     """
@@ -253,8 +177,7 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset | OmniPretrainData, st
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         scheduler.step()
-    if isinstance(dataset, OmniPretrainData):
-        dataset.commit_step(step)
+    dataset.commit_step(step)
     MoELoadBalanceLossTracker.reset()
 
     # Measure the elapsed time in seconds.
@@ -342,7 +265,7 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset | OmniPretrainData, st
             save_checkpoint(
                 cfg.training.save_location,
                 completed,
-                data_state=dataset if isinstance(dataset, OmniPretrainData) else None,
+                data_state=dataset.checkpoint_state,
             )
 
     # Run deferred GC here so cyclic collection never fires mid-forward/backward.
@@ -365,7 +288,7 @@ def launch(cfg: PretrainLMCfg) -> None:
         load_checkpoint(
             cfg.training.save_location,
             step,
-            data_state=dataset if isinstance(dataset, OmniPretrainData) else None,
+            data_state=dataset.checkpoint_state,
         )
     step = step or 0
     gc.disable()

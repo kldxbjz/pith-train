@@ -91,9 +91,9 @@ def main():
     assert t.sequence_length % (2 * d.cp_size) == 0
 
     dataset = setup_dataset(cfg)
-    indices = torch.from_numpy(np.array(dataset.indices, dtype=np.int64))
-    assert len(dataset) == len(inputs)
-    assert torch.equal(indices.sort().values, torch.arange(len(dataset))), "Invalid shuffle"
+    indices = torch.from_numpy(np.array(dataset.corpus.indices, dtype=np.int64))
+    assert len(dataset.corpus) == len(inputs)
+    assert torch.equal(indices.sort().values, torch.arange(len(dataset.corpus))), "Invalid shuffle"
     digests = [None] * d.world_size
     torch.distributed.all_gather_object(
         digests, hashlib.sha256(indices.numpy().tobytes()).hexdigest()
@@ -102,7 +102,7 @@ def main():
     # Reinitializing with the same seed must give the same global sample order.
     torch.distributed.barrier()
     dataset = setup_dataset(cfg)
-    assert np.array_equal(dataset.indices, indices.numpy()), "Shuffle is not reproducible"
+    assert np.array_equal(dataset.corpus.indices, indices.numpy()), "Shuffle is not reproducible"
     front, back = zigzag_spans(d.cp_rank, d.cp_size, t.sequence_length)
     positions = torch.tensor([*front, *back])
     for step in range(t.max_steps):
@@ -122,6 +122,7 @@ def main():
         actual_y = torch.cat([micro.objective_inputs[0] for micro in batch]).cpu()
         torch.testing.assert_close(actual_x, expected_x, rtol=0, atol=0)
         torch.testing.assert_close(actual_y, expected_y, rtol=0, atol=0)
+        dataset.commit_step(step)
     torch.distributed.barrier()
     if d.rank == 0:
         print(
@@ -135,7 +136,7 @@ def main():
                     steps=t.max_steps,
                     samples_per_step=t.global_batch_size,
                     sequence_length=t.sequence_length,
-                    dataset_samples=len(dataset),
+                    dataset_samples=len(dataset.corpus),
                     vocab_size=metadata["vocab_size"],
                 )
             ),

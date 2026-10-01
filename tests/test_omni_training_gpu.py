@@ -191,7 +191,7 @@ def main():
         pretrain_lm.train_step(cfg, data, 1)
         check_update(saved["weights"])
         restored = pretrain_lm.setup_dataset(cfg)
-        load_checkpoint(t.save_location, 1, data_state=restored)
+        load_checkpoint(t.save_location, 1, data_state=restored.checkpoint_state)
         torch.testing.assert_close(runtime_state(), saved, rtol=0, atol=0)
         assert restored.consumed_samples == t.global_batch_size
         t.save_interval = None

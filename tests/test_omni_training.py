@@ -68,8 +68,7 @@ def source(root, *, stage="video", rank=0, world=1, seed=1234, cp=1):
 
 
 def consume(data, step):
-    data.begin_step(step)
-    batches = data.media_microbatches("cpu")
+    batches = data.get_batch(step, "cpu")
     data.commit_step(step)
     return batches
 
@@ -115,12 +114,11 @@ def test_training_rejects_unsupported_layout_and_uncommitted_save(
     _, config = processor_config
     with pytest.raises(ValueError, match="does not implement"):
         data.validate_model(type("TextOnly", (), {}), config)
-    data.begin_step(0)
-    data.media_microbatches("cpu")
+    data.get_batch(0, "cpu")
     with pytest.raises(RuntimeError, match="optimizer step"):
         data.state_dict()
     with pytest.raises(ValueError, match="disagree"):
-        data.begin_step(0)
+        data.get_batch(0, "cpu")
 
 
 def test_checkpoint_restores_model_optimizer_and_next_data(
@@ -138,7 +136,7 @@ def test_checkpoint_restores_model_optimizer_and_next_data(
     expected_optimizer = copy.deepcopy(optimizer.state_dict())
     expected_scheduler = copy.deepcopy(scheduler.state_dict())
     checkpoint = tmp_path / "checkpoint"
-    state = CheckpointState(model, (optimizer,), (scheduler,), data_state=data)
+    state = CheckpointState(model, (optimizer,), (scheduler,), data_state=data.checkpoint_state)
     dcp.save({"app": state}, checkpoint_id=checkpoint)
     expected_batch = consume(data, 1)
     restored_data = source(training_bundle)
@@ -146,7 +144,10 @@ def test_checkpoint_restores_model_optimizer_and_next_data(
     restored_optimizer = torch.optim.AdamW(restored_model.parameters(), lr=0.01)
     restored_scheduler = torch.optim.lr_scheduler.LambdaLR(restored_optimizer, lambda _: 1.0)
     restored = CheckpointState(
-        restored_model, (restored_optimizer,), (restored_scheduler,), data_state=restored_data
+        restored_model,
+        (restored_optimizer,),
+        (restored_scheduler,),
+        data_state=restored_data.checkpoint_state,
     )
     dcp.load({"app": restored}, checkpoint_id=checkpoint)
     assert restored_data.consumed_samples == 4

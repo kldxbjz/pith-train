@@ -80,6 +80,14 @@ This is a data/checkpoint integration check, not a model numerical-regression te
 transport; it does not implement or validate an Omni encoder. CPU coverage is in
 `tests/test_omni_training.py`; GPU checks require Hopper/Blackwell hardware.
 
+The training task consumes all sources through `PretrainData`: `get_batch(step, device)`,
+`commit_step(step)` after optimization, and `checkpoint_state` for save/restore.
+`DensePretrainData` retains the existing token packing, corpus shuffle and DP/CP slicing;
+its position comes from the training step, so legacy checkpoints need no data-state entry.
+`OmniPretrainData` owns the dense or media reader and checkpoints the committed cursor and
+recipe identity. Adding a source with this interface does not require a type check in the
+training loop. This interface does not extend media support beyond CP1/microbatch1.
+
 ## Independent-process acceptance
 
 `tests/test_omni_training_acceptance.py` complements the short integration check.

@@ -217,7 +217,7 @@ def main():
         if args.restore is not None:
             assert not args.legacy and args.expected is not None
             expected = json.loads((args.expected / f"rank{distributed.rank}.json").read_text())
-            load_checkpoint(args.restore, args.checkpoint_step, data_state=data)
+            load_checkpoint(args.restore, args.checkpoint_step, data_state=data.checkpoint_state)
             assert runtime_state() == expected["checkpoint_state"], (
                 "Fresh-process restored state differs"
             )
@@ -303,7 +303,7 @@ def main():
             else:
                 assert not objective_outputs
             if not args.legacy and args.restore is None and step + 1 == args.checkpoint_step:
-                save_checkpoint(t.save_location, step + 1, data_state=data)
+                save_checkpoint(t.save_location, step + 1, data_state=data.checkpoint_state)
                 checkpoint_state = runtime_state()
         final = digest(dict(training.model.named_parameters()))
         assert initial != final, "Training did not update weights"

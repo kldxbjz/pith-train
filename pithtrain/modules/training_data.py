@@ -1,16 +1,20 @@
-"""Prepared Omni data at the training-task boundary; optional media imports are lazy."""
+"""A shared pretraining data boundary; optional media imports remain lazy."""
 
 import hashlib
 import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 import torch
 import torch.distributed as dist
+from torch.distributed.checkpoint.stateful import Stateful
 
 from pithtrain.config import SlottedDefault
+from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
 from pithtrain.modules.microbatch import Microbatch
+from pithtrain.operators.cp_sequence import zigzag_spans
 
 
 @dataclass(init=False, slots=True)
@@ -39,6 +43,100 @@ def global_loss_mean(local_loss_sum, target_count, group=None):
     return total / target_count
 
 
+class PretrainData(Protocol):
+    """The task reads a batch, commits after optimization, and checkpoints its data state.
+
+    Sources whose position follows solely from the training step can return None
+    for checkpoint_state. Stateful sources must reject saving an uncommitted batch.
+    """
+
+    def get_batch(self, step: int, device: torch.device) -> list[Microbatch]: ...
+
+    def commit_step(self, step: int) -> None: ...
+
+    @property
+    def checkpoint_state(self) -> Stateful | None: ...
+
+
+class DensePretrainData:
+    """The existing shuffled token stream, with its DP ordering and zigzag CP reads.
+
+    The training step determines the position, so legacy checkpoints need no
+    additional data state. PP and EP ranks never select different samples.
+    """
+
+    def __init__(self, root, training_cfg, *, dp_rank=0, dp_size=1, cp_rank=0, cp_size=1):
+        self.training_cfg = training_cfg
+        self.dp_rank, self.dp_size = dp_rank, dp_size
+        self.cp_rank, self.cp_size = cp_rank, cp_size
+        files = sorted(Path(root).rglob("*.bin"))
+        if not files:
+            raise ValueError(f"No token shards under {root}")
+        memmaps = [MemmapDataset(file, training_cfg.sequence_length) for file in files]
+        self.corpus = ConcatDataset(memmaps, training_cfg.seed)
+        required = training_cfg.max_steps * training_cfg.global_batch_size
+        assert len(self.corpus) >= required, (
+            f"corpus has {len(self.corpus)} samples, run needs {required}"
+        )
+
+    @property
+    def checkpoint_state(self) -> None:
+        return None
+
+    def commit_step(self, step: int) -> None:
+        # No separate cursor: get_batch indexes the corpus from the training step.
+        pass
+
+    def get_batch(self, step: int, device: torch.device) -> list[Microbatch]:
+        # short-hands
+        micro_batch_size = self.training_cfg.micro_batch_size
+        global_batch_size = self.training_cfg.global_batch_size
+        dp_size = self.dp_size
+        dp_rank = self.dp_rank
+        sequence_length = self.training_cfg.sequence_length
+
+        # arithmetic for dataset indices
+        effective_batch_size = micro_batch_size * dp_size
+        local_batch_size = global_batch_size // dp_size
+        start0 = step * global_batch_size + dp_rank * micro_batch_size
+
+        # two blocks per rank under zigzag CP; at cp_size 1 this is one contiguous read
+        front, back = zigzag_spans(self.cp_rank, self.cp_size, sequence_length)
+        block = len(front)
+        local_seq_len = 2 * block
+
+        # single allocation on host, then one HtoD transfer per tensor
+        local_tokens = torch.empty((local_batch_size, local_seq_len), dtype=torch.long)
+        local_labels = torch.empty((local_batch_size, local_seq_len), dtype=torch.long)
+
+        # fill in one pass: k iterates over our rank-local batch rows. Each sample
+        # is two memmap reads (front block + back block) followed by an in-place
+        # concat into the pre-allocated host buffer.
+        for k in range(local_batch_size):
+            acc, off = divmod(k, micro_batch_size)
+            index = start0 + acc * effective_batch_size + off
+            tokens_a, labels_a = self.corpus.get_chunk(index, front.start, block)
+            tokens_b, labels_b = self.corpus.get_chunk(index, back.start, block)
+            local_tokens[k, :block] = tokens_a
+            local_tokens[k, block:] = tokens_b
+            local_labels[k, :block] = labels_a
+            local_labels[k, block:] = labels_b
+
+        local_tokens = local_tokens.to(device, non_blocking=True)
+        local_labels = local_labels.to(device, non_blocking=True)
+
+        # Rows are already micro-batch major, so a plain split reproduces the partitioning the pipeline
+        # applies itself: rows [i * mbs, (i + 1) * mbs) belong to micro-batch i.
+        return [
+            Microbatch(
+                model_inputs=(local_tokens[i : i + micro_batch_size],),
+                cu_seqlens=None,
+                objective_inputs=(local_labels[i : i + micro_batch_size],),
+            )
+            for i in range(0, local_batch_size, micro_batch_size)
+        ]
+
+
 class OmniPretrainData:
     """Checkpointable data position shared by all ranks.
 
@@ -47,7 +145,7 @@ class OmniPretrainData:
     Only commit_step advances the durable cursor; prefetch does not count.
     """
 
-    def __init__(self, root, cfg, training_cfg, *, dp_rank=0, dp_size=1, cp_size=1):
+    def __init__(self, root, cfg, training_cfg, *, dp_rank=0, dp_size=1, cp_rank=0, cp_size=1):
         # Keep legacy text training independent of the optional omni-data extra.
         from pithtrain.tasks.prepare_omni_data import verify_bundle
 
@@ -74,7 +172,6 @@ class OmniPretrainData:
         if type(cfg.num_workers) is not int or cfg.num_workers < 0:
             raise ValueError("num_workers must be nonnegative")
         self.is_text = self.modalities == ["text"]
-        self.dense = None
         self.weights = (
             cfg.sampling_weights
             if cfg.sampling_weights is not None
@@ -121,6 +218,28 @@ class OmniPretrainData:
             epoch_samples=self.epoch_samples,
         )
         self.fingerprint = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+        self._dense = (
+            DensePretrainData(
+                self.root / "tokens/train",
+                training_cfg,
+                dp_rank=dp_rank,
+                dp_size=dp_size,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+            )
+            if self.is_text
+            else None
+        )
+
+    @property
+    def checkpoint_state(self) -> Stateful:
+        return self
+
+    def get_batch(self, step: int, device: torch.device) -> list[Microbatch]:
+        self.begin_step(step)
+        if self._dense is not None:
+            return self._dense.get_batch(step, device)
+        return self._media_microbatches(device)
 
     def validate_model(self, model_class, model_config):
         text_config = getattr(
@@ -190,7 +309,7 @@ class OmniPretrainData:
         with torch.device("cpu"):
             self._iterator = iter(loader)
 
-    def media_microbatches(self, device):
+    def _media_microbatches(self, device):
         if self.is_text or self.pending_step is None:
             raise RuntimeError("Media batches must be requested inside a media training step")
         if self._iterator is None:
