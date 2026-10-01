@@ -417,7 +417,8 @@ def setup_model(
 
     assert hasattr(module_config, "hidden_size")
     assert isinstance(module_config.hidden_size, int)
-    if cfg.sequence_length % (2 * cp_size) != 0:
+    # CP=1 has no sequence sharding, so its length may be odd.
+    if cp_size > 1 and cfg.sequence_length % (2 * cp_size) != 0:
         raise ValueError(
             f"sequence_length ({cfg.sequence_length}) must be divisible by "
             f"2 * context_parallel_size ({2 * cp_size}); zigzag ring attention "
