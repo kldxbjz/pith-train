@@ -56,6 +56,9 @@ def test_one_data_config_owns_source_and_independent_defaults(tmp_path):
     left, right = task.PretrainLMCfg(), task.PretrainLMCfg()
     assert left.data is not right.data
     assert not hasattr(left, "dataset") and not hasattr(left, "omni_data")
+    for removed in ("dataset", "omni_data"):
+        with pytest.raises(AttributeError, match=removed):
+            setattr(left, removed, tmp_path)
     left.data.dataset = tmp_path
     left.data.validate()
     assert left.data.to_json_dict() == dict(

@@ -211,3 +211,35 @@ def test_dense_rejects_missing_and_insufficient_corpus(text_corpus, tmp_path):
     cfg.max_steps = 5
     with pytest.raises(AssertionError, match="run needs"):
         DensePretrainData(root, cfg)
+
+
+def test_pre_datacfg_text_checkpoint_keeps_identity_and_next_batch(text_bundle):
+    root, cfg = text_bundle
+    # Independently construct the version-1 state written before DataCfg. In this
+    # fixture the old recipe has 2 text records, rounded to one global batch of 8.
+    identity = dict(
+        version=1,
+        bundle_sha256=hashlib.sha256((root / "bundle.json").read_bytes()).hexdigest(),
+        stage="text",
+        global_batch_size=8,
+        micro_batch_size=1,
+        sequence_length=16,
+        seed=431,
+        weights={"text": 1.0},
+        epoch_samples=8,
+    )
+    saved = dict(
+        version=1,
+        fingerprint=hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest(),
+        consumed_samples=8,
+    )
+    ranks = dict(dp_rank=1, dp_size=2, cp_rank=1, cp_size=2)
+    restored = OmniPretrainData(prepared_config(root), cfg, **ranks)
+    restored.load_state_dict(saved)
+    assert restored.state_dict() == saved
+    dense = DensePretrainData(root / "tokens/train", cfg, **ranks)
+    torch.testing.assert_close(
+        tensors(restored.get_batch(1, "cpu")), tensors(dense.get_batch(1, "cpu")), rtol=0, atol=0
+    )
+    restored.commit_step(1)
+    assert restored.state_dict() == dict(saved, consumed_samples=16)
