@@ -129,8 +129,10 @@ uses the prepared bundle through `OmniPretrainData`.
 ```bash
 # Example feature arm; the base arms use --legacy and the base source archive.
 torchrun --standalone --nproc-per-node=1 tests/test_omni_training_acceptance.py \
+  --observation-protocol save_then_runtime_state_v1 \
   --dataset /tmp/omni-training --output /tmp/feature --report /tmp/feature-report
 torchrun --standalone --nproc-per-node=1 tests/test_omni_training_acceptance.py \
+  --observation-protocol save_then_runtime_state_v1 \
   --dataset /tmp/omni-training --output /tmp/resumed --report /tmp/resumed-report \
   --restore /tmp/feature/checkpoints --expected /tmp/feature-report
 python tests/compare_omni_acceptance.py \
@@ -178,3 +180,11 @@ under a new local directory and run the same `--restore` command in a new job.
 The Orchard validation harness does this through personal GCS; local `/tmp`
 contents alone cannot survive node reclamation. A queued validation job is not
 a passing result; see the PR's current validation record before merging.
+
+Acceptance reports use schema 3. Every producer, including `--legacy`, saves one
+checkpoint and hashes its full runtime state after the configured checkpoint step.
+The historical base is called through its original two-argument checkpoint API.
+Restore arms independently assert exact restored state and subsequent inputs; they
+do not repeat the producer save. Reports from earlier schemas remain historical
+evidence and cannot serve as schema-3 restore references. This aligns the observation
+boundary and call counts, not the internal implementations or GPU timing.

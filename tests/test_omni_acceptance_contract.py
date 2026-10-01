@@ -35,6 +35,8 @@ def arguments(root, *extra):
         str(root / "run"),
         "--report",
         str(root / "report"),
+        "--observation-protocol",
+        "save_then_runtime_state_v1",
         *extra,
     ]
 
@@ -79,7 +81,11 @@ def test_required_checkpoint_state_kind(tmp_path, data_format):
 
 def example_report(data_format="prepared_bundle"):
     return dict(
-        report_version=2,
+        report_version=3,
+        checkpoint_observation=dict(
+            protocol="save_then_runtime_state_v1",
+            events=[dict(operation=name, step=1) for name in ("save_checkpoint", "runtime_state")],
+        ),
         result="PASSED",
         start=0,
         steps=3,
@@ -108,6 +114,9 @@ def example_report(data_format="prepared_bundle"):
     "change",
     [
         {"report_version": 1},
+        {"report_version": 2},
+        {"checkpoint_observation": None},
+        {"checkpoint_observation": {"protocol": "save_then_runtime_state_v1", "events": []}},
         {"legacy": True},
         {"data_format": "token_bin"},
         {"media": True},
@@ -207,7 +216,7 @@ class CPUTraining(SimpleNamespace):
         return SlottedDefault._make_json_serializable(vars(self))
 
 
-def install_cpu_runtime(monkeypatch, data_root, events, fault):
+def install_cpu_runtime(monkeypatch, data_root, events, fault, *, legacy=False):
     """Fresh model/data per main call; actual runner observes CPU stand-ins."""
     # Import real bundle verification before replacing the logging runtime.
     importlib.import_module("pithtrain.tasks.prepare_omni_data")
@@ -229,6 +238,14 @@ def install_cpu_runtime(monkeypatch, data_root, events, fault):
     task.PretrainLMCfg = task_config(
         TrainingCfg=lambda: CPUTraining(seed=1234, init_std=0.02),
     ).PretrainLMCfg
+    if legacy:
+
+        def historical_config():
+            cfg = HistoricalConfig()
+            cfg.training = CPUTraining(seed=1234, init_std=0.02)
+            return cfg
+
+        task.PretrainLMCfg = historical_config
     task.activate_wandb = lambda _: None
     task.wandb = SimpleNamespace(log=lambda _: None)
 
@@ -271,7 +288,9 @@ def install_cpu_runtime(monkeypatch, data_root, events, fault):
         events.append(("model", id(context.model)))
 
     def setup_dataset(cfg):
-        if cfg.data.format == "token_bin":
+        if legacy:
+            data = DensePretrainData(cfg.dataset, cfg.training)
+        elif cfg.data.format == "token_bin":
             data = DensePretrainData(cfg.data.dataset, cfg.training)
         else:
             data = OmniPretrainData(cfg.data, cfg.training)
@@ -301,8 +320,10 @@ def install_cpu_runtime(monkeypatch, data_root, events, fault):
             }
         )
 
-    def save_checkpoint(path, step, *, data_state):
+    def save_current_checkpoint(path, step, *, data_state):
         assert events[-1] == ("commit", step - 1)
+        if fault == "save":
+            raise RuntimeError("save failed before observation")
         path.mkdir(parents=True, exist_ok=True)
         torch.save(
             dict(
@@ -315,6 +336,10 @@ def install_cpu_runtime(monkeypatch, data_root, events, fault):
             path / f"{step}.pt",
         )
         events.append(("save", data_state is None))
+
+    def save_legacy_checkpoint(path, step):
+        # Exact historical API: supplying data_state would raise TypeError.
+        return save_current_checkpoint(path, step, data_state=None)
 
     def load_checkpoint(path, step, *, data_state):
         state = torch.load(path / f"{step}.pt", weights_only=True)
@@ -357,7 +382,7 @@ def install_cpu_runtime(monkeypatch, data_root, events, fault):
         monkeypatch,
         "pithtrain.modules.checkpoint",
         load_checkpoint=load_checkpoint,
-        save_checkpoint=save_checkpoint,
+        save_checkpoint=save_legacy_checkpoint if legacy else save_current_checkpoint,
     )
     stub_module(monkeypatch, "pithtrain.pipeline.execution", model_forward=lambda *a, **kw: None)
     monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
@@ -393,6 +418,8 @@ def test_actual_runner_constructs_and_restores_each_provider(
                     str(output),
                     "--report",
                     str(output / "report"),
+                    "--observation-protocol",
+                    "save_then_runtime_state_v1",
                     "--data-format",
                     data_format,
                     "--steps",
@@ -444,3 +471,128 @@ def test_actual_runner_constructs_and_restores_each_provider(
         else:
             assert ("load", data_format == "token_bin") in events
         assert not torch.cuda.is_initialized()
+
+
+def test_historical_producer_must_save_and_hash_at_the_common_boundary(
+    monkeypatch, tmp_path, text_bundle
+):
+    data_root, _ = text_bundle
+    events = []
+    with torch.random.fork_rng(devices=[]):
+        install_cpu_runtime(monkeypatch, data_root, events, None, legacy=True)
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                str(Path(runner.__file__)),
+                *arguments(data_root, "--legacy", "--steps", "3", "--sequence-length", "16"),
+            ],
+        )
+        runner.main()
+    report = json.loads((data_root / "report/rank0.json").read_text())
+    assert [event for event in events if event[0] == "save"] == [("save", True)]
+    assert report["checkpoint_state"] is not None
+    assert report["checkpoint_state"]["data"] is None
+    assert (data_root / "run/checkpoints/1.pt").is_file()
+
+
+@pytest.mark.parametrize("fault", [None, "save", "state_hash"])
+@pytest.mark.parametrize("mode", ["legacy", "token_bin", "prepared_bundle"])
+def test_every_producer_has_one_ordered_observation_and_stops_on_failure(
+    monkeypatch, tmp_path, text_bundle, mode, fault
+):
+    data_root, _ = text_bundle
+    events = []
+    with torch.random.fork_rng(devices=[]):
+        install_cpu_runtime(monkeypatch, data_root, events, fault, legacy=mode == "legacy")
+        real_digest = runner.digest
+
+        def observed_digest(value):
+            if isinstance(value, dict) and set(value) == {
+                "weights",
+                "optimizers",
+                "schedulers",
+                "cuda_rng",
+                "data",
+            }:
+                assert events[-1] == ("save", mode != "prepared_bundle")
+                events.append(("state_hash", 1))
+                if fault == "state_hash":
+                    raise RuntimeError("state hash failed")
+            return real_digest(value)
+
+        monkeypatch.setattr(runner, "digest", observed_digest)
+        extra = ["--legacy"] if mode == "legacy" else ["--data-format", mode]
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                str(Path(runner.__file__)),
+                *arguments(data_root, "--steps", "3", "--sequence-length", "16", *extra),
+            ],
+        )
+        if fault:
+            with pytest.raises(RuntimeError, match="failed"):
+                runner.main()
+            assert not (data_root / "report/rank0.json").exists()
+            assert [event for event in events if event[0] == "commit"] == [("commit", 0)]
+        else:
+            runner.main()
+            report = json.loads((data_root / "report/rank0.json").read_text())
+            assert report["report_version"] == 3
+            assert report["checkpoint_observation"] == {
+                "protocol": "save_then_runtime_state_v1",
+                "events": [
+                    {"operation": "save_checkpoint", "step": 1},
+                    {"operation": "runtime_state", "step": 1},
+                ],
+            }
+            assert report["config"]["save_interval"] is None
+            assert [event for event in events if event[0] in {"commit", "save", "state_hash"}] == [
+                ("commit", 0),
+                ("save", mode != "prepared_bundle"),
+                ("state_hash", 1),
+                ("commit", 1),
+                ("commit", 2),
+            ]
+        assert not torch.cuda.is_initialized()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["wrong_protocol", "missing_save", "missing_hash", "reverse", "duplicate", "wrong_step"],
+)
+def test_restore_rejects_malformed_observation(tmp_path, mutation):
+    report = example_report()
+    observation = report["checkpoint_observation"]
+    if mutation == "wrong_protocol":
+        observation["protocol"] = "feature_only_historical"
+    elif mutation == "missing_save":
+        observation["events"].pop(0)
+    elif mutation == "missing_hash":
+        observation["events"].pop()
+    elif mutation == "reverse":
+        observation["events"].reverse()
+    elif mutation == "duplicate":
+        observation["events"].append(observation["events"][0])
+    else:
+        observation["events"][0]["step"] = 2
+    args = runner.parse_args(arguments(tmp_path, "--steps", "3"))
+    with pytest.raises(AssertionError, match="observation"):
+        runner.validate_restore_report(
+            report,
+            args,
+            mesh=report["mesh"],
+            config=report["config"],
+            source_sha256=report["source_sha256"],
+        )
+
+
+def test_observation_protocol_must_be_explicit(tmp_path):
+    argv = arguments(tmp_path)
+    at = argv.index("--observation-protocol")
+    del argv[at : at + 2]
+    with pytest.raises(SystemExit):
+        runner.parse_args(argv)
+    with pytest.raises(SystemExit):
+        runner.parse_args([*argv, "--observation-protocol", "feature_only_historical"])

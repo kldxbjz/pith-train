@@ -18,6 +18,16 @@ from unittest.mock import patch
 
 import torch
 
+REPORT_VERSION = 3
+OBSERVATION_PROTOCOL = "save_then_runtime_state_v1"
+
+
+def observation_events(step):
+    """Ordered producer boundary, after the completed step/objective observation."""
+    return [
+        dict(operation=operation, step=step) for operation in ("save_checkpoint", "runtime_state")
+    ]
+
 
 def digest(value):
     """Hash every state entry, including shape/dtype, without storing a second checkpoint."""
@@ -59,6 +69,12 @@ def parse_args(argv=None):
     parser.add_argument("--restore", type=Path)
     parser.add_argument("--expected", type=Path)
     parser.add_argument("--checkpoint-step", type=int, default=1)
+    parser.add_argument(
+        "--observation-protocol",
+        required=True,
+        choices=(OBSERVATION_PROTOCOL,),
+        help="Explicit versioned checkpoint/state observation, identical for all producers",
+    )
     args = parser.parse_args(argv)
     args.data_format = args.data_format or ("token_bin" if args.legacy else "prepared_bundle")
     if args.legacy and (args.data_format != "token_bin" or args.media):
@@ -104,7 +120,13 @@ def checkpoint_data(data, args):
 
 def validate_restore_report(expected, args, *, mesh, config, source_sha256):
     assert expected["result"] == "PASSED" and expected["start"] == 0
-    assert expected["report_version"] == 2, "Restore requires the current report schema"
+    assert expected["report_version"] == REPORT_VERSION, (
+        "Restore requires the current report schema"
+    )
+    assert expected["checkpoint_observation"] == dict(
+        protocol=args.observation_protocol,
+        events=observation_events(args.checkpoint_step),
+    ), "Restore requires the complete producer observation boundary"
     assert not expected["legacy"], "Cannot restore against a historical-base report"
     assert expected["data_format"] == args.data_format, "Restore data format differs"
     assert expected["media"] == args.media, "Restore modalities differ"
@@ -184,6 +206,7 @@ def main():
     t.fp8, t.moe_load_balance_coef = False, 0.01
     t.moe_load_balance_type = "global-batch"
     t.save_location = args.output / "checkpoints"
+    t.save_interval = None  # Only the explicit common observation boundary may save.
     setup_logging(cfg)
     setup_distributed(cfg)
     if distributed.rank == 0:
@@ -416,6 +439,7 @@ def main():
         stack.enter_context(patch.object(logging, "wandb", object()))
         stack.enter_context(patch.object(pretrain_lm.wandb, "log", capture))
         checkpoint_state = None
+        checkpoint_events = []
         initial = digest(dict(training.model.named_parameters()))
         for step in range(start, args.steps):
             pretrain_lm.train_step(cfg, data, step)
@@ -439,9 +463,18 @@ def main():
                 )
             else:
                 assert not objective_outputs
-            if not args.legacy and args.restore is None and step + 1 == args.checkpoint_step:
-                save_checkpoint(t.save_location, step + 1, data_state=data_state)
+            if args.restore is None and step + 1 == args.checkpoint_step:
+                # Every producer saves and hashes at this same boundary. The
+                # historical base predates the data_state keyword; its dense
+                # cursor is still derived from the step, just as in current dense.
+                if args.legacy:
+                    assert data_state is None
+                    save_checkpoint(t.save_location, step + 1)
+                else:
+                    save_checkpoint(t.save_location, step + 1, data_state=data_state)
+                checkpoint_events.append(dict(operation="save_checkpoint", step=step + 1))
                 checkpoint_state = runtime_state()
+                checkpoint_events.append(dict(operation="runtime_state", step=step + 1))
         final = digest(dict(training.model.named_parameters()))
         assert initial != final, "Training did not update weights"
         for parameter in training.model.parameters():
@@ -466,8 +499,14 @@ def main():
         assert all(record["backward"] for record in view_checks), (
             "A decoder view lost its backward hook"
         )
+        assert checkpoint_events == (
+            observation_events(args.checkpoint_step) if expected is None else []
+        ), "Incomplete or duplicate checkpoint observation"
         report = dict(
-            report_version=2,
+            report_version=REPORT_VERSION,
+            checkpoint_observation=dict(
+                protocol=args.observation_protocol, events=checkpoint_events
+            ),
             data_format=args.data_format,
             parallelism=dict(pp=args.pp, cp=args.cp, ep=args.ep),
             media=args.media,

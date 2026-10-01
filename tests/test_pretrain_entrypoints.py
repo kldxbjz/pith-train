@@ -195,6 +195,8 @@ def test_acceptance_runner_preserves_data_selection(monkeypatch, tmp_path, histo
             str(tmp_path / "run"),
             "--report",
             str(tmp_path / "report"),
+            "--observation-protocol",
+            "save_then_runtime_state_v1",
             "--pp",
             "2",
             "--ep",
