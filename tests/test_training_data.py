@@ -22,7 +22,8 @@ from pithtrain.operators.cp_sequence import zigzag_spans
 
 
 @pytest.fixture
-def text_corpus(tmp_path, monkeypatch):
+def text_corpus(tmp_path, monkeypatch, request):
+    sequence_length = getattr(request, "param", 16)
     monkeypatch.setenv("LOCAL_RANK", "0")
     monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
     monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
@@ -31,14 +32,23 @@ def text_corpus(tmp_path, monkeypatch):
     inputs, labels = [], []
     # Distinct shards exercise concat offsets; short tails must stay dropped.
     for shard, count in enumerate((17, 19)):
-        tokens = np.arange(count * 16 + 7, dtype=np.uint32) + shard * 10000
+        tail = max(1, sequence_length // 2 - 1)
+        tokens = np.arange(count * sequence_length + tail, dtype=np.uint32) + shard * 10000
         with (token_root / f"{shard}.bin").open("wb") as stream:
             np.save(stream, tokens)
             np.save(stream, np.array([len(tokens)], dtype=np.uint64))
-        inputs.append(tokens[: count * 16].astype(np.int64).reshape(count, 16))
-        labels.append(tokens[1 : count * 16 + 1].astype(np.int64).reshape(count, 16))
+        inputs.append(
+            tokens[: count * sequence_length].astype(np.int64).reshape(count, sequence_length)
+        )
+        labels.append(
+            tokens[1 : count * sequence_length + 1].astype(np.int64).reshape(count, sequence_length)
+        )
     cfg = SimpleNamespace(
-        global_batch_size=8, micro_batch_size=1, sequence_length=16, seed=431, max_steps=3
+        global_batch_size=8,
+        micro_batch_size=1,
+        sequence_length=sequence_length,
+        seed=431,
+        max_steps=3,
     )
     return (
         token_root,
@@ -112,6 +122,44 @@ def test_dense_batches_match_global_token_oracle(text_corpus, dp_size, cp_size, 
                 torch.testing.assert_close(actual_y, labels[selected][:, positions], rtol=0, atol=0)
                 data.commit_step(step)
     assert torch.equal(torch.get_rng_state(), rng)
+
+
+@pytest.mark.parametrize("text_corpus", [1, 5], indirect=True)
+@pytest.mark.parametrize("prepared", [False, True])
+def test_cp1_odd_text_keeps_every_token_and_target(text_corpus, text_bundle, prepared):
+    token_root, cfg, inputs, labels = text_corpus
+    bundle_root, _ = text_bundle
+    cfg.micro_batch_size = 2
+    dp_size = 2
+    # The oracle is the complete original stream, without CP splitting arithmetic.
+    order = torch.randperm(len(inputs), generator=torch.Generator().manual_seed(cfg.seed))
+    selected = order[: cfg.max_steps * cfg.global_batch_size].reshape(
+        cfg.max_steps, -1, dp_size, cfg.micro_batch_size
+    )
+    for dp_rank in range(dp_size):
+        ranks = dict(dp_rank=dp_rank, dp_size=dp_size, cp_rank=0, cp_size=1)
+
+        def make_data():
+            if prepared:
+                return OmniPretrainData(prepared_config(bundle_root), cfg, **ranks)
+            return DensePretrainData(token_root, cfg, **ranks)
+
+        data = make_data()
+        for step in range(cfg.max_steps):
+            batch = data.get_batch(step, "cpu")
+            assert all(
+                mb.model_inputs[0].shape == (cfg.micro_batch_size, cfg.sequence_length)
+                for mb in batch
+            )
+            indices = selected[step, :, dp_rank].flatten()
+            actual_inputs, actual_labels = tensors(batch)
+            torch.testing.assert_close(actual_inputs, inputs[indices], rtol=0, atol=0)
+            torch.testing.assert_close(actual_labels, labels[indices], rtol=0, atol=0)
+            data.commit_step(step)
+            if prepared and step == 0:
+                state = data.checkpoint_state.state_dict()
+                data = make_data()
+                data.checkpoint_state.load_state_dict(state)
 
 
 def test_prepared_text_uses_same_batches_and_committed_resume(text_bundle):

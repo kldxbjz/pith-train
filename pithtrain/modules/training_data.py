@@ -91,10 +91,10 @@ class DensePretrainData:
         local_batch_size = global_batch_size // dp_size
         start0 = step * global_batch_size + dp_rank * micro_batch_size
 
-        # two blocks per rank under zigzag CP; at cp_size 1 this is one contiguous read
+        # CP1 spans cover the full sequence and can have unequal lengths.
         front, back = zigzag_spans(self.cp_rank, self.cp_size, sequence_length)
-        block = len(front)
-        local_seq_len = 2 * block
+        front_len, back_len = len(front), len(back)
+        local_seq_len = front_len + back_len
 
         # single allocation on host, then one HtoD transfer per tensor
         local_tokens = torch.empty((local_batch_size, local_seq_len), dtype=torch.long)
@@ -106,12 +106,12 @@ class DensePretrainData:
         for k in range(local_batch_size):
             acc, off = divmod(k, micro_batch_size)
             index = start0 + acc * effective_batch_size + off
-            tokens_a, labels_a = self.corpus.get_chunk(index, front.start, block)
-            tokens_b, labels_b = self.corpus.get_chunk(index, back.start, block)
-            local_tokens[k, :block] = tokens_a
-            local_tokens[k, block:] = tokens_b
-            local_labels[k, :block] = labels_a
-            local_labels[k, block:] = labels_b
+            tokens_a, labels_a = self.corpus.get_chunk(index, front.start, front_len)
+            tokens_b, labels_b = self.corpus.get_chunk(index, back.start, back_len)
+            local_tokens[k, :front_len] = tokens_a
+            local_tokens[k, front_len:] = tokens_b
+            local_labels[k, :front_len] = labels_a
+            local_labels[k, front_len:] = labels_b
 
         local_tokens = local_tokens.to(device, non_blocking=True)
         local_labels = local_labels.to(device, non_blocking=True)
