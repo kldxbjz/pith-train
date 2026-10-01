@@ -65,12 +65,14 @@ def main():
     from pithtrain.tasks import pretrain_lm
 
     cfg = pretrain_lm.PretrainLMCfg()
-    cfg.dataset = args.dataset / "tokens/train" if args.legacy else args.dataset
-    if not args.legacy:
-        from pithtrain.modules.training_data import OmniDataCfg
-
-        cfg.omni_data = OmniDataCfg()
-        cfg.omni_data.stage = "video" if args.media else "text"
+    if args.legacy:
+        # This identical runner also imports the immutable PR-base config API.
+        data_cfg = cfg.data if hasattr(cfg, "data") else cfg
+        data_cfg.dataset = args.dataset / "tokens/train"
+    else:
+        cfg.data.dataset = args.dataset
+        cfg.data.format = "prepared_bundle"
+        cfg.data.modalities = ("text", "image", "audio", "video") if args.media else ("text",)
     cfg.distributed.pipeline_parallel_size = args.pp
     cfg.distributed.context_parallel_size = args.cp
     cfg.distributed.expert_parallel_size = args.ep

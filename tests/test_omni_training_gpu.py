@@ -37,13 +37,12 @@ def main():
         make_constant_scheduler,
         setup_training,
     )
-    from pithtrain.modules.training_data import OmniDataCfg
     from pithtrain.pipeline.execution import model_forward
     from pithtrain.tasks import pretrain_lm
 
     cfg = pretrain_lm.PretrainLMCfg()
-    cfg.dataset = args.dataset
-    cfg.omni_data = OmniDataCfg()
+    cfg.data.dataset = args.dataset
+    cfg.data.format = "prepared_bundle"
     cfg.distributed.pipeline_parallel_size = args.pp
     cfg.distributed.context_parallel_size = args.cp
     cfg.distributed.expert_parallel_size = args.ep

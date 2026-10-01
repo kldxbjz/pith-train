@@ -75,7 +75,7 @@ def main():
     from pithtrain.tasks.pretrain_lm import PretrainLMCfg, get_global_batch, setup_dataset
 
     cfg = PretrainLMCfg()
-    cfg.dataset = args.dataset / "tokens/train"
+    cfg.data.dataset = args.dataset / "tokens/train"
     cfg.training.sequence_length = args.sequence_length
     cfg.training.global_batch_size = args.global_batch_size
     cfg.training.micro_batch_size = args.micro_batch_size

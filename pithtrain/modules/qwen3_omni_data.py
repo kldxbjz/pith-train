@@ -22,6 +22,8 @@ import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, Sampler
 
+from pithtrain.modules.data_config import resolve_bundle_modalities
+
 
 class Qwen3OmniDataset(Dataset):
     """Index JSONL shards by byte offset; decode records only when requested.
@@ -380,7 +382,8 @@ def create_omni_dataloader(
     processor,
     thinker_config,
     *,
-    stage,
+    stage=None,
+    modalities=None,
     split,
     batch_size=1,
     num_samples=None,
@@ -393,7 +396,7 @@ def create_omni_dataloader(
     seed=None,
     batch_cfg=None,
 ):
-    """Read a prepared bundle and select only modalities supported by this stage.
+    """Read a prepared bundle using a named stage or explicit modalities, exclusively.
 
     Training uses weighted sampling. Validation reads each selected record once,
     in order; this initial evaluation reader is single-process (no DP padding).
@@ -419,7 +422,14 @@ def create_omni_dataloader(
     if bundle["status"] != "complete" or split not in {"train", "validation"}:
         raise ValueError("Expected a completed bundle and train/validation split")
     recipe = bundle["recipe"]
-    modalities = recipe["stages"][stage]
+    if (stage is None) == (modalities is None):
+        raise ValueError("Supply exactly one of stage or modalities")
+    if stage is not None:
+        if stage not in recipe["stages"]:
+            raise ValueError(f"Unknown data stage: {stage}")
+        modalities = recipe["stages"][stage]
+    else:
+        modalities, _ = resolve_bundle_modalities(recipe, modalities)
     available = bundle["manifests"][split]
     missing = set(modalities) - set(available)
     if missing:

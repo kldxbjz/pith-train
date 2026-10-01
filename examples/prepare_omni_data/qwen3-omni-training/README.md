@@ -168,7 +168,7 @@ python examples/prepare_omni_data/qwen3-omni-training/script.py check \
 ```
 
 This command verifies bundle hashes and exercises train/validation loaders; it
-does not train a model. The [training entry point](../../pretrain_lm/omni-data/README.md)
+does not train a model. The [training entry point](../../pretrain_lm/qwen3-omni/README.md)
 now connects these stages to `pretrain_lm`, including device transfer, Microbatch
 context in normal/overlapped DualPipeV execution, global valid-target normalization
 and checkpointed consumption. Text retains the existing dense `.bin` loader.

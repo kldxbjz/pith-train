@@ -21,6 +21,7 @@ from pithtrain.modules.checkpoint import (
     load_checkpoint,
     save_checkpoint,
 )
+from pithtrain.modules.data_config import DataCfg
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
 from pithtrain.modules.logging import LoggingCfg, activate_wandb, setup_logging
@@ -28,7 +29,6 @@ from pithtrain.modules.optimizer import clip_grad_norm
 from pithtrain.modules.training import TrainingCfg, model_class_for_config, setup_training
 from pithtrain.modules.training_data import (
     DensePretrainData,
-    OmniDataCfg,
     OmniPretrainData,
     PretrainData,
     global_loss_mean,
@@ -59,26 +59,22 @@ class PretrainLMCfg(SlottedDefault):
     Logging configuration.
     """
 
-    omni_data: OmniDataCfg | None = None
-    """When set, dataset names a prepared Omni bundle rather than a bare .bin directory."""
-
-    dataset: Path
-    """
-    Tokenized corpus root (globbed for *.bin), or a prepared bundle when omni_data is set.
-    """
+    data: DataCfg = field(default_factory=DataCfg)
+    """Dataset location, storage format, modalities and sampling configuration."""
 
 
 def setup_dataset(cfg: PretrainLMCfg) -> PretrainData:
     """Choose a data source once; the training loop uses the same interface for each."""
+    cfg.data.validate()
     ranks = dict(
         dp_rank=distributed.dp_rank,
         dp_size=distributed.dp_size,
         cp_rank=distributed.cp_rank,
         cp_size=distributed.cp_size,
     )
-    if cfg.omni_data is None:
-        return DensePretrainData(cfg.dataset, cfg.training, **ranks)
-    data = OmniPretrainData(cfg.dataset, cfg.omni_data, cfg.training, **ranks)
+    if cfg.data.format == "token_bin":
+        return DensePretrainData(cfg.data.dataset, cfg.training, **ranks)
+    data = OmniPretrainData(cfg.data, cfg.training, **ranks)
     config = AutoConfig.from_pretrained(cfg.training.model)
     data.validate_model(model_class_for_config(config), config)
     return data

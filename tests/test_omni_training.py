@@ -15,9 +15,9 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 
 from pithtrain.modules.checkpoint import CheckpointState
+from pithtrain.modules.data_config import DataCfg
 from pithtrain.modules.microbatch import Microbatch
 from pithtrain.modules.training_data import (
-    OmniDataCfg,
     OmniPretrainData,
     global_loss_mean,
     global_target_count,
@@ -61,10 +61,12 @@ def training_bundle(manifest):
 
 
 def source(root, *, stage="video", rank=0, world=1, seed=1234, cp=1):
-    cfg = OmniDataCfg()
-    cfg.stage, cfg.epoch_samples = stage, 8
+    cfg = DataCfg()
+    cfg.dataset, cfg.format = root, "prepared_bundle"
+    recipe = json.loads((root / "bundle.json").read_text())["recipe"]
+    cfg.modalities, cfg.epoch_samples = tuple(recipe["stages"][stage]), 8
     tc = SimpleNamespace(global_batch_size=4, micro_batch_size=1, sequence_length=1024, seed=seed)
-    return OmniPretrainData(root, cfg, tc, dp_rank=rank, dp_size=world, cp_size=cp)
+    return OmniPretrainData(cfg, tc, dp_rank=rank, dp_size=world, cp_size=cp)
 
 
 def consume(data, step):

@@ -1,15 +1,15 @@
-# Train from the prepared Omni data bundle
+# Qwen3-Omni training data example
 
 This entry point configures the existing `pretrain_lm.launch`, including its
 optimizer, DualPipeV scheduler and distributed checkpoint path. Prepare the data
 with [the unified recipe](../../prepare_omni_data/qwen3-omni-training/README.md).
 
 ```bash
-torchrun --standalone --nproc-per-node=1 examples/pretrain_lm/omni-data/script.py \
-  --dataset workspace/datasets/omni-training --stage text \
+torchrun --standalone --nproc-per-node=1 examples/pretrain_lm/qwen3-omni/script.py \
+  --dataset workspace/datasets/omni-training --modalities text \
   --model /path/to/compatible-native-model-config \
   --sequence-length 128 --global-batch-size 8 --steps 4 \
-  --checkpoint workspace/checkpoints/omni-data --save-interval 2
+  --checkpoint workspace/checkpoints/qwen3-omni --save-interval 2
 ```
 
 `--model` must name a model registered in PithTrain with a vocabulary of at least
@@ -18,13 +18,35 @@ width or expert count; never clamp token IDs or take them modulo a smaller
 vocabulary. This recipe does not download model weights. Native Qwen3-Omni
 registration and numerical validation are a separate model change.
 
-## Data stages and model contract
+## Shared data configuration
 
-- `text` reads only `tokens/train/*.bin`, using the existing shuffled dense loader
+Every pretraining example uses `cfg.data`, a `DataCfg` containing the dataset path,
+storage format, modalities, sampling weights, epoch size and worker count. There is
+no separate `cfg.dataset` or optional `cfg.omni_data` configuration.
+
+```python
+cfg.data.dataset = Path("workspace/datasets/omni-training")
+cfg.data.format = "prepared_bundle"
+cfg.data.modalities = ("text", "image")
+cfg.data.sampling_weights = {"text": 1, "image": 2}
+```
+
+Other model examples use the defaults `format="token_bin"` and
+`modalities=("text",)`, pointing `cfg.data.dataset` directly to their token shards.
+This example defaults to `prepared_bundle`; `--data-format token_bin` selects the
+same legacy dense reader. Format describes storage; modalities select record kinds.
+The preparation recipe's named stages remain preparation presets. For training,
+`--modalities text image` explicitly selects the two kinds, and other nonempty
+subsets of prepared modalities are allowed. No extra modality is silently enabled.
+
+## Data modalities and model contract
+
+- `--modalities text` with a prepared bundle reads only `tokens/train/*.bin`, using the existing shuffled dense loader
   and CP zigzag layout. Held-out tokens are never included. The corpus must have
   enough complete sequences for `global_batch_size * steps`.
-- `image`, `audio` and `video` enable the cumulative mixtures in the data recipe.
-  Set `--sampling-weights '{"text":1,"image":2}'` for the image stage, for example.
+- Select `--modalities text image`, `--modalities text image audio`, or
+  `--modalities text image audio video` to reproduce the former cumulative stages.
+  Set `--sampling-weights '{"text":1,"image":2}'` for the two-modality example.
   Media epochs use weighted sampling with replacement; `--epoch-samples` must be
   a multiple of global batch size. Micro-batch size is currently 1 and CP must be 1.
 - The task converts processor batches into `Microbatch`: token IDs are positional
@@ -39,7 +61,7 @@ registration and numerical validation are a separate model change.
   construction belongs in its position method. Context is available on each PP
   rank, separately from the hidden activations sent over P2P. Root FSDP preserves
   context precision (including timing); individual compute modules cast their inputs.
-- Existing models default to text-only. Unsupported model/stage, vocabulary or
+- Existing models default to text-only. Unsupported model/modalities, vocabulary or
   media CP/batch layouts fail before allocating model parameters. Routing media
   tensors is implemented; consuming them with native Omni encoders/positions is
   still model work. Synchronized audio/video and Talker targets remain unsupported.
@@ -54,10 +76,14 @@ targets when the global batch has some. A globally empty target batch fails.
 The model/optimizer checkpoint now also stores data identity and the count of
 samples consumed by completed optimizer steps. Prefetch never advances this
 saved count. Relaunch with the same checkpoint directory to resume; increasing
-`--steps` is allowed. Changing the data bundle, stage, sampling, sequence length,
+`--steps` is allowed. Changing the data bundle, modalities, sampling, sequence length,
 seed or batch sizes rejects the resume. An old checkpoint without data state
 cannot silently restart this data stream. Legacy `.bin`-only recipes keep their
-existing checkpoint format and loading path.
+existing checkpoint format and loading path. Selecting the same modalities as an
+existing recipe stage preserves its version-1 fingerprint, so checkpoints from
+the previous `OmniDataCfg.stage` configuration remain compatible. A new subset
+includes its selected modalities in the fingerprint; a different subset cannot
+resume the same checkpoint.
 
 ## Integration check
 

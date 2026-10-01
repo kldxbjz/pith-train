@@ -16,7 +16,8 @@ import torch.distributed.checkpoint as dcp
 from torch.utils._pytree import tree_flatten
 
 from pithtrain.modules.checkpoint import CheckpointState
-from pithtrain.modules.training_data import DensePretrainData, OmniDataCfg, OmniPretrainData
+from pithtrain.modules.data_config import DataCfg
+from pithtrain.modules.training_data import DensePretrainData, OmniPretrainData
 from pithtrain.operators.cp_sequence import zigzag_spans
 
 
@@ -68,6 +69,12 @@ def text_bundle(text_corpus):
     return root, cfg
 
 
+def prepared_config(root):
+    cfg = DataCfg()
+    cfg.dataset, cfg.format = root, "prepared_bundle"
+    return cfg
+
+
 def tensors(batches):
     assert all(mb.cu_seqlens is None and mb.model_context is None for mb in batches)
     assert all(
@@ -111,7 +118,7 @@ def test_prepared_text_uses_same_batches_and_committed_resume(text_bundle):
     root, cfg = text_bundle
     ranks = dict(dp_rank=1, dp_size=2, cp_rank=1, cp_size=2)
     legacy = DensePretrainData(root / "tokens/train", cfg, **ranks)
-    data = OmniPretrainData(root, OmniDataCfg(), cfg, **ranks)
+    data = OmniPretrainData(prepared_config(root), cfg, **ranks)
     assert data.checkpoint_state is data
     torch.testing.assert_close(
         tensors(data.get_batch(0, "cpu")), tensors(legacy.get_batch(0, "cpu")), rtol=0, atol=0
@@ -125,7 +132,7 @@ def test_prepared_text_uses_same_batches_and_committed_resume(text_bundle):
     assert set(saved) == {"version", "fingerprint", "consumed_samples"}
     assert saved["version"] == 1 and saved["consumed_samples"] == cfg.global_batch_size
     expected = tensors(data.get_batch(1, "cpu"))
-    restored = OmniPretrainData(root, OmniDataCfg(), cfg, **ranks)
+    restored = OmniPretrainData(prepared_config(root), cfg, **ranks)
     restored.checkpoint_state.load_state_dict(saved)
     with pytest.raises(ValueError, match="disagree"):
         restored.get_batch(0, "cpu")
@@ -136,7 +143,7 @@ def test_prepared_text_uses_same_batches_and_committed_resume(text_bundle):
         restored.commit_step(1)
     changed_cfg = copy.copy(cfg)
     changed_cfg.seed += 1
-    changed = OmniPretrainData(root, OmniDataCfg(), changed_cfg, **ranks)
+    changed = OmniPretrainData(prepared_config(root), changed_cfg, **ranks)
     with pytest.raises(ValueError, match="differs"):
         changed.checkpoint_state.load_state_dict(saved)
 
@@ -147,7 +154,7 @@ def test_dense_checkpoint_compatibility_and_next_batch(text_bundle, tmp_path, pr
 
     def source():
         return (
-            OmniPretrainData(root, OmniDataCfg(), cfg)
+            OmniPretrainData(prepared_config(root), cfg)
             if prepared
             else DensePretrainData(root / "tokens/train", cfg)
         )

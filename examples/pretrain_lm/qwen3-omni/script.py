@@ -1,4 +1,4 @@
-"""Train from a prepared Omni bundle through the normal pretrain_lm task."""
+"""Configure Qwen3-Omni data training through the shared pretrain_lm task."""
 
 import argparse
 import json
@@ -7,9 +7,16 @@ from pathlib import Path
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", type=Path, required=True, help="Prepared bundle root")
+    parser.add_argument(
+        "--dataset", type=Path, required=True, help="Dataset root for the selected format"
+    )
     parser.add_argument("--model", type=Path, required=True, help="Native model config directory")
-    parser.add_argument("--stage", choices=("text", "image", "audio", "video"), default="text")
+    parser.add_argument(
+        "--modalities", nargs="+", choices=("text", "image", "audio", "video"), default=["text"]
+    )
+    parser.add_argument(
+        "--data-format", choices=("token_bin", "prepared_bundle"), default="prepared_bundle"
+    )
     parser.add_argument(
         "--sampling-weights", type=json.loads, help='JSON object, e.g. {"text":1,"image":1}'
     )
@@ -48,16 +55,16 @@ def main():
 
     # Keep --help usable on a machine without the CUDA training dependencies.
     from pithtrain.modules.training import make_adamw_optimizer, make_constant_scheduler
-    from pithtrain.modules.training_data import OmniDataCfg
     from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 
     cfg = PretrainLMCfg()
-    cfg.dataset = args.dataset
-    cfg.omni_data = OmniDataCfg()
-    cfg.omni_data.stage = args.stage
-    cfg.omni_data.sampling_weights = args.sampling_weights
-    cfg.omni_data.epoch_samples = args.epoch_samples
-    cfg.omni_data.num_workers = args.num_workers
+    cfg.data.dataset = args.dataset
+    cfg.data.format = args.data_format
+    cfg.data.modalities = tuple(args.modalities)
+    cfg.data.sampling_weights = args.sampling_weights
+    cfg.data.epoch_samples = args.epoch_samples
+    cfg.data.num_workers = args.num_workers
+    cfg.data.validate()
     cfg.distributed.pipeline_parallel_size = args.pp
     cfg.distributed.context_parallel_size = args.cp
     cfg.distributed.expert_parallel_size = args.ep

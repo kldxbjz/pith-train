@@ -3,7 +3,6 @@
 import hashlib
 import json
 import math
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
@@ -11,18 +10,10 @@ import torch
 import torch.distributed as dist
 from torch.distributed.checkpoint.stateful import Stateful
 
-from pithtrain.config import SlottedDefault
+from pithtrain.modules.data_config import DataCfg, resolve_bundle_modalities
 from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
 from pithtrain.modules.microbatch import Microbatch
 from pithtrain.operators.cp_sequence import zigzag_spans
-
-
-@dataclass(init=False, slots=True)
-class OmniDataCfg(SlottedDefault):
-    stage: str = "text"
-    sampling_weights: dict[str, float] | None = None
-    epoch_samples: int | None = None
-    num_workers: int = 0
 
 
 def global_target_count(microbatches, group=None):
@@ -145,19 +136,19 @@ class OmniPretrainData:
     Only commit_step advances the durable cursor; prefetch does not count.
     """
 
-    def __init__(self, root, cfg, training_cfg, *, dp_rank=0, dp_size=1, cp_rank=0, cp_size=1):
+    def __init__(self, cfg: DataCfg, training_cfg, *, dp_rank=0, dp_size=1, cp_rank=0, cp_size=1):
+        cfg.validate()
+        if cfg.format != "prepared_bundle":
+            raise ValueError("OmniPretrainData requires prepared_bundle format")
         # Keep legacy text training independent of the optional omni-data extra.
         from pithtrain.tasks.prepare_omni_data import verify_bundle
 
-        self.root, self.cfg = Path(root).resolve(), cfg
+        self.root, self.cfg = Path(cfg.dataset).resolve(), cfg
         self.bundle = verify_bundle(self.root)
         self.recipe = self.bundle["recipe"]
-        self.stage = cfg.stage
-        if self.stage not in self.recipe["stages"]:
-            raise ValueError(f"Unknown Omni data stage: {self.stage}")
-        self.modalities = self.recipe["stages"][self.stage]
+        self.modalities, self.stage = resolve_bundle_modalities(self.recipe, cfg.modalities)
         if set(self.modalities) - set(self.bundle["manifests"]["train"]):
-            raise ValueError("This training stage has not been prepared")
+            raise ValueError("The selected modalities have not been prepared")
         self.global_batch_size = training_cfg.global_batch_size
         self.micro_batch_size = training_cfg.micro_batch_size
         self.sequence_length = training_cfg.sequence_length
@@ -217,6 +208,10 @@ class OmniPretrainData:
             weights=self.weights,
             epoch_samples=self.epoch_samples,
         )
+        # Existing recipe presets keep their exact version-1 checkpoint fingerprint.
+        # A new explicit mixture must include its own modalities in the identity.
+        if self.stage is None:
+            identity["modalities"] = self.modalities
         self.fingerprint = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
         self._dense = (
             DensePretrainData(
@@ -293,7 +288,7 @@ class OmniPretrainData:
             self.root,
             self._processor,
             self._thinker_config,
-            stage=self.stage,
+            modalities=self.modalities,
             split="train",
             batch_size=1,
             num_samples=self.epoch_samples,
