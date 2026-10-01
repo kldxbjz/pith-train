@@ -11,9 +11,9 @@ class Microbatch:
     """
     One micro-batch of work for DualPipeV.step.
 
-    The caller partitions the global batch into these and hands the same list to every pipeline
-    rank within each data/context coordinate, so each derives receive-buffer shapes locally.
-    The first PP rank consumes model/objective inputs; all PP ranks may read model_context.
+    The caller supplies the same sample order and sequence shapes to every pipeline rank
+    within each data/context coordinate. The first PP rank consumes model/objective inputs;
+    all PP ranks may read model_context. Only the rank hosting stage 0 holds media_inputs.
 
     Attributes:
         model_inputs: Inputs to the model, for instance the token ids, handed to its first
@@ -30,10 +30,20 @@ class Microbatch:
     objective_inputs: Any
 
     model_context: Optional[dict[str, torch.Tensor]] = None
-    """Per-sample media/position inputs, present on every PP rank.
+    """Token, mask and position/layout inputs shared by all decoder stages.
 
-    Models opting into media data must accept model_context in forward,
-    forward_prolog and forward_posemb. Decoder-stage context is not a P2P
-    activation: each PP rank receives it from the deterministic data stream.
+    Models opting into media data accept model_context in forward,
+    forward_prolog and forward_posemb. The pipeline adds media_inputs only for
+    stage 0; later stages receive this shared context without media payloads.
     """
+    media_inputs: Optional[dict[str, torch.Tensor]] = None
+    """Encoder inputs, such as image pixels or audio features; stage 0 only."""
     sample_ids: tuple[str, ...] = ()
+
+    def context_for_stage(self, stage_index: int) -> Optional[dict[str, torch.Tensor]]:
+        if stage_index == 0 and self.media_inputs:
+            context = self.model_context or {}
+            if context.keys() & self.media_inputs.keys():
+                raise ValueError("Media inputs must not overwrite shared model context")
+            return dict(context, **self.media_inputs)
+        return self.model_context

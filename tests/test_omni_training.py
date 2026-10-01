@@ -29,6 +29,18 @@ processor_config = data_fixtures.processor_config
 
 
 @pytest.fixture
+def single_cpu_thread():
+    # Match the spawned workers: CPU audio FFT/reduction rounding can depend on
+    # thread count. Keep exact tensor comparisons and restore the caller setting.
+    previous = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
+
+
+@pytest.fixture
 def training_bundle(manifest):
     root = manifest.parent
     recipe_path = (
@@ -78,10 +90,12 @@ def consume(data, step):
 def compare_batches(actual, expected):
     assert [mb.sample_ids for mb in actual] == [mb.sample_ids for mb in expected]
     for left, right in zip(actual, expected, strict=True):
-        assert left.model_context.keys() == right.model_context.keys()
         torch.testing.assert_close(left.objective_inputs[0], right.objective_inputs[0])
-        for name in left.model_context:
-            torch.testing.assert_close(left.model_context[name], right.model_context[name])
+        for field in ("model_context", "media_inputs"):
+            left_inputs, right_inputs = getattr(left, field) or {}, getattr(right, field) or {}
+            assert left_inputs.keys() == right_inputs.keys()
+            for name in left_inputs:
+                torch.testing.assert_close(left_inputs[name], right_inputs[name], rtol=0, atol=0)
 
 
 def test_training_media_batches_dp_resume_and_epoch(training_bundle, processor_config):
@@ -102,7 +116,7 @@ def test_training_media_batches_dp_resume_and_epoch(training_bundle, processor_c
         assert micro.model_inputs[0] is micro.model_context["input_ids"]
         assert micro.model_inputs[0].shape[0] == 1
         assert micro.model_inputs[0].shape == micro.objective_inputs[0].shape
-        assert all(value.device.type == "cpu" for value in micro.model_context.values())
+        assert all(value.device.type == "cpu" for value in micro.context_for_stage(0).values())
     with pytest.raises(ValueError, match="differs"):
         source(training_bundle, seed=42).load_state_dict(state)
 
@@ -202,7 +216,9 @@ def test_global_target_normalization_excludes_pipeline_duplicates(tmp_path):
     mp.spawn(_reduction_worker, args=(str(tmp_path / "rendezvous"),), nprocs=4, join=True)
 
 
-def test_worker_prefetch_does_not_advance_checkpoint(training_bundle, processor_config):
+def test_worker_prefetch_does_not_advance_checkpoint(
+    training_bundle, processor_config, single_cpu_thread
+):
     expected = source(training_bundle)
     first, second = consume(expected, 0), consume(expected, 1)
     data = source(training_bundle)

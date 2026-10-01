@@ -163,6 +163,10 @@ def main():
 
     def posemb(self, length, cu_seqlens=None, model_context=None):
         assert model_context["input_ids"].shape[1] == length
+        if self.stage_index != 0:
+            assert (
+                not {"pixel_values", "input_features", "pixel_values_videos"} & model_context.keys()
+            )
         for name, value in model_context.items():
             assert value.device == distributed.device, name
             if value.is_floating_point():
@@ -248,6 +252,7 @@ def main():
                         mb.objective_inputs,
                         mb.cu_seqlens,
                         getattr(mb, "model_context", None),
+                        getattr(mb, "media_inputs", None),
                         getattr(mb, "sample_ids", ()),
                     )
                     for mb in result
@@ -260,14 +265,19 @@ def main():
                 )
             for mb in result:
                 context = getattr(mb, "model_context", None) or {}
+                media = getattr(mb, "media_inputs", None) or {}
+                if distributed.pp_rank != 0:
+                    assert not media, "A non-encoder PP rank holds media payloads"
                 kind = "text"
-                for field, modality in (
-                    ("pixel_values", "image"),
-                    ("input_features", "audio"),
-                    ("pixel_values_videos", "video"),
+                for field, payload, modality in (
+                    ("image_grid_thw", "pixel_values", "image"),
+                    ("feature_attention_mask", "input_features", "audio"),
+                    ("video_grid_thw", "pixel_values_videos", "video"),
                 ):
                     if field in context:
                         kind = modality
+                        if distributed.pp_rank == 0:
+                            assert payload in media, "Encoder media payload is missing"
                 seen[kind] += 1
             return result
 

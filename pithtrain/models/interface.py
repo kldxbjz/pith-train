@@ -88,7 +88,8 @@ class ModelProtocol(Protocol):
     """
 
     # Text-only models may omit this. Media models declare their implemented inputs
-    # and forward each Microbatch.model_context into model_forward(...).
+    # and forward the stage-selected model_context into model_forward(...).
+    # Only stage 0 receives encoder payloads; other stages get tokens/masks/layout.
     input_modalities: frozenset[str]
 
     stage_index: int

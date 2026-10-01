@@ -43,7 +43,9 @@ def task_config(**overrides):
         LoggingCfg=SimpleNamespace,
         DensePretrainData=DensePretrainData,
         OmniPretrainData=OmniPretrainData,
-        distributed=SimpleNamespace(dp_rank=0, dp_size=1, cp_rank=0, cp_size=1),
+        distributed=SimpleNamespace(
+            dp_rank=0, dp_size=1, cp_rank=0, cp_size=1, pp_rank=0, pp_size=1, pp_group=None
+        ),
     )
     namespace.update(overrides)
     module = ast.fix_missing_locations(ast.Module(body=[future, *nodes], type_ignores=[]))
@@ -238,3 +240,31 @@ def test_qwen_omni_example_cli_builds_one_data_config(
     assert cfg.data.dataset == tmp_path and cfg.data.format == format
     assert cfg.data.modalities == kinds
     cfg.data.validate()
+
+
+def test_task_passes_pipeline_ownership_to_prepared_provider(tmp_path):
+    group = object()
+    calls = []
+
+    class Provider:
+        def __init__(self, cfg, training, **ranks):
+            calls.append(ranks)
+
+        def validate_model(self, model, config):
+            assert model == "TestModel" and config == "native-config"
+
+    task = task_config(
+        OmniPretrainData=Provider,
+        distributed=SimpleNamespace(
+            dp_rank=1, dp_size=2, cp_rank=0, cp_size=1, pp_rank=1, pp_size=2, pp_group=group
+        ),
+        AutoConfig=SimpleNamespace(from_pretrained=lambda _: "native-config"),
+        model_class_for_config=lambda _: "TestModel",
+    )
+    cfg = task.PretrainLMCfg()
+    cfg.data.dataset, cfg.data.format = tmp_path, "prepared_bundle"
+    cfg.training.model = "model-path"
+    assert isinstance(task.setup_dataset(cfg), Provider)
+    assert calls == [
+        dict(dp_rank=1, dp_size=2, cp_rank=0, cp_size=1, pp_rank=1, pp_size=2, pp_group=group)
+    ]

@@ -49,18 +49,21 @@ subsets of prepared modalities are allowed. No extra modality is silently enable
   Set `--sampling-weights '{"text":1,"image":2}'` for the two-modality example.
   Media epochs use weighted sampling with replacement; `--epoch-samples` must be
   a multiple of global batch size. Micro-batch size is currently 1 and CP must be 1.
-- The task converts processor batches into `Microbatch`: token IDs are positional
-  model inputs, shifted labels are objective inputs, and all processor tensors
-  travel in `model_context` on the rank's device. DP selects records; PP and EP
-  do not select additional independent samples. Workers decode on CPU and use a
-  separate RNG so reading a batch does not perturb the model's random state.
+- Within each PP group, only rank 0 verifies/reads media and runs the processor.
+  It keeps image/video pixels and audio features in `Microbatch.media_inputs`.
+  Tokens, shifted labels and position/layout tensors are broadcast to its PP peers;
+  `model_context` holds the shared inputs, without encoder payloads. DP selects
+  records; PP and EP do not select additional independent samples. CPU workers use
+  a separate RNG so reading a batch does not perturb the model's random state.
 - A media-capable model must declare `input_modalities` and accept `model_context`
   in `forward`, `forward_prolog` and `forward_posemb`. Its normal forward passes
   this argument to `model_forward`; the overlapped scheduler passes it directly.
   Encoders/feature insertion belong in the model prolog, and multimodal position
-  construction belongs in its position method. Context is available on each PP
-  rank, separately from the hidden activations sent over P2P. Root FSDP preserves
-  context precision (including timing); individual compute modules cast their inputs.
+  construction belongs in its position method. The pipeline merges `media_inputs`
+  into the context only for model stage 0. All later stages, including the other
+  V-shaped chunk on PP rank 0, receive only shared context. Input distribution is
+  separate from activation P2P. Root FSDP preserves context precision (including
+  timing); individual compute modules cast their inputs.
 - Existing models default to text-only. Unsupported model/modalities, vocabulary or
   media CP/batch layouts fail before allocating model parameters. Routing media
   tensors is implemented; consuming them with native Omni encoders/positions is

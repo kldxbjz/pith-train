@@ -15,6 +15,10 @@ from pithtrain.modules.dataset import ConcatDataset, MemmapDataset
 from pithtrain.modules.microbatch import Microbatch
 from pithtrain.operators.cp_sequence import zigzag_spans
 
+# Qwen processor payloads belong to the encoder; masks and grids remain available
+# to decoder position construction. Never broadcast these large feature tensors.
+_MEDIA_INPUTS = frozenset({"pixel_values", "pixel_values_videos", "input_features"})
+
 
 def global_target_count(microbatches, group=None):
     """Count labels over one pipeline stage's DP x CP group, without PP duplication."""
@@ -133,10 +137,24 @@ class OmniPretrainData:
 
     Text uses the existing dense .bin loader and its CP layout. Media uses one
     sample per microbatch so feature tensors never need ambiguous batch slicing.
+    Only PP rank 0 reads/processes media; its peers receive tokens, labels and
+    position/layout tensors. Large encoder payloads never cross the PP group.
     Only commit_step advances the durable cursor; prefetch does not count.
     """
 
-    def __init__(self, cfg: DataCfg, training_cfg, *, dp_rank=0, dp_size=1, cp_rank=0, cp_size=1):
+    def __init__(
+        self,
+        cfg: DataCfg,
+        training_cfg,
+        *,
+        dp_rank=0,
+        dp_size=1,
+        cp_rank=0,
+        cp_size=1,
+        pp_rank=0,
+        pp_size=1,
+        pp_group=None,
+    ):
         cfg.validate()
         if cfg.format != "prepared_bundle":
             raise ValueError("OmniPretrainData requires prepared_bundle format")
@@ -144,7 +162,26 @@ class OmniPretrainData:
         from pithtrain.tasks.prepare_omni_data import verify_bundle
 
         self.root, self.cfg = Path(cfg.dataset).resolve(), cfg
-        self.bundle = verify_bundle(self.root)
+        self.is_text = list(cfg.modalities) == ["text"]
+        self.pp_rank, self.pp_size, self.pp_group = pp_rank, pp_size, pp_group
+        if (
+            type(pp_size) is not int
+            or pp_size < 1
+            or type(pp_rank) is not int
+            or not 0 <= pp_rank < pp_size
+        ):
+            raise ValueError("Invalid pipeline-parallel rank/size")
+        if not self.is_text and pp_size > 1:
+            if pp_group is None or not dist.is_initialized():
+                raise ValueError("Media PP requires an initialized pipeline process group")
+            if dist.get_world_size(pp_group) != pp_size or dist.get_rank(pp_group) != pp_rank:
+                raise ValueError("Pipeline process group does not match the data rank/size")
+
+        def verify():
+            bundle = verify_bundle(self.root)
+            return bundle, hashlib.sha256((self.root / "bundle.json").read_bytes()).hexdigest()
+
+        self.bundle, bundle_sha256 = self._share_metadata(verify)
         self.recipe = self.bundle["recipe"]
         self.modalities, self.stage = resolve_bundle_modalities(self.recipe, cfg.modalities)
         if set(self.modalities) - set(self.bundle["manifests"]["train"]):
@@ -162,7 +199,6 @@ class OmniPretrainData:
             raise ValueError("Global batch must divide into whole data-rank microbatches")
         if type(cfg.num_workers) is not int or cfg.num_workers < 0:
             raise ValueError("num_workers must be nonnegative")
-        self.is_text = self.modalities == ["text"]
         self.weights = (
             cfg.sampling_weights
             if cfg.sampling_weights is not None
@@ -199,7 +235,7 @@ class OmniPretrainData:
         self.batch_cfg = dict(self.recipe["batch"], max_length=self.sequence_length)
         identity = dict(
             version=1,
-            bundle_sha256=hashlib.sha256((self.root / "bundle.json").read_bytes()).hexdigest(),
+            bundle_sha256=bundle_sha256,
             stage=self.stage,
             global_batch_size=self.global_batch_size,
             micro_batch_size=self.micro_batch_size,
@@ -243,8 +279,12 @@ class OmniPretrainData:
         # The pinned processor config defines the embedding vocabulary, not tokenizer.vocab_size.
         from pithtrain.tasks.prepare_omni_data import processor_for
 
-        self._processor, self._thinker_config = processor_for(self.recipe, True)
-        if text_config.vocab_size < self._thinker_config.text_config.vocab_size:
+        def prepare():
+            self._processor, self._thinker_config = processor_for(self.recipe, True)
+            return self._thinker_config.text_config.vocab_size
+
+        required_vocab = self._share_metadata(prepare)
+        if text_config.vocab_size < required_vocab:
             raise ValueError("The model vocabulary cannot consume the prepared Omni token IDs")
         supported = set(getattr(model_class, "input_modalities", {"text"}))
         if not set(self.modalities) <= supported:
@@ -278,6 +318,25 @@ class OmniPretrainData:
         self.consumed_samples += self.global_batch_size
         self.pending_step = None
 
+    def _share_metadata(self, read):
+        """Read on PP rank 0; share only small metadata or an explicit read failure."""
+        if self.is_text or self.pp_size == 1:
+            return read()
+        message = [None]
+        failure = None
+        if self.pp_rank == 0:
+            try:
+                message[0] = (read(), None)
+            except Exception as error:
+                failure = error
+                message[0] = (None, f"{type(error).__name__}: {error}")
+        source = dist.get_global_rank(self.pp_group, 0)
+        dist.broadcast_object_list(message, src=source, group=self.pp_group)
+        result, error = message[0]
+        if error is not None:
+            raise RuntimeError(f"Pipeline media reader failed: {error}") from failure
+        return result
+
     def _make_iterator(self):
         from pithtrain.modules.qwen3_omni_data import create_omni_dataloader
         from pithtrain.tasks.prepare_omni_data import processor_for
@@ -307,28 +366,44 @@ class OmniPretrainData:
     def _media_microbatches(self, device):
         if self.is_text or self.pending_step is None:
             raise RuntimeError("Media batches must be requested inside a media training step")
-        if self._iterator is None:
-            self._make_iterator()
-        batches = []
-        for _ in range(self.global_batch_size // self.dp_size):
-            with torch.device("cpu"):
-                batch = next(self._iterator)
-            inputs = {
-                name: value.to(device, non_blocking=True)
-                for name, value in batch.model_inputs.items()
-            }
-            labels = batch.labels.to(device, non_blocking=True)
-            # With batch_size=1 there is no batch padding or media-feature slicing.
-            batches.append(
-                Microbatch(
-                    model_inputs=(inputs["input_ids"],),
-                    cu_seqlens=None,
-                    objective_inputs=(labels,),
-                    model_context=inputs,
-                    sample_ids=batch.sample_ids,
-                )
-            )
+        batches = [
+            self._next_media_microbatch(device)
+            for _ in range(self.global_batch_size // self.dp_size)
+        ]
         # Epochs contain whole global steps. Reset only after yielding the final step.
         if (self.consumed_samples + self.global_batch_size) % self.epoch_samples == 0:
             self._iterator = None
         return batches
+
+    def _next_media_microbatch(self, device):
+        shared, media_inputs = {}, {}
+
+        def read():
+            if self._iterator is None:
+                self._make_iterator()
+            with torch.device("cpu"):
+                batch = next(self._iterator)
+            for name, value in batch.model_inputs.items():
+                destination = media_inputs if name in _MEDIA_INPUTS else shared
+                destination[name] = value.to(device, non_blocking=True).contiguous()
+            shared["labels"] = batch.labels.to(device, non_blocking=True).contiguous()
+            return batch.sample_ids, [
+                (name, tuple(value.shape), value.dtype) for name, value in shared.items()
+            ]
+
+        sample_ids, specs = self._share_metadata(read)
+        if self.pp_size > 1:
+            source = dist.get_global_rank(self.pp_group, 0)
+            for name, shape, dtype in specs:
+                if self.pp_rank != 0:
+                    shared[name] = torch.empty(shape, dtype=dtype, device=device)
+                dist.broadcast(shared[name], src=source, group=self.pp_group)
+        labels = shared.pop("labels")
+        return Microbatch(
+            model_inputs=(shared["input_ids"],),
+            cu_seqlens=None,
+            objective_inputs=(labels,),
+            model_context=shared,
+            media_inputs=media_inputs or None,
+            sample_ids=sample_ids,
+        )

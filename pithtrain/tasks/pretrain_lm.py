@@ -74,7 +74,14 @@ def setup_dataset(cfg: PretrainLMCfg) -> PretrainData:
     )
     if cfg.data.format == "token_bin":
         return DensePretrainData(cfg.data.dataset, cfg.training, **ranks)
-    data = OmniPretrainData(cfg.data, cfg.training, **ranks)
+    data = OmniPretrainData(
+        cfg.data,
+        cfg.training,
+        **ranks,
+        pp_rank=distributed.pp_rank,
+        pp_size=distributed.pp_size,
+        pp_group=distributed.pp_group,
+    )
     config = AutoConfig.from_pretrained(cfg.training.model)
     data.validate_model(model_class_for_config(config), config)
     return data

@@ -87,8 +87,8 @@ def test_new_subset_resume_and_preset_v1_identity(training_bundle, processor_con
     assert data.stage is None and data.modalities == ["audio", "text"]
     first = media_fixtures.consume(data, 0)
     assert all(
-        "pixel_values" not in batch.model_context
-        and "pixel_values_videos" not in batch.model_context
+        "pixel_values" not in batch.context_for_stage(0)
+        and "pixel_values_videos" not in batch.context_for_stage(0)
         for batch in first
     )
     saved = data.state_dict()

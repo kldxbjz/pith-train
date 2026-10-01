@@ -188,9 +188,10 @@ class DualPipeV(nn.Module):
         """
         Record the per-step shapes.
 
-        Every pipeline rank is given the same micro-batches, so each derives the activation shape
-        of every one locally and no metadata crosses the pipeline. Micro-batches may differ in
-        shape from one another. The hidden dimension is read from the local model.
+        Every pipeline rank has the same sample order and token shapes, so each derives
+        activation shapes locally. Media payloads stay on the rank hosting stage 0, and
+        even that rank's other V-shaped model chunk sees only the shared context.
+        Micro-batches may differ in shape. The hidden size comes from the local model.
 
         Returns the number of micro-batches in this step.
         """
@@ -199,7 +200,10 @@ class DualPipeV(nn.Module):
 
         # One shape per micro-batch, so a ragged step sizes each receive buffer correctly.
         self.p2p_shapes = []
-        self.model_context_chunks = [mb.model_context for mb in microbatches]
+        self.model_context_chunks = [
+            [mb.context_for_stage(module.stage_index) for mb in microbatches]
+            for module in self.module
+        ]
         for mb in microbatches:
             first_input, *_ = mb.model_inputs
             batch, sequence, *_ = first_input.shape
@@ -233,7 +237,7 @@ class DualPipeV(nn.Module):
             self.cu_seqlens_chunks[chunk_id] if self.cu_seqlens_chunks is not None else None
         )
         kwargs = dict(cu_seqlens=cu_seqlens)
-        context = self.model_context_chunks[chunk_id]
+        context = self.model_context_chunks[phase][chunk_id]
         if context is not None:
             kwargs["model_context"] = context
         outputs = self.module[phase](*inputs, **kwargs)
@@ -358,7 +362,7 @@ class DualPipeV(nn.Module):
             output_grads1,
             self.chunk_records[phase1][chunk_id1],
             self.comm_stream,
-            model_context=self.model_context_chunks[chunk_id0],
+            model_context=self.model_context_chunks[phase0][chunk_id0],
         )
         nvtx.range_pop()
 
