@@ -332,12 +332,18 @@ def apply_fsdp(model, hsdp_replica: int = 1):
         expt_fsdp_mesh = split_replicas(expt_fsdp_mesh, hsdp_replica)
     else:
         attn_fsdp_mesh = distributed.attn_mesh["dp", "cp"]._flatten()
-    mp = MixedPrecisionPolicy(
+    compute_mp = MixedPrecisionPolicy(
         param_dtype=training.PARAM_DTYPE,
         reduce_dtype=torch.float32,
         output_dtype=None,
         cast_forward_inputs=True,
     )
+    # Pipeline activations already have PARAM_DTYPE. Keep root context tensors
+    # (e.g. media timing) in their original precision, consistently with the
+    # overlapped path which calls prolog/posemb directly. Compute children
+    # still cast their floating inputs through their own FSDP policies.
+    root_mp = replace(compute_mp, cast_forward_inputs=False)
+
     # FSDP recommends shard models from the bottom to the top.
     for i in range(2):
         assert isinstance(model[i], PIPELINE_STAGE_MODELS)
@@ -345,28 +351,28 @@ def apply_fsdp(model, hsdp_replica: int = 1):
         # owns parameters. reshard_after_forward=True since each runs once per step.
         for name, child in model[i].named_children():
             if name != "layers" and next(child.parameters(), None) is not None:
-                fully_shard(child, mesh=attn_fsdp_mesh, reshard_after_forward=True, mp_policy=mp)
+                fully_shard(
+                    child, mesh=attn_fsdp_mesh, reshard_after_forward=True, mp_policy=compute_mp
+                )
         for layer in model[i].layers.values():
             if hasattr(layer.mlp, "experts"):
                 fully_shard(
                     layer.mlp.experts,
                     mesh=expt_fsdp_mesh,
                     reshard_after_forward=False,
-                    mp_policy=mp,
+                    mp_policy=compute_mp,
                 )
-            fully_shard(layer, mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=mp)
+            fully_shard(
+                layer, mesh=attn_fsdp_mesh, reshard_after_forward=False, mp_policy=compute_mp
+            )
             torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage1")
             torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage3")
             torch.distributed.fsdp.register_fsdp_forward_method(layer, "forward_stage5")
-        # Pipeline activations already have PARAM_DTYPE. Keep root context tensors
-        # (e.g. media timing) in their original precision, consistently with the
-        # overlapped path which calls prolog/posemb directly. Compute children
-        # still cast their floating inputs through their own FSDP policies.
         fully_shard(
             model[i],
             mesh=attn_fsdp_mesh,
             reshard_after_forward=False,
-            mp_policy=replace(mp, cast_forward_inputs=False),
+            mp_policy=root_mp,
         )
 
     # Sum gradients instead of the FSDP2 default average. The two classes reduce over groups of
