@@ -21,6 +21,7 @@ from pithtrain.modules.microbatch import Microbatch
 from pithtrain.modules.qwen3_omni_data import create_omni_dataloader
 from pithtrain.modules.training_data import OmniPretrainData
 from tests import test_omni_training as fixtures
+from tests.test_omni_training_acceptance import media_kind
 
 manifest = fixtures.manifest
 training_bundle = fixtures.training_bundle
@@ -40,6 +41,7 @@ def configs(root, kinds):
 
 def assert_batches(batches, expected, owns_media):
     for actual, reference in zip(batches, expected, strict=True):
+        media_kind(actual, 0 if owns_media else 1)
         assert actual.sample_ids == reference["sample_ids"]
         torch.testing.assert_close(actual.objective_inputs[0], reference["labels"], rtol=0, atol=0)
         all_inputs = reference["inputs"]

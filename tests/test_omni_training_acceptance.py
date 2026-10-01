@@ -38,9 +38,15 @@ def digest(value):
     return value
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", type=Path, required=True)
+    parser.add_argument(
+        "--dataset",
+        type=Path,
+        required=True,
+        help="Prepared fixture root; token_bin uses its tokens/train export",
+    )
+    parser.add_argument("--data-format", choices=("token_bin", "prepared_bundle"))
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--pp", type=int, default=1)
@@ -53,7 +59,104 @@ def main():
     parser.add_argument("--restore", type=Path)
     parser.add_argument("--expected", type=Path)
     parser.add_argument("--checkpoint-step", type=int, default=1)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    args.data_format = args.data_format or ("token_bin" if args.legacy else "prepared_bundle")
+    if args.legacy and (args.data_format != "token_bin" or args.media):
+        parser.error("--legacy requires token_bin text on the historical base")
+    if args.media and args.data_format != "prepared_bundle":
+        parser.error("--media requires prepared_bundle")
+    if (args.restore is None) != (args.expected is None):
+        parser.error("--restore and --expected must be supplied together")
+    if args.restore is not None and args.legacy:
+        parser.error("--legacy does not implement checkpoint restore")
+    if not 0 < args.checkpoint_step < args.steps:
+        parser.error("checkpoint-step must be positive and less than steps")
+    if min(args.pp, args.cp, args.ep, args.sequence_length) < 1:
+        parser.error("parallelism and sequence length must be positive")
+    return args
+
+
+def configure_data(cfg, args):
+    if args.legacy:
+        if hasattr(cfg, "data"):
+            raise ValueError(
+                "--legacy identifies historical logging; use --data-format token_bin for current code"
+            )
+        cfg.dataset = args.dataset / "tokens/train"
+    else:
+        cfg.data.dataset = (
+            args.dataset / "tokens/train" if args.data_format == "token_bin" else args.dataset
+        )
+        cfg.data.format = args.data_format
+        cfg.data.modalities = ("text", "image", "audio", "video") if args.media else ("text",)
+
+
+def checkpoint_data(data, args):
+    if args.legacy:
+        return None
+    state = data.checkpoint_state
+    if args.data_format == "token_bin":
+        assert state is None, "Dense position must follow the training step"
+    else:
+        assert state is not None, "Prepared data must preserve its committed state"
+    return state
+
+
+def validate_restore_report(expected, args, *, mesh, config, source_sha256):
+    assert expected["result"] == "PASSED" and expected["start"] == 0
+    assert expected["report_version"] == 2, "Restore requires the current report schema"
+    assert not expected["legacy"], "Cannot restore against a historical-base report"
+    assert expected["data_format"] == args.data_format, "Restore data format differs"
+    assert expected["media"] == args.media, "Restore modalities differ"
+    assert expected["parallelism"] == dict(pp=args.pp, cp=args.cp, ep=args.ep)
+    assert expected["mesh"] == mesh, "Restore rank/mesh differs"
+    assert expected["source_sha256"] == source_sha256, "Restore source differs"
+    # Output paths differ in a fresh process; all numerical training settings must match.
+    numerical_config = lambda cfg: {
+        key: value for key, value in cfg.items() if key not in {"model", "save_location"}
+    }
+    assert numerical_config(expected["config"]) == numerical_config(config), (
+        "Restore training configuration differs"
+    )
+    assert expected["checkpoint_step"] == args.checkpoint_step, "Checkpoint step differs"
+    assert expected["steps"] == args.steps and len(expected["batches"]) == args.steps
+    assert [row["train/step"] for row in expected["rows"]] == list(range(args.steps))
+    state = expected["checkpoint_state"]
+    assert isinstance(state, dict) and set(state) == {
+        "weights",
+        "optimizers",
+        "schedulers",
+        "cuda_rng",
+        "data",
+    }
+    assert (state["data"] is None) == (args.data_format == "token_bin"), (
+        "Checkpoint data state differs"
+    )
+    for batch in expected["batches"]:
+        assert batch and all(len(micro) == 6 for micro in batch), "Invalid microbatch schema"
+
+
+def media_kind(microbatch, pp_rank):
+    context = microbatch.model_context or {}
+    media = microbatch.media_inputs or {}
+    fields = (
+        ("image_grid_thw", "pixel_values", "image"),
+        ("feature_attention_mask", "input_features", "audio"),
+        ("video_grid_thw", "pixel_values_videos", "video"),
+    )
+    assert not {payload for _, payload, _ in fields} & context.keys(), (
+        "Shared context contains media payloads"
+    )
+    expected = {payload for marker, payload, _ in fields if marker in context}
+    assert set(media) == (expected if pp_rank == 0 else set()), (
+        "Incorrect encoder payload ownership"
+    )
+    kinds = [kind for marker, _, kind in fields if marker in context]
+    return kinds[-1] if kinds else "text"
+
+
+def main():
+    args = parse_args()
 
     from pithtrain.contexts import distributed, logging, training
     from pithtrain.models.qwen3_moe import Qwen3MoeModel
@@ -65,14 +168,7 @@ def main():
     from pithtrain.tasks import pretrain_lm
 
     cfg = pretrain_lm.PretrainLMCfg()
-    if args.legacy:
-        # This identical runner also imports the immutable PR-base config API.
-        data_cfg = cfg.data if hasattr(cfg, "data") else cfg
-        data_cfg.dataset = args.dataset / "tokens/train"
-    else:
-        cfg.data.dataset = args.dataset
-        cfg.data.format = "prepared_bundle"
-        cfg.data.modalities = ("text", "image", "audio", "video") if args.media else ("text",)
+    configure_data(cfg, args)
     cfg.distributed.pipeline_parallel_size = args.pp
     cfg.distributed.context_parallel_size = args.cp
     cfg.distributed.expert_parallel_size = args.ep
@@ -205,6 +301,7 @@ def main():
             ):
                 stack.enter_context(patch.object(Qwen3MoeModel, name, method))
         data = pretrain_lm.setup_dataset(cfg)
+        data_state = checkpoint_data(data, args)
         setup_training(cfg)
 
         def runtime_state():
@@ -214,16 +311,34 @@ def main():
                     optimizers=[opt.state_dict() for opt in training.optimizers],
                     schedulers=[s.state_dict() for s in training.schedulers],
                     cuda_rng=torch.cuda.get_rng_state(),
-                    data=None if args.legacy else data.state_dict(),
+                    data=None if data_state is None else data_state.state_dict(),
                 )
             )
 
+        mesh = dict(
+            rank=distributed.rank,
+            pp_rank=distributed.pp_rank,
+            dp_rank=distributed.dp_rank,
+            cp_rank=distributed.cp_rank,
+            pp_size=distributed.pp_size,
+            dp_size=distributed.dp_size,
+            cp_size=distributed.cp_size,
+        )
+        config = cfg.training.to_json_dict()
+        source_file = Path(pretrain_lm.__file__).resolve()
+        source_sha256 = hashlib.sha256(source_file.read_bytes()).hexdigest()
         start = 0
         expected = None
         if args.restore is not None:
             assert not args.legacy and args.expected is not None
             expected = json.loads((args.expected / f"rank{distributed.rank}.json").read_text())
-            load_checkpoint(args.restore, args.checkpoint_step, data_state=data.checkpoint_state)
+            validate_restore_report(
+                expected, args, mesh=mesh, config=config, source_sha256=source_sha256
+            )
+            assert digest(dict(training.model.named_parameters())) == expected["initial_state"], (
+                "Fresh-process initialization differs"
+            )
+            load_checkpoint(args.restore, args.checkpoint_step, data_state=data_state)
             assert runtime_state() == expected["checkpoint_state"], (
                 "Fresh-process restored state differs"
             )
@@ -264,20 +379,9 @@ def main():
                     "Restart changed next inputs/media"
                 )
             for mb in result:
-                context = getattr(mb, "model_context", None) or {}
-                media = getattr(mb, "media_inputs", None) or {}
-                if distributed.pp_rank != 0:
-                    assert not media, "A non-encoder PP rank holds media payloads"
-                kind = "text"
-                for field, payload, modality in (
-                    ("image_grid_thw", "pixel_values", "image"),
-                    ("feature_attention_mask", "input_features", "audio"),
-                    ("video_grid_thw", "pixel_values_videos", "video"),
-                ):
-                    if field in context:
-                        kind = modality
-                        if distributed.pp_rank == 0:
-                            assert payload in media, "Encoder media payload is missing"
+                # Historical microbatches have no media fields; all feature
+                # modes use the ownership check, including plain text.
+                kind = "text" if args.legacy else media_kind(mb, distributed.pp_rank)
                 seen[kind] += 1
             return result
 
@@ -315,13 +419,13 @@ def main():
             else:
                 assert not objective_outputs
             if not args.legacy and args.restore is None and step + 1 == args.checkpoint_step:
-                save_checkpoint(t.save_location, step + 1, data_state=data.checkpoint_state)
+                save_checkpoint(t.save_location, step + 1, data_state=data_state)
                 checkpoint_state = runtime_state()
         final = digest(dict(training.model.named_parameters()))
         assert initial != final, "Training did not update weights"
         for parameter in training.model.parameters():
             assert torch.isfinite(parameter.to_local()).all()
-        if not args.legacy:
+        if data_state is not None:
             assert data.consumed_samples == args.steps * t.global_batch_size
         if args.media:
             all_seen = [None] * distributed.world_size
@@ -342,32 +446,29 @@ def main():
             "A decoder view lost its backward hook"
         )
         report = dict(
+            report_version=2,
+            data_format=args.data_format,
+            parallelism=dict(pp=args.pp, cp=args.cp, ep=args.ep),
+            media=args.media,
+            checkpoint_step=args.checkpoint_step,
             initial_state=initial,
             audited_view_hooks=len(view_checks),
-            source_file=str(Path(pretrain_lm.__file__).resolve()),
-            source_sha256=hashlib.sha256(Path(pretrain_lm.__file__).read_bytes()).hexdigest(),
+            source_file=str(source_file),
+            source_sha256=source_sha256,
             result="PASSED",
             start=start,
             steps=args.steps,
             rows=rows,
             loss_statistics=loss_statistics,
             legacy=args.legacy,
-            mesh=dict(
-                rank=distributed.rank,
-                pp_rank=distributed.pp_rank,
-                dp_rank=distributed.dp_rank,
-                cp_rank=distributed.cp_rank,
-                pp_size=distributed.pp_size,
-                dp_size=distributed.dp_size,
-                cp_size=distributed.cp_size,
-            ),
+            mesh=mesh,
             batches=batches,
             checkpoint_state=checkpoint_state,
             exact_restore=expected is not None,
             modalities=dict(seen),
             normal_calls=dict(normal_calls),
             posemb_calls=dict(posemb_calls),
-            config=cfg.training.to_json_dict(),
+            config=config,
         )
         (args.report / f"rank{distributed.rank}.json").write_text(json.dumps(report, indent=2))
     torch.distributed.barrier()

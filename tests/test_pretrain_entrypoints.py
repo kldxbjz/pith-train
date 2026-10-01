@@ -136,8 +136,8 @@ def test_identical_validation_template_supports_base_and_feature(monkeypatch, hi
 
 @pytest.mark.parametrize(
     "historical,mode",
-    [(True, "legacy"), (False, "legacy"), (False, "text"), (False, "media")],
-    ids=["pr-base-legacy", "current-legacy", "prepared-text", "prepared-media"],
+    [(True, "legacy"), (False, "token_bin"), (False, "text"), (False, "media")],
+    ids=["pr-base-legacy", "current-token-bin", "prepared-text", "prepared-media"],
 )
 def test_acceptance_runner_preserves_data_selection(monkeypatch, tmp_path, historical, mode):
     calls = example_modules(monkeypatch)
@@ -179,7 +179,11 @@ def test_acceptance_runner_preserves_data_selection(monkeypatch, tmp_path, histo
     )
     stub_module(monkeypatch, "pithtrain.pipeline.execution", model_forward=unexpected_setup)
     path = ROOT / "tests/test_omni_training_acceptance.py"
-    arguments = [f"--{mode}"] if mode != "text" else []
+    arguments = (
+        ["--data-format", "token_bin"]
+        if mode == "token_bin"
+        else ([f"--{mode}"] if mode != "text" else [])
+    )
     monkeypatch.setattr(
         sys,
         "argv",
@@ -204,10 +208,12 @@ def test_acceptance_runner_preserves_data_selection(monkeypatch, tmp_path, histo
     cfg = calls[0]
     data = cfg if historical else cfg.data
     expected_root = tmp_path / "bundle"
-    assert data.dataset == (expected_root / "tokens/train" if mode == "legacy" else expected_root)
+    assert data.dataset == (
+        expected_root / "tokens/train" if mode in {"legacy", "token_bin"} else expected_root
+    )
     if not historical:
         data.validate()
-        assert data.format == ("token_bin" if mode == "legacy" else "prepared_bundle")
+        assert data.format == ("token_bin" if mode == "token_bin" else "prepared_bundle")
         assert data.modalities == (
             ("text", "image", "audio", "video") if mode == "media" else ("text",)
         )
