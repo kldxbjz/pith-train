@@ -4,55 +4,13 @@ This entry point configures the existing `pretrain_lm.launch`, including its
 optimizer, DualPipeV scheduler and distributed checkpoint path. Prepare the data
 with [the unified recipe](../../prepare_omni_data/qwen3-omni-training/README.md).
 
-For a short data/checkpoint run, select the constant schedule and disable the
-load-balancing auxiliary loss explicitly:
-
 ```bash
 torchrun --standalone --nproc-per-node=1 examples/pretrain_lm/qwen3-omni/script.py \
   --dataset workspace/datasets/omni-training --modalities text \
   --model /path/to/compatible-native-model-config \
-  --optimizer adamw --scheduler constant --lr 1e-4 --moe-load-balance-coef 0 \
   --sequence-length 128 --global-batch-size 8 --steps 4 \
-  --checkpoint workspace/checkpoints/qwen3-omni-smoke --save-interval 2
+  --checkpoint workspace/checkpoints/qwen3-omni --save-interval 2
 ```
-
-## Training options
-
-The example now defaults to AdamW (`lr=1e-4`, weight decay `0.1`), WSD with
-`start_lr=final_lr=1e-5`, 3% warmup and 10% cosine decay, and global-batch MoE
-load balancing with coefficient `1e-3`. It defaults to 4096 steps, global batch
-1024 and a checkpoint every 256 steps. Microbatch size is 1; PP/CP/EP default to 1.
-These are configurable example settings, not a validated full-size Omni recipe.
-
-This longer example selects Muon for eligible weights and AdamW for the rest,
-with explicit scheduler parameters and a four-GPU PP2/EP2 layout:
-
-```bash
-torchrun --standalone --nproc-per-node=4 examples/pretrain_lm/qwen3-omni/script.py \
-  --dataset /path/to/full-prepared-bundle --modalities text \
-  --model /path/to/compatible-native-model-config --pp 2 --ep 2 \
-  --optimizer muon --weight-decay 0.1 --scheduler wsd --lr 3e-4 \
-  --start-lr 1e-5 --warmup-ratio 0.03 --final-lr 1e-5 \
-  --decay-ratio 0.1 --decay-shape cosine \
-  --moe-load-balance-type global-batch --moe-load-balance-coef 1e-3 \
-  --sequence-length 2048 --global-batch-size 1024 --steps 4096 \
-  --checkpoint workspace/checkpoints/qwen3-omni-training --save-interval 256
-```
-
-The text corpus must contain at least `steps * global_batch_size` complete
-sequences. The small validation bundle cannot supply this longer run. Choose a
-model and parallel layout that fit the available memory.
-
-WSD options are rejected with `--scheduler constant`, so a supplied warmup/decay
-setting cannot be silently ignored. Positive phase fractions must round to at
-least one step; set a fraction to zero to disable that phase. Both fractions
-together, including their rounded step counts, must fit in the run. The example
-rejects invalid/nonfinite learning rates, weight decay and load-balance coefficients
-before importing the GPU training modules.
-
-Changing a checkpoint's training recipe is not an exact-continuation guarantee;
-use separate checkpoint directories when comparing recipes. The independent
-acceptance runner below retains its own fixed configuration and thresholds.
 
 `--model` must name a model registered in PithTrain with a vocabulary of at least
 152064 entries. A reduced model must keep that vocabulary while reducing depth,
@@ -117,11 +75,9 @@ targets when the global batch has some. A globally empty target batch fails.
 
 The model/optimizer checkpoint now also stores data identity and the count of
 samples consumed by completed optimizer steps. Prefetch never advances this
-saved count. Relaunch with the same checkpoint directory to resume. The data
-cursor permits increasing `--steps`, but WSD derives its phase boundaries from
-the total step count. Preserve the total steps and scheduler settings to retain
-the original LR trajectory. Changing the data bundle, modalities, sampling,
-sequence length, seed or batch sizes rejects the data resume. An old checkpoint without data state
+saved count. Relaunch with the same checkpoint directory to resume; increasing
+`--steps` is allowed. Changing the data bundle, modalities, sampling, sequence length,
+seed or batch sizes rejects the resume. An old checkpoint without data state
 cannot silently restart this data stream. Legacy `.bin`-only recipes keep their
 existing checkpoint format and loading path. Selecting the same modalities as an
 existing recipe stage preserves its version-1 fingerprint, so checkpoints from
