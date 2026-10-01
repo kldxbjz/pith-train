@@ -86,12 +86,13 @@ def example_report(data_format="prepared_bundle"):
         legacy=False,
         data_format=data_format,
         parallelism=dict(pp=1, cp=1, ep=1),
-        mesh={"rank": 0},
+        mesh=dict(rank=0, pp_rank=0, dp_rank=0, cp_rank=0, pp_size=1, dp_size=1, cp_size=1),
         config={"lr": 1e-5},
         source_sha256="same-source",
         media=False,
         checkpoint_step=1,
         rows=[{"train/step": n} for n in range(3)],
+        loss_statistics=[{"loss_sum": 1.0, "target_count": 2}] * 3,
         batches=[[[[], [], None, None, None, []]] for _ in range(3)],
         checkpoint_state=dict(
             weights={},
@@ -118,6 +119,7 @@ def example_report(data_format="prepared_bundle"):
         {"steps": 2},
         {"batches": []},
         {"rows": [{"train/step": 1}]},
+        {"loss_statistics": []},
         {"checkpoint_state": None},
         {"batches": [[[[], [], None, None, []]]] * 3},
     ],
@@ -128,8 +130,36 @@ def test_restore_rejects_wrong_or_incomplete_provenance(tmp_path, change):
     report.update(change)
     with pytest.raises(AssertionError):
         runner.validate_restore_report(
-            report, args, mesh={"rank": 0}, config={"lr": 1e-5}, source_sha256="same-source"
+            report,
+            args,
+            mesh=dict(rank=0, pp_rank=0, dp_rank=0, cp_rank=0, pp_size=1, dp_size=1, cp_size=1),
+            config={"lr": 1e-5},
+            source_sha256="same-source",
         )
+
+
+@pytest.mark.parametrize("rank", range(4))
+def test_restore_report_matches_rank_zero_logging_and_pp_zero_objectives(tmp_path, rank):
+    args = runner.parse_args(arguments(tmp_path, "--steps", "3", "--pp", "2", "--ep", "2"))
+    report = example_report()
+    mesh = dict(
+        rank=rank, pp_rank=rank // 2, dp_rank=rank % 2, cp_rank=0, pp_size=2, dp_size=2, cp_size=1
+    )
+    report.update(mesh=mesh, parallelism=dict(pp=2, cp=1, ep=2))
+    if rank != 0:
+        report["rows"] = []
+    if mesh["pp_rank"] != 0:
+        report["loss_statistics"] = []
+    kwargs = dict(mesh=mesh, config={"lr": 1e-5}, source_sha256="same-source")
+    runner.validate_restore_report(report, args, **kwargs)
+    broken = copy.deepcopy(report)
+    broken["rows"] = [] if rank == 0 else [{"train/step": 0}]
+    with pytest.raises(AssertionError):
+        runner.validate_restore_report(broken, args, **kwargs)
+    broken = copy.deepcopy(report)
+    broken["loss_statistics"] = [] if mesh["pp_rank"] == 0 else [{"loss_sum": 1.0}]
+    with pytest.raises(AssertionError):
+        runner.validate_restore_report(broken, args, **kwargs)
 
 
 @pytest.mark.parametrize(

@@ -120,7 +120,9 @@ def validate_restore_report(expected, args, *, mesh, config, source_sha256):
     )
     assert expected["checkpoint_step"] == args.checkpoint_step, "Checkpoint step differs"
     assert expected["steps"] == args.steps and len(expected["batches"]) == args.steps
-    assert [row["train/step"] for row in expected["rows"]] == list(range(args.steps))
+    logged_steps = list(range(args.steps)) if mesh["rank"] == 0 else []
+    assert [row["train/step"] for row in expected["rows"]] == logged_steps
+    assert len(expected["loss_statistics"]) == (args.steps if mesh["pp_rank"] == 0 else 0)
     state = expected["checkpoint_state"]
     assert isinstance(state, dict) and set(state) == {
         "weights",
@@ -210,6 +212,7 @@ def main():
     # encoder and cannot certify Omni semantics. No production capability is changed.
     seen, normal_calls, posemb_calls = Counter(), Counter(), Counter()
     view_checks = []
+    media_audit = None
 
     def audit_method(method):
         def checked(self, *a, **kw):
@@ -244,6 +247,7 @@ def main():
 
     def forward(self, inputs, cu_seqlens=None, model_context=None):
         normal_calls[self.stage_index] += 1
+        media_audit.observe_dispatch(self.stage_index, model_context, "normal")
         return model_forward(self, inputs, self.chunk_record, cu_seqlens, model_context)
 
     def prolog(self, inputs, model_context=None):
@@ -286,6 +290,17 @@ def main():
                 )
             )
         if args.media:
+            from pithtrain.modules import qwen3_omni_data
+            from pithtrain.modules.training_data import OmniPretrainData
+            from pithtrain.pipeline import dualpipev
+            from pithtrain.tasks import prepare_omni_data
+            from tests.omni_media_audit import MediaAudit
+
+            media_audit = MediaAudit(distributed.pp_rank, distributed.pp_size, distributed.pp_group)
+            media_audit.install(
+                stack, OmniPretrainData, prepare_omni_data, qwen3_omni_data, torch.distributed
+            )
+            media_audit.install_dispatch(stack, dualpipev)
             stack.enter_context(
                 patch.object(
                     Qwen3MoeModel,
@@ -357,6 +372,10 @@ def main():
         def get_batch(*a, **kw):
             nonlocal local_target_count
             result = original_batch(*a, **kw)
+            if media_audit is not None:
+                media_audit.bind_batches(
+                    result, [module.stage_index for module in training.model.module]
+                )
             local_target_count = sum(
                 int((mb.objective_inputs[0] != -100).sum().item()) for mb in result
             )
@@ -400,6 +419,8 @@ def main():
         initial = digest(dict(training.model.named_parameters()))
         for step in range(start, args.steps):
             pretrain_lm.train_step(cfg, data, step)
+            if media_audit is not None:
+                media_audit.end_step()
             # Observe the same detached objective outputs in every arm. Do not
             # replace the training logger or change its reduction/gradients.
             # The offline comparator can then form a global token-weighted mean
@@ -466,6 +487,18 @@ def main():
             checkpoint_state=checkpoint_state,
             exact_restore=expected is not None,
             modalities=dict(seen),
+            media_observations=None
+            if media_audit is None
+            else dict(
+                data=media_audit.finish_data(
+                    providers=1,
+                    validations=1,
+                    expected_batches=(args.steps - start)
+                    * t.global_batch_size
+                    // distributed.dp_size,
+                ),
+                dispatch=media_audit.finish_dispatch(expected_steps=args.steps - start),
+            ),
             normal_calls=dict(normal_calls),
             posemb_calls=dict(posemb_calls),
             config=config,

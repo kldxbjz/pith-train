@@ -21,6 +21,7 @@ from pithtrain.modules.microbatch import Microbatch
 from pithtrain.modules.qwen3_omni_data import create_omni_dataloader
 from pithtrain.modules.training_data import OmniPretrainData
 from tests import test_omni_training as fixtures
+from tests.omni_media_audit import MediaAudit
 from tests.test_omni_training_acceptance import media_kind
 
 manifest = fixtures.manifest
@@ -123,6 +124,8 @@ def _media_worker(rank, rendezvous, root, reference_file):
             )
         stack.enter_context(patch.object(dist, "broadcast_object_list", object_broadcast))
         stack.enter_context(patch.object(dist, "broadcast", tensor_broadcast))
+        audit = MediaAudit(pp_rank, 2, group)
+        audit.install(stack, OmniPretrainData, prepare_omni_data, qwen3_omni_data, dist)
         for mode, kinds in enumerate(MODES):
             cfg, tc = configs(root, kinds)
             data = OmniPretrainData(cfg, tc, **kwargs)
@@ -154,6 +157,12 @@ def _media_worker(rank, rendezvous, root, reference_file):
                 restored.commit_step(step)
             assert restored.state_dict() == data.state_dict()
 
+        audit_report = audit.finish_data(
+            providers=2 * len(MODES), validations=len(MODES), expected_batches=10 * len(MODES)
+        )
+        (Path(rendezvous).parent / f"media-audit-rank{rank}.json").write_text(
+            json.dumps(audit_report)
+        )
         cfg, tc = configs(root, ("image",))
         failed = OmniPretrainData(cfg, tc, **kwargs)
 
