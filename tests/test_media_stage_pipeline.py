@@ -1,7 +1,8 @@
 """Execute actual DualPipeV dispatch methods with CPU tensors and mock compute.
 
 Model kernels, CUDA streams/NVTX and overlapped math are mocked. These tests cover
-phase/microbatch context selection, including the two chunks on the same PP rank.
+phase/microbatch context selection, including the two chunks on the same PP rank,
+and the forward microbatch identity published for routing replay.
 """
 
 import ast
@@ -29,6 +30,7 @@ def dispatch_methods(overlapped):
     ns = module.__dict__
     ns.update(
         torch=torch,
+        training=SimpleNamespace(current_microbatch=None),
         distributed=SimpleNamespace(device="cpu"),
         nvtx=SimpleNamespace(range_push=lambda *_: None, range_pop=lambda: None),
         overlapped_forward_backward=overlapped,
@@ -78,11 +80,11 @@ def test_pipeline_passes_media_only_to_stage_zero(pp_rank, phase, overlap, with_
 
         def __call__(self, inputs, **kwargs):
             observe(self.stage_index, kwargs.get("model_context"), "normal")
-            seen.append((self.stage_index, kwargs))
+            seen.append((self.stage_index, kwargs, pipeline_module.training.current_microbatch))
             return torch.ones(1, 3, 3, requires_grad=True)
 
     def overlapped(module, *args, **kwargs):
-        seen.append((module.stage_index, kwargs))
+        seen.append((module.stage_index, kwargs, pipeline_module.training.current_microbatch))
         return (
             [torch.ones(1, 3, 3, requires_grad=True)],
             torch.tensor(1.0),
@@ -147,8 +149,10 @@ def test_pipeline_passes_media_only_to_stage_zero(pp_rank, phase, overlap, with_
         else:
             engine._forward_compute_chunk(phase)
     assert len(seen) == 1
-    stage, kwargs = seen[0]
+    stage, kwargs, replay_microbatch = seen[0]
     assert stage == modules[phase].stage_index
+    # The overlapped backward uses batch 0; routing replay must see forward batch 1.
+    assert replay_microbatch == 1
     context = kwargs.get("model_context")
     if not with_media:
         assert context is None
