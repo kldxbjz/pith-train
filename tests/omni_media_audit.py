@@ -138,18 +138,18 @@ class MediaAudit:
 
         original_object = dist.broadcast_object_list
 
-        def object_broadcast(message, *args, **kwargs):
+        def object_broadcast(object_list, *args, **kwargs):
             if self.pp_size == 1 or kwargs.get("group") is not self.pp_group:
-                return original_object(message, *args, **kwargs)
+                return original_object(object_list, *args, **kwargs)
             assert kwargs["src"] == dist.get_global_rank(self.pp_group, 0)
-            no_tensors(message)
+            no_tensors(object_list)
             self.in_object_broadcast = True
             try:
-                result = original_object(message, *args, **kwargs)
+                result = original_object(object_list, *args, **kwargs)
             finally:
                 self.in_object_broadcast = False
-            no_tensors(message)
-            value, error = message[0]
+            no_tensors(object_list)
+            value, error = object_list[0]
             self.counts["metadata_headers"] += 1
             if self.in_batch and error is None:
                 _, specs = value
