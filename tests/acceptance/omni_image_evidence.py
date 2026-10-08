@@ -1,5 +1,7 @@
 """CPU-testable evidence checks shared by the unexecuted H100 image gates."""
 
+import copy
+
 import torch
 
 
@@ -94,3 +96,53 @@ class OptimizerStepEvidence:
 def fixture_image_index(global_index, dp_size):
     """Alternate local images even when global batches are strided across DP."""
     return (global_index // dp_size + global_index % dp_size) % 2
+
+
+def fixed_image_batches(batches, dp_size, scenario):
+    """Shared by CPU audits and the real staged gate; never skips zero-label work."""
+    assert len(batches) == 2 and dp_size in (1, 2, 4)
+    assert scenario in ("nonuniform", "rank-zero")
+    assert scenario != "rank-zero" or dp_size > 1, "rank-zero requires multiple DP ranks"
+    result = []
+    for index in range(8):
+        batch = copy.deepcopy(batches[fixture_image_index(index, dp_size)])
+        batch.labels = batch.labels.clone()
+        if index == 0 or (scenario == "rank-zero" and index % dp_size == 0):
+            batch.labels.fill_(-100)
+        elif index % 3 == 0:
+            batch.labels[:, ::2] = -100
+        result.append(batch)
+    validate_target_layout(result, dp_size, scenario)
+    return result
+
+
+def validate_target_layout(batches, dp_size, scenario):
+    """Fail before native execution if the advertised rank-zero case is absent."""
+    assert len(batches) == 8 and dp_size in (1, 2, 4)
+    assert scenario in ("nonuniform", "rank-zero")
+    counts = [int((batch.labels != -100).sum()) for batch in batches]
+    totals = [sum(counts[rank::dp_size]) for rank in range(dp_size)]
+    assert sum(totals) > 0, "Expected globally nonzero targets"
+    if scenario == "rank-zero":
+        assert dp_size > 1 and totals[0] == 0, "Expected the entire DP rank 0 to have zero targets"
+        assert all(value > 0 for value in totals[1:]), "Other DP ranks must retain targets"
+    else:
+        assert counts[0] == 0 and all(value > 0 for value in totals)
+    return dict(
+        microbatch_target_counts=counts, rank_target_totals=totals, global_target_count=sum(totals)
+    )
+
+
+def target_partition_evidence(microbatches, layout, dp_rank, global_count):
+    """Check actual objective_inputs, including each PP copy, before model.step."""
+    counts = [int((batch.objective_inputs[0] != -100).sum()) for batch in microbatches]
+    dp_size = len(layout["rank_target_totals"])
+    assert counts == layout["microbatch_target_counts"][dp_rank::dp_size], (
+        "Wrong DP label partition"
+    )
+    local_count = sum(counts)
+    assert local_count == layout["rank_target_totals"][dp_rank]
+    assert int(global_count) == layout["global_target_count"], "PP replicas duplicated targets"
+    return dict(
+        dp_rank=dp_rank, local_target_count=local_count, global_target_count=int(global_count)
+    )

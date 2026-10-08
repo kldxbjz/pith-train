@@ -1,6 +1,5 @@
 """H100-only DualPipeV/FSDP image gradient gate; invoked by omni_image_training."""
 
-import copy
 import json
 import os
 from datetime import timedelta
@@ -14,9 +13,11 @@ from pithtrain.modules.microbatch import Microbatch
 from pithtrain.modules.training_data import global_loss_mean, global_target_count
 from tests.acceptance.omni_image_evidence import (
     OptimizerStepEvidence,
-    fixture_image_index,
+    fixed_image_batches,
     module_update_evidence,
+    target_partition_evidence,
     training_groups,
+    validate_target_layout,
 )
 from tests.acceptance.omni_image_training import (
     HFReference,
@@ -53,6 +54,7 @@ def run(args):
 
     world = int(os.environ["WORLD_SIZE"])
     assert world % args.pp == 0 and (world // args.pp) % args.ep == 0
+    assert args.scenario != "rank-zero" or world // args.pp > 1
     _, _, batches, config = source_inputs(args.dataset)
     rank = int(os.environ["RANK"])
     # Before the first barrier every rank checks that evidence is fresh.
@@ -100,18 +102,11 @@ def run(args):
     dist.all_gather_object(owned_keys, sorted(actual))
     assert set().union(*(set(keys) for keys in owned_keys)) == set(expected)
 
-    # Fixed real-image batches isolate staged math and expose nonuniform/zero
-    # local targets. DP coordinates use separate fixture entries; PP replicas
-    # see identical shared layout but only stage 0 sees pixels.
-    global_batches = []
-    for index in range(8):
-        batch = copy.deepcopy(batches[fixture_image_index(index, distributed.dp_size)])
-        batch.labels = batch.labels.clone()
-        if index == 0:
-            batch.labels.fill_(-100)
-        elif index % 3 == 0:
-            batch.labels[:, ::2] = -100
-        global_batches.append(batch)
+    # Each scenario has its own process/weights/optimizer and output directory.
+    # Preserve nonuniform microbatches; rank-zero also masks every microbatch on
+    # attention-DP rank 0, while retaining the other rank's labels.
+    global_batches = fixed_image_batches(batches, distributed.dp_size, args.scenario)
+    layout = validate_target_layout(global_batches, distributed.dp_size, args.scenario)
     local_batches = global_batches[distributed.dp_rank :: distributed.dp_size]
     microbatches = []
     for batch in local_batches:
@@ -129,7 +124,18 @@ def run(args):
         )
     group = distributed.attn_mesh["dp", "cp"]._flatten().get_group()
     count = global_target_count(microbatches, group)
-    assert int(count) == sum(int((b.labels != -100).sum()) for b in global_batches)
+    partition = target_partition_evidence(microbatches, layout, distributed.dp_rank, count)
+    partition["pp_rank"] = distributed.pp_rank
+    partitions = [None] * world
+    dist.all_gather_object(partitions, partition)
+    assert sorted((row["pp_rank"], row["dp_rank"]) for row in partitions) == [
+        (pp, dp) for pp in range(args.pp) for dp in range(distributed.dp_size)
+    ]
+    for row in partitions:
+        assert row["local_target_count"] == layout["rank_target_totals"][row["dp_rank"]]
+        assert row["global_target_count"] == layout["global_target_count"] > 0
+        if args.scenario == "rank-zero" and row["dp_rank"] == 0:
+            assert row["local_target_count"] == 0
     # Independent HF processes all eight global samples. No PP or DP replicas
     # are counted in its denominator.
     hf_loss = 0
@@ -199,6 +205,10 @@ def run(args):
         rank=rank,
         pp=args.pp,
         ep=args.ep,
+        scenario=args.scenario,
+        target_layout=layout,
+        target_partitions=partitions,
+        local_target_count=partition["local_target_count"],
         target_count=int(count),
         gradient_errors=errors,
         updated_parameters=updated,

@@ -26,7 +26,12 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 
 from pithtrain.models.qwen3_omni_image_inputs import validate_image_inputs
 from pithtrain.models.qwen3_omni_vision import Qwen3OmniMoeVisionEncoder
-from tests.acceptance.omni_image_evidence import module_update_evidence, training_groups
+from tests.acceptance.omni_image_evidence import (
+    fixed_image_batches,
+    module_update_evidence,
+    training_groups,
+    validate_target_layout,
+)
 from tests.test_qwen3_omni_vision import hf_positions
 
 REPO = Path(__file__).resolve().parents[2]
@@ -191,7 +196,11 @@ def cpu_gate(args):
     config.save_pretrained(args.output / "model")
     report = dict(
         status="PASSED",
-        scope="CPU native vision and image geometry only",
+        scope="CPU native vision, image geometry and staged fixture layout only",
+        staged_target_layouts={
+            scenario: validate_target_layout(fixed_image_batches(batches, 2, scenario), 2, scenario)
+            for scenario in ("nonuniform", "rank-zero")
+        },
         gpu_acceptance="NOT_RUN",
         processor=bundle["recipe"]["revision"],
         samples=audits,
@@ -315,6 +324,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--pp", type=int, default=1)
     parser.add_argument("--ep", type=int, default=1)
+    parser.add_argument("--scenario", choices=("nonuniform", "rank-zero"), default="nonuniform")
     args = parser.parse_args()
     args.dataset, args.output = args.dataset.resolve(), args.output.resolve()
     assert not args.output.is_relative_to(args.dataset) and not args.dataset.is_relative_to(

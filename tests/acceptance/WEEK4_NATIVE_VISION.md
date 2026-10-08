@@ -56,9 +56,16 @@ promise recovery after process death or broken NCCL transport.
    numerical regression. Code and runner prepared; GPU NOT RUN.
 3. **Staged H100 training**: DualPipeV/FSDP WORLD1, DP2, PP2, EP2 and PP2EP2,
    global target counts excluding PP replicas, nonuniform/zero local targets,
-   global all-zero rejection, all owned gradients versus independent HF,
+   global all-zero rejection, a separate whole-DP-rank-zero scenario, all owned gradients versus independent HF,
    encoder/projection/decoder update witnesses and four real-reader task steps.
    Code and runner prepared; GPU NOT RUN.
+
+The v3 P2 correction preserves the original nonuniform fixture (DP2 target
+totals 28/39) and adds independently launched rank-zero scenarios on DP2, EP2
+and PP2EP2 (DP2 totals 0/39). CPU audits use the identical fixture builder;
+four-rank Gloo and fault-injection tests verify the labels and nonduplicated
+counts. GPU native CE/FSDP gradient/update execution is still NOT RUN. See
+WEEK4_ACCEPTANCE_MATRIX.md for the exact evidence boundary.
 
 Planning estimate for the expanded native-encoder scope: approximately 8–12
 hours for milestone 1, 8–12 for milestone 2, and 8–16 for milestone 3 including
@@ -77,6 +84,7 @@ export CUDA_VISIBLE_DEVICES= HF_HUB_OFFLINE=1 PYTHONPATH="$PWD"
 export OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
 PY=/home/kldxbjz/code/pith-train-omni/.venv/bin/python
 "$PY" -m pytest tests/test_qwen3_omni_vision.py tests/test_omni_image_contract.py \
+  tests/test_omni_image_acceptance_evidence.py tests/test_omni_image_rank_zero.py \
   tests/test_omni_model_registration.py tests/test_omni_training.py \
   tests/test_qwen3_omni_data.py tests/test_training_data.py \
   tests/test_training_sequence_length.py tests/test_qwen3_omni_checkpoint.py \
@@ -101,7 +109,7 @@ package without the user's new explicit resource/transfer authorization.
 
 Proposal: one node, **4 H100**, 32 CPUs, 128 GiB host RAM, 32 GiB new scratch,
 **45-minute allocation = at most 3 allocated GPU-hours**. This is an estimate,
-not a measured H100 requirement. Runner wall budget is 40 minutes; per GPU gate
+not a measured H100 requirement. Eight staged scenarios plus text/image reference gates fit the same hard budget; timeouts fail rather than skip. Runner wall budget is 40 minutes; per GPU gate
 is capped at 120 seconds (single GPU) or 180 seconds (multi-GPU), plus at most
 15 seconds termination grace. No retry/requeue. Queue time is not execution.
 The tiny vision is 3 layers/64 hidden and text is 4 layers/128 hidden with the

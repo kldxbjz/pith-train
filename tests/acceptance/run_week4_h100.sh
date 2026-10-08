@@ -44,7 +44,7 @@ for i in range(4):
  assert total-free < 1000*1024*1024, f"GPU {i} is busy"'
 }
 run_gate cpu-tests 180 env CUDA_VISIBLE_DEVICES= "$python" -m pytest \
-  tests/test_qwen3_omni_vision.py tests/test_omni_image_contract.py tests/test_omni_image_acceptance_evidence.py tests/test_omni_training.py \
+  tests/test_qwen3_omni_vision.py tests/test_omni_image_contract.py tests/test_omni_image_acceptance_evidence.py tests/test_omni_image_rank_zero.py tests/test_omni_training.py \
   tests/test_qwen3_omni_data.py tests/test_omni_model_registration.py -q --junitxml="$out/cpu.xml"
 run_gate cpu-no-skips 15 "$python" -c 'import sys,xml.etree.ElementTree as E
 r=E.parse(sys.argv[1]); suites=list(r.iter("testsuite")); assert suites
@@ -58,20 +58,32 @@ suites=list(E.parse(sys.argv[1]).iter("testsuite")); assert suites
 assert all(int(s.get("tests",0))>0 and all(int(s.get(k,0))==0 for k in ("skipped","failures","errors")) for s in suites)' "$out/text.xml"
 gpu_free > "$out/gpu-before-reference.log"
 run_gate image-hf-reference 120 "$python" "$driver" --mode reference --dataset "$data" --output "$out/reference"
-for profile in '1 1 1' '2 1 1' '2 2 1' '2 1 2' '4 2 2'; do
-  read -r world pp ep <<< "$profile"
+for profile in '1 1 1 nonuniform' '2 1 1 nonuniform' '2 2 1 nonuniform' '2 1 2 nonuniform' '4 2 2 nonuniform' '2 1 1 rank-zero' '2 1 2 rank-zero' '4 2 2 rank-zero'; do
+  read -r world pp ep scenario <<< "$profile"
   name=w${world}-pp${pp}-ep${ep}
+  if [[ $scenario != nonuniform ]]; then name+=-$scenario; fi
   gpu_free > "$out/gpu-before-$name.log"
   cap=180
   (( world != 1 )) || cap=120
   run_gate "$name" "$cap" "$python" -m torch.distributed.run --standalone --nnodes=1 \
-    --nproc-per-node="$world" "$driver" --mode staged --dataset "$data" --output "$out/$name" --pp "$pp" --ep "$ep"
+    --nproc-per-node="$world" "$driver" --mode staged --dataset "$data" --output "$out/$name" --pp "$pp" --ep "$ep" --scenario "$scenario"
 done
 run_gate reports 15 "$python" -c 'import json,pathlib,sys
 r=pathlib.Path(sys.argv[1]); commit=(r/"commit.txt").read_text().strip()
-paths=[r/"audit/cpu.json",r/"reference/reference.json"]
+paths=[(r/"audit/cpu.json",None),(r/"reference/reference.json",None)]
 for world,pp,ep in ((1,1,1),(2,1,1),(2,2,1),(2,1,2),(4,2,2)):
- paths += [r/f"w{world}-pp{pp}-ep{ep}"/f"rank-{rank:05d}.json" for rank in range(world)]
-for path in paths:
+ paths += [(r/f"w{world}-pp{pp}-ep{ep}"/f"rank-{rank:05d}.json","nonuniform") for rank in range(world)]
+for world,pp,ep in ((2,1,1),(2,1,2),(4,2,2)):
+ paths += [(r/f"w{world}-pp{pp}-ep{ep}-rank-zero"/f"rank-{rank:05d}.json","rank-zero") for rank in range(world)]
+for path,scenario in paths:
  report=json.loads(path.read_text()); assert report["status"]=="PASSED" and report["commit"]==commit, path
+ if scenario:
+  assert report["scenario"]==scenario, path
+ if scenario=="rank-zero":
+  totals=report["target_layout"]["rank_target_totals"]
+  assert totals[0]==0 and all(value>0 for value in totals[1:]), path
+  assert report["target_count"]==sum(totals)>0, path
+  for row in report["target_partitions"]:
+   assert row["local_target_count"]==totals[row["dp_rank"]], path
+   assert row["global_target_count"]==sum(totals), path
 print(f"PASS: {len(paths)} reports. This does not cover full released weights, CP, mixed-modality DP, or image checkpoint conversion.")' "$out"
