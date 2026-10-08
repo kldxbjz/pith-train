@@ -30,6 +30,8 @@ from .qwen3_omni_moe import (
     canonical_to_hf,
     export_config,
     load_canonical,
+    read_json,
+    require_empty_destination,
 )
 
 
@@ -69,6 +71,8 @@ def hf2dcp(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
     """Convert HuggingFace checkpoint to DCP format."""
     load_path, save_path = Path(cfg.load_path), Path(cfg.save_path)
 
+    if (load_path / "config.json").exists():
+        read_json(load_path / "config.json")
     for converter in CONVERTERS:
         if converter.detect_hf(load_path):
             stdout.info("Dispatching hf2dcp to %s converter" % converter.name)
@@ -109,12 +113,12 @@ def dcp2hf(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
         raise ValueError("max_shard_size must be positive")
     config = export_config(load_path, cfg.omni_text_config)
     if config is not None:
+        require_empty_destination(save_path)
         canonical = load_canonical(load_path, config)
         hf_state = canonical_to_hf(
             canonical, config, prefix=cfg.omni_prefix, layout=cfg.omni_expert_layout
         )
-        if save_path.exists() and any(save_path.iterdir()):
-            raise ConversionError(f"Destination must be empty: {save_path}")
+        del canonical  # release unstacked source experts before writing fused copies
         _write_hf(hf_state, save_path, cfg.max_shard_size, stdout)
         (save_path / "config.json").write_text(json.dumps(config.to_dict(), indent=2) + "\n")
         manifest = {

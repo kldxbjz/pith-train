@@ -80,8 +80,15 @@ dense layers, attention bias and unnormalized routing. A HF module with native's
 parameter structure exercises runtime key packing; native CUDA forward/backward
 is not run or simulated. Negative tests cover dropped/extra/reshaped parameters,
 expert IDs, prefixes, dtype mismatches, mixed layouts, shard/index corruption,
-duplicate tensors, media exclusion, config conflicts and nonempty destinations.
-A generic Qwen converter file roundtrip guards the shared writer integration.
+duplicate tensors and serialized JSON keys (including raw safetensors headers),
+media exclusion, config conflicts and nonempty destinations. Header/DCP dtype
+checks precede tensor reads/allocations; both export layouts reject inconsistent
+expert dtypes. Occupied destinations fail before payload loading.
+Generic Qwen plus existing GPT-OSS/Qwen3.5 file-conversion tests guard dispatcher
+and shared-writer compatibility. The expanded CPU suite has 67 passing cases.
+See [validation preparation](VALIDATION.md) for six explicitly gated GPU cases
+and concrete PR100 strict-recovery prerequisites; those GPU/resume checks have
+not been executed.
 
 The full-size test constructs the official HF text architecture on **meta** and
 checks 531 fused HF keys <-> 12,723 canonical keys <-> 18,867 released split keys.

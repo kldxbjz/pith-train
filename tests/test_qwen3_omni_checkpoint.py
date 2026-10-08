@@ -337,7 +337,7 @@ def test_dtype_and_config_guards(config, tmp_path):
     split["thinker.model.layers.0.mlp.experts.0.up_proj.weight"] = split[
         "thinker.model.layers.0.mlp.experts.0.up_proj.weight"
     ].double()
-    with pytest.raises(ConversionError, match="Mixed gate/up"):
+    with pytest.raises(ConversionError, match="Mixed expert dtypes"):
         hf_to_canonical(split, config)
     canon, _ = hf_to_canonical(synthetic_hf(config), config)
     canon["layers.0.mlp.experts.0.down_proj"] = canon["layers.0.mlp.experts.0.down_proj"].double()
@@ -422,3 +422,228 @@ def test_cli_dense_native_requires_config(tmp_path):
     assert result.returncode == 2
     assert "requires --text-config" in result.stderr
     assert not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("location", ["config", "index", "header", "sidecar"])
+def test_duplicate_serialized_keys_are_rejected(config, tmp_path, location):
+    src, disk = tmp_path / "src", tmp_path / "disk"
+    write_hf(src, config, synthetic_hf(config), sharded=location == "index")
+    if location == "config":
+        path = src / "config.json"
+        path.write_text('{"hidden_size":999,' + path.read_text()[1:])
+    elif location == "index":
+        path = src / "model.safetensors.index.json"
+        raw = path.read_text()
+        key = next(iter(json.loads(raw)["weight_map"]))
+        path.write_text(
+            raw.replace(
+                '"weight_map": {',
+                '"weight_map": {' + json.dumps(key) + ':"discarded.safetensors",',
+                1,
+            )
+        )
+    elif location == "header":
+        path = src / "model.safetensors"
+        payload = path.read_bytes()
+        n = int.from_bytes(payload[:8], "little")
+        header = json.loads(payload[8 : 8 + n])
+        key = next(iter(header))
+        duplicate = (
+            "{"
+            + json.dumps(key)
+            + ":"
+            + json.dumps(header[key])
+            + ","
+            + payload[8 : 8 + n].decode().strip()[1:]
+        ).encode()
+        duplicate += b" " * (-len(duplicate) % 8)
+        path.write_bytes(len(duplicate).to_bytes(8, "little") + duplicate + payload[8 + n :])
+    else:
+        hf2dcp(make_cfg(load_path=src, save_path=disk), LOGGER)
+        path = disk / SIDECAR
+        path.write_text('{"scope":"discarded",' + path.read_text()[1:])
+        with pytest.raises(ConversionError, match="duplicate JSON key"):
+            dcp2hf(make_cfg(load_path=disk, save_path=tmp_path / "out"), LOGGER)
+        assert not (tmp_path / "out").exists()
+        return
+    with pytest.raises(ConversionError, match="duplicate JSON key"):
+        hf2dcp(make_cfg(load_path=src, save_path=disk), LOGGER)
+    assert not disk.exists()
+
+
+@pytest.mark.parametrize("fault", ["integer", "mixed-gate", "mixed-down"])
+def test_dtype_preflight_never_reads_tensor_payload(config, tmp_path, monkeypatch, fault):
+    from pithtrain.tasks.convert_checkpoint import qwen3_omni_moe as converter
+
+    src = tmp_path / "src"
+    state = synthetic_hf(config, layout="split")
+    if fault == "integer":
+        state["thinker.model.norm.weight"] = state["thinker.model.norm.weight"].int()
+    else:
+        projections = ("gate_proj", "up_proj") if fault == "mixed-gate" else ("down_proj",)
+        for proj in projections:
+            key = f"thinker.model.layers.0.mlp.experts.1.{proj}.weight"
+            state[key] = state[key].double()
+    write_hf(src, config, state)
+    original_open = converter.safe_open
+
+    class HeaderOnly:
+        def __init__(self, *args, **kwargs):
+            self.handle = original_open(*args, **kwargs)
+
+        def __enter__(self):
+            self.handle.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.handle.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self.handle, name)
+
+        def get_tensor(self, key):
+            pytest.fail(f"Payload read before dtype preflight: {key}")
+
+    monkeypatch.setattr(converter, "safe_open", HeaderOnly)
+    with pytest.raises(ConversionError, match="non-floating|Mixed expert"):
+        converter.read_hf_text(src, config)
+
+
+@pytest.mark.parametrize("layout", ["split", "fused"])
+def test_mixed_canonical_experts_fail_for_both_export_layouts(config, layout):
+    canonical, _ = hf_to_canonical(synthetic_hf(config), config)
+    canonical["layers.0.mlp.experts.1.down_proj"] = canonical[
+        "layers.0.mlp.experts.1.down_proj"
+    ].double()
+    with pytest.raises(ConversionError, match="Mixed expert"):
+        canonical_to_hf(canonical, config, layout=layout)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.float64])
+def test_dcp_dtype_preflight_never_allocates_or_loads(config, tmp_path, monkeypatch, dtype):
+    from pithtrain.tasks.convert_checkpoint import qwen3_omni_moe as converter
+
+    canonical, _ = hf_to_canonical(synthetic_hf(config), config)
+    canonical["layers.0.mlp.experts.1.down_proj"] = canonical[
+        "layers.0.mlp.experts.1.down_proj"
+    ].to(dtype)
+    disk = tmp_path / "disk"
+    dcp.save({"app": {"model": canonical}}, checkpoint_id=disk, no_dist=True)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Invalid DCP dtype reached tensor allocation/load")
+
+    monkeypatch.setattr(converter.torch, "empty", forbidden)
+    monkeypatch.setattr(converter.dcp, "load", forbidden)
+    with pytest.raises(ConversionError, match="non-floating|Mixed expert"):
+        load_canonical(disk, config)
+
+
+@pytest.mark.parametrize("operation", ["hf2dcp", "dcp2hf"])
+def test_nonempty_destination_is_checked_before_payload(config, tmp_path, monkeypatch, operation):
+    from pithtrain.tasks.convert_checkpoint import _core
+    from pithtrain.tasks.convert_checkpoint import qwen3_omni_moe as converter
+
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    write_hf(src, config, synthetic_hf(config))
+    dst.mkdir()
+    (dst / "keep.txt").write_text("user content")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Nonempty output reached tensor payload read")
+
+    monkeypatch.setattr(converter, "read_hf_text", forbidden)
+    monkeypatch.setattr(_core, "load_canonical", forbidden)
+    cfg = make_cfg(load_path=src, save_path=dst, omni_text_config=src / "config.json")
+    with pytest.raises(ConversionError, match="Destination must be empty"):
+        {"hf2dcp": hf2dcp, "dcp2hf": dcp2hf}[operation](cfg, LOGGER)
+    assert (dst / "keep.txt").read_text() == "user content"
+
+
+def test_numeric_expert_order_and_gate_up_order(config):
+    config.num_experts = 12
+    source = synthetic_hf(config, layout="split")
+    for i in range(config.num_experts):
+        for proj, tag in (("gate_proj", 100), ("up_proj", 200), ("down_proj", 300)):
+            source[f"thinker.model.layers.0.mlp.experts.{i}.{proj}.weight"].fill_(tag + i)
+    canonical, _ = hf_to_canonical(source, config)
+    fused = canonical_to_hf(canonical, config)
+    for i in range(config.num_experts):
+        gate, up = fused["thinker.model.layers.0.mlp.experts.gate_up_proj"][i].chunk(2, dim=0)
+        assert torch.all(gate == 100 + i) and torch.all(up == 200 + i)
+        assert torch.all(fused["thinker.model.layers.0.mlp.experts.down_proj"][i] == 300 + i)
+    split = canonical_to_hf(canonical, config, layout="split")
+    for key in source:
+        torch.testing.assert_close(split[key], source[key], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "thinker.visualization.weight",
+        "thinker.model.audio_tower.weight",
+        "thinker.model_extra.weight",
+        "other_thinker.lm_head.weight",
+    ],
+)
+def test_text_only_opt_in_does_not_drop_unknown_names(config, key):
+    state = synthetic_hf(config)
+    state[key] = torch.ones(1)
+    with pytest.raises(ConversionError, match="unexpected"):
+        hf_to_canonical(state, config, text_only=True)
+
+
+@pytest.mark.parametrize("family", ["gpt_oss", "qwen35_moe"])
+def test_existing_specialized_converters_preserve_dispatch_and_layout(tmp_path, family):
+    src, disk, out = (tmp_path / name for name in ("src", "disk", "out"))
+    src.mkdir()
+    e, h, m = 2, 4, 3
+    gate = torch.arange(e * 2 * m * h).reshape(e, 2 * m, h).float()
+    down = torch.arange(e * h * m).reshape(e, h, m).float()
+    if family == "gpt_oss":
+        config_data = {"model_type": "gpt_oss"}
+        state = {
+            "model.layers.0.mlp.experts.gate_up_proj": gate,
+            "model.layers.0.mlp.experts.down_proj": down,
+            "model.layers.0.mlp.experts.gate_up_proj_bias": torch.zeros(e, 2 * m),
+            "model.layers.0.mlp.experts.down_proj_bias": torch.zeros(e, h),
+        }
+        expected = {
+            key: value.transpose(-2, -1).contiguous() if value.ndim == 3 else value
+            for key, value in state.items()
+        }
+    else:
+        config_data = {"model_type": "qwen3_5_moe_text"}
+        state = {
+            "model.language_model.layers.0.mlp.experts.gate_up_proj": gate,
+            "model.language_model.layers.0.mlp.experts.down_proj": down,
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight": torch.ones(3, h),
+        }
+        expected = state
+    (src / "config.json").write_text(json.dumps(config_data))
+    save_file(state, src / "weights.safetensors")
+    (src / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {key: "weights.safetensors" for key in state}})
+    )
+    cfg = make_cfg(load_path=src, save_path=disk)
+    hf2dcp(cfg, LOGGER)
+    cfg.load_path, cfg.save_path = disk, out
+    # Both family dispatch and the shared loader must respect CPU allocation.
+    with torch.device("meta"):
+        dcp2hf(cfg, LOGGER)
+    exported = read_export(out)
+    assert exported.keys() == expected.keys()
+    for key in exported:
+        torch.testing.assert_close(exported[key], expected[key], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "index", [{"weight_map": None}, {"weight_map": []}, {"weight_map": {}}, {}]
+)
+def test_invalid_index_never_falls_back_to_single_file(config, tmp_path, index):
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    write_hf(src, config, synthetic_hf(config))
+    (src / "model.safetensors.index.json").write_text(json.dumps(index))
+    with pytest.raises(ConversionError, match="weight_map"):
+        hf2dcp(make_cfg(load_path=src, save_path=dst), LOGGER)
+    assert not dst.exists()

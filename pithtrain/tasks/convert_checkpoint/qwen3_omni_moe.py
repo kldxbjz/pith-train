@@ -20,11 +20,81 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen
 SIDECAR = "qwen3_omni_text.json"
 TEXT_TYPE = "qwen3_omni_moe_text"
 _NON_TEXT = ("thinker.audio_tower.", "thinker.visual.", "talker.", "code2wav.")
+_FLOAT_DTYPES = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+_SAFE_DTYPES = {
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+    "F32": torch.float32,
+    "F64": torch.float64,
+}
+_EXPERT_DTYPE = re.compile(
+    r"(.+\.experts)(?:\.\d+)?\.(gate_proj\.weight|up_proj\.weight|gate_up_proj|down_proj(?:\.weight)?)$"
+)
 _INDEXED = re.compile(r"(layers\.\d+\.mlp\.experts)\.(\d+)\.(gate_up_proj|down_proj)$")
 
 
 class ConversionError(ValueError):
     """A checkpoint violates the complete text parameter contract."""
+
+
+def _decode_json(data, label):
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ConversionError(f"{label}: duplicate JSON key {key!r}")
+            result[key] = value
+        return result
+
+    try:
+        result = json.loads(data, object_pairs_hook=unique_object)
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise ConversionError(f"{label}: invalid JSON") from error
+    if not isinstance(result, dict):
+        raise ConversionError(f"{label}: expected a JSON object")
+    return result
+
+
+def read_json(path):
+    """Do not silently replace duplicate config, sidecar or index entries."""
+    return _decode_json(Path(path).read_bytes(), str(path))
+
+
+def _validate_header_json(path):
+    # safetensors' parser accepts duplicate names with last-value-wins. Check
+    # raw JSON first; reading only its bounded header never materializes weights.
+    with Path(path).open("rb") as handle:
+        size = handle.read(8)
+        length = int.from_bytes(size, "little")
+        if len(size) != 8 or not 0 < length <= min(100_000_000, Path(path).stat().st_size - 8):
+            raise ConversionError(f"{path}: invalid safetensors header length")
+        _decode_json(handle.read(length), str(path))
+
+
+def require_empty_destination(path):
+    path = Path(path)
+    if path.exists() and (not path.is_dir() or any(path.iterdir())):
+        raise ConversionError(f"Destination must be empty: {path}")
+
+
+def validate_dtypes(dtypes, label):
+    invalid = {key: str(dtype) for key, dtype in dtypes.items() if dtype not in _FLOAT_DTYPES}
+    if invalid:
+        raise ConversionError(f"{label}: unsupported non-floating weights: {invalid}")
+    groups = {}
+    for key, dtype in dtypes.items():
+        match = _EXPERT_DTYPE.fullmatch(key)
+        if match:
+            root, proj = match.groups()
+            proj = (
+                "gate_up_proj"
+                if proj in ("gate_proj.weight", "up_proj.weight", "gate_up_proj")
+                else "down_proj"
+            )
+            groups.setdefault((root, proj), set()).add(dtype)
+    for (root, proj), values in groups.items():
+        if len(values) > 1:
+            raise ConversionError(f"{label}: Mixed expert dtypes: {root}.{proj}: {values}")
 
 
 def text_config(raw: dict) -> Qwen3OmniMoeTextConfig:
@@ -160,15 +230,11 @@ def validate_shapes(actual: Mapping, expected: Mapping, label: str):
 
 
 def validate_tensors(state, expected, label):
-    invalid = [
-        key
-        for key, value in state.items()
-        if not isinstance(value, torch.Tensor)
-        or value.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
-    ]
+    invalid = [key for key, value in state.items() if not isinstance(value, torch.Tensor)]
     if invalid:
         raise ConversionError(f"{label}: unsupported non-floating/non-tensor weights: {invalid}")
     validate_shapes({key: tuple(value.shape) for key, value in state.items()}, expected, label)
+    validate_dtypes({key: value.dtype for key, value in state.items()}, label)
 
 
 def _scope(keys, prefix, text_only):
@@ -203,8 +269,6 @@ def hf_to_canonical(state, config, *, prefix="thinker.", text_only=False):
         else:
             gate = raw[f"{root}.{idx}.gate_proj.weight"]
             up = raw[f"{root}.{idx}.up_proj.weight"]
-            if gate.dtype != up.dtype:
-                raise ConversionError(f"Mixed gate/up dtypes: {key}")
             result[key] = torch.cat((gate, up), dim=0)
     validate_tensors(result, parameter_shapes(config), "Canonical output")
     return result, excluded
@@ -221,8 +285,6 @@ def canonical_to_hf(state, config, *, prefix="thinker.", layout="fused"):
         if layout == "fused" and canon.endswith((".experts.gate_up_proj", ".experts.down_proj")):
             root, proj = canon.rsplit(".", 1)
             values = [state[f"{root}.{i}.{proj}"] for i in range(config.num_experts)]
-            if len({value.dtype for value in values}) != 1:
-                raise ConversionError(f"Mixed expert dtypes: {canon}")
             result[key] = torch.stack(values)
         elif layout == "split" and ".experts." in canon:
             root, proj, _ = canon.rsplit(".", 2)
@@ -243,19 +305,30 @@ def read_hf_text(load_path, config, *, prefix="thinker.", text_only=False):
     """Validate index and every header before reading text tensors; never load media."""
     load_path = Path(load_path)
     index = load_path / "model.safetensors.index.json"
-    weight_map = json.loads(index.read_text())["weight_map"] if index.exists() else None
+    weight_map = None
+    if index.exists():
+        weight_map = read_json(index).get("weight_map")
+        if (
+            not isinstance(weight_map, dict)
+            or not weight_map
+            or not all(isinstance(value, str) and value for value in weight_map.values())
+        ):
+            raise ConversionError("HF weight_map must be a nonempty tensor-to-shard mapping")
     filenames = (
         sorted(set(weight_map.values())) if weight_map is not None else ["model.safetensors"]
     )
-    shapes, owners = {}, {}
+    shapes, owners, dtypes = {}, {}, {}
     for filename in filenames:
         if Path(filename).name != filename:
             raise ConversionError(f"Shard must be a filename within the source: {filename!r}")
+        _validate_header_json(load_path / filename)
         with safe_open(load_path / filename, framework="pt", device="cpu") as handle:
             for key in handle.keys():
                 if key in shapes:
                     raise ConversionError(f"Duplicate tensor across shards: {key}")
-                shapes[key], owners[key] = tuple(handle.get_slice(key).get_shape()), filename
+                view = handle.get_slice(key)
+                shapes[key], owners[key] = tuple(view.get_shape()), filename
+                dtypes[key] = _SAFE_DTYPES.get(view.get_dtype(), view.get_dtype())
     if weight_map is not None and owners != weight_map:
         raise ConversionError(
             f"HF index/shard mismatch: missing={sorted(weight_map.keys() - owners.keys())}; unexpected={sorted(owners.keys() - weight_map.keys())}; wrong_shard={sorted(key for key in owners.keys() & weight_map.keys() if owners[key] != weight_map[key])}"
@@ -265,6 +338,7 @@ def read_hf_text(load_path, config, *, prefix="thinker.", text_only=False):
     selected = {key: shape for key, shape in shapes.items() if key not in excluded_set}
     layout = "fused" if any(key.endswith(".experts.gate_up_proj") for key in selected) else "split"
     validate_shapes(selected, parameter_shapes(config, layout, prefix), f"HF {layout} headers")
+    validate_dtypes({key: dtypes[key] for key in selected}, "HF headers")
     state = {}
     for filename in filenames:
         with safe_open(load_path / filename, framework="pt", device="cpu") as handle:
@@ -291,6 +365,7 @@ def load_canonical(load_path, config):
         parameter_shapes(config),
         "DCP metadata",
     )
+    validate_dtypes({key: meta.properties.dtype for key, meta in entries.items()}, "DCP metadata")
     state = {
         prefix + key: torch.empty(meta.size, dtype=meta.properties.dtype, device="cpu")
         for key, meta in entries.items()
@@ -304,7 +379,7 @@ class Qwen3OmniTextConverter:
 
     def detect_hf(self, load_path):
         path = Path(load_path) / "config.json"
-        return path.exists() and json.loads(path.read_text()).get("model_type") in (
+        return path.exists() and read_json(path).get("model_type") in (
             TEXT_TYPE,
             "qwen3_omni_moe",
             "qwen3_omni_moe_thinker",
@@ -316,7 +391,9 @@ class Qwen3OmniTextConverter:
         return False
 
     def hf2dcp(self, load_path, save_path, stdout, *, prefix="thinker.", text_only=False):
-        raw = json.loads((Path(load_path) / "config.json").read_text())
+        save_path = Path(save_path)
+        require_empty_destination(save_path)
+        raw = read_json(Path(load_path) / "config.json")
         if raw.get("quantization_config"):
             raise ConversionError("Quantized Omni checkpoints are unsupported")
         config = text_config(raw)
@@ -324,9 +401,7 @@ class Qwen3OmniTextConverter:
             load_path, config, prefix=prefix, text_only=text_only
         )
         canonical, _ = hf_to_canonical(state, config, prefix=prefix)
-        save_path = Path(save_path)
-        if save_path.exists() and any(save_path.iterdir()):
-            raise ConversionError(f"Destination must be empty: {save_path}")
+        del state  # release split source gate/up storage before the DCP writer runs
         save_path.mkdir(parents=True, exist_ok=True)
         dcp.save({"app": {"model": canonical}}, checkpoint_id=save_path, no_dist=True)
         manifest = {
@@ -356,11 +431,11 @@ def export_config(load_path, config_path=None):
     path = Path(load_path) / SIDECAR
     sidecar = None
     if path.exists():
-        manifest = json.loads(path.read_text())
+        manifest = read_json(path)
         if manifest.get("format_version") != 1 or manifest.get("scope") != "thinker_text_only":
             raise ConversionError("Unsupported Omni text sidecar format/scope")
         sidecar = text_config(manifest["text_config"])
-    explicit = text_config(json.loads(Path(config_path).read_text())) if config_path else None
+    explicit = text_config(read_json(config_path)) if config_path else None
     if explicit and sidecar:
         # In particular a RoPE/router config change must not silently alter predictions.
         left, right = explicit.to_dict(), sidecar.to_dict()
