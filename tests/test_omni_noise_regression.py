@@ -100,6 +100,19 @@ def write_arm(folder, plan, arm, profile=(1, 1, 1)):
             native_fa4=True,
             torch="test-fixture",
             records=noise.parse_training_log(logs()) if rank == 0 else None,
+            bridge=(
+                dict(
+                    protocol=noise.BRIDGE,
+                    producer_pid=1,
+                    restorer_pid=2,
+                    before_sha256="boundary",
+                    restored_sha256="boundary",
+                    exact_boundary=True,
+                    strict_hf_strict=True,
+                )
+                if arm == "feat0"
+                else None
+            ),
         )
         (folder / f"rank-{rank:05d}.json").write_text(json.dumps(report))
 
@@ -256,24 +269,20 @@ def test_orchestration_is_sequential_and_fails_closed(
     monkeypatch.setattr(noise, "verify_plan", lambda path: plan)
     calls = []
 
-    def cpu_command_fixture(command, log_path, env, timeout):
-        arm = command[command.index("--arm") + 1]
-        profile = tuple(map(int, command[command.index("--profile") + 1].split(",")))
+    def cpu_arm_fixture(plan_path, plan, profile, arm, arm_output, deadline):
         calls.append((profile, arm))
-        assert env["PYTHONPATH"] == ("feature-code" if arm == "feat0" else "base-code")
-        assert 0 < timeout <= 600
         if mode == "failure" and len(calls) == 2:
             raise RuntimeError("CPU-injected arm failure; no GPU ran")
-        write_arm(log_path.parent, plan, arm, profile)
+        write_arm(arm_output, plan, arm, profile)
         if mode == "investigate":
             ce = {"base0": 10, "base1": 11, "feat0": 13}[arm]
-            log_path.write_text(logs(ce=ce))
-            report_path = log_path.parent / "rank-00000.json"
+            (arm_output / "training.log").write_text(logs(ce=ce))
+            report_path = arm_output / "rank-00000.json"
             report = json.loads(report_path.read_text())
             report["records"] = noise.parse_training_log(logs(ce=ce))
             report_path.write_text(json.dumps(report))
 
-    monkeypatch.setattr(noise, "run_command", cpu_command_fixture)
+    monkeypatch.setattr(noise, "execute_arm", cpu_arm_fixture)
     code = noise.run(SimpleNamespace(plan=tmp_path / "plan.json"))
     assert len(calls) == expected_calls
     assert calls == [(p, a) for p in noise.PROFILES for a in noise.ARMS][:expected_calls]
@@ -284,3 +293,107 @@ def test_orchestration_is_sequential_and_fails_closed(
         assert "NOT_RUN" in summary["arms"].values()
     if mode == "failure":
         assert summary["arms"]["w1-pp1-ep1/base1"] == "FAILED_OR_INTERRUPTED"
+
+
+def test_bridge_segments_still_require_all_32_steps():
+    lines = logs().splitlines()
+    prefix = noise.parse_training_log("\n".join(lines[:16]), 1, 16)
+    suffix = noise.parse_training_log("\n".join(lines[16:]), 17, 32)
+    assert prefix + suffix == noise.parse_training_log(logs())
+    with pytest.raises(ValueError):
+        noise.parse_training_log("\n".join(lines[:16]))
+    with pytest.raises(ValueError):
+        noise.parse_training_log("\n".join(lines[:3]), 1, 3)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda b: None,
+        lambda b: dict(b, exact_boundary=False),
+        lambda b: dict(b, restored_sha256="wrong"),
+        lambda b: dict(b, restorer_pid=1),
+        lambda b: dict(b, strict_hf_strict=False),
+        lambda b: dict(b, protocol=dict(noise.BRIDGE, step=3)),
+    ],
+)
+def test_feature_cannot_bypass_or_falsify_bridge(experiment, change):
+    plan, folder = experiment
+    path = folder / "feat0/rank-00000.json"
+    report = json.loads(path.read_text())
+    report["bridge"] = change(report["bridge"])
+    path.write_text(json.dumps(report))
+    with pytest.raises(ValueError):
+        noise.compare_profile(plan, folder, (1, 1, 1))
+
+
+def test_bridge_executes_native_save_cpu_export_import_then_fresh_restore(tmp_path, monkeypatch):
+    import time
+
+    plan = dict(base=dict(path="base"), feature=dict(path="candidate"))
+    calls = []
+
+    def command(command, log, env, timeout):
+        calls.append((command, env, timeout))
+        lines = logs().splitlines()
+        log.write_text(
+            "\n".join(
+                lines[:16]
+                if log.name == "produce.log"
+                else lines[16:]
+                if log.name == "restore.log"
+                else []
+            )
+        )
+
+    monkeypatch.setattr(noise, "run_command", command)
+    noise.execute_arm(
+        tmp_path / "plan.json", plan, (4, 2, 2), "feat0", tmp_path, time.monotonic() + 3300
+    )
+    assert len(calls) == 4
+    assert calls[0][0][calls[0][0].index("--segment") + 1] == "produce"
+    assert calls[1][0][2] == "dcp2hf" and "fused" in calls[1][0]
+    assert calls[2][0][2] == "hf2dcp" and "--restore-resume" in calls[2][0]
+    assert calls[3][0][calls[3][0].index("--segment") + 1] == "restore"
+    assert calls[1][1]["CUDA_VISIBLE_DEVICES"] == calls[2][1]["CUDA_VISIBLE_DEVICES"] == ""
+    assert all(0 < c[2] <= 600 for c in calls)
+    assert len(noise.parse_training_log((tmp_path / "training.log").read_text())) == 32
+
+
+def test_bridge_failed_conversion_never_starts_restore(tmp_path, monkeypatch):
+    import time
+
+    calls = []
+
+    def command(cmd, log, env, timeout):
+        calls.append(cmd)
+        log.write_text("CPU fixture; no GPU executed")
+        if len(calls) == 2:
+            raise RuntimeError("conversion failed")
+
+    monkeypatch.setattr(noise, "run_command", command)
+    with pytest.raises(RuntimeError):
+        noise.execute_arm(
+            tmp_path / "plan.json",
+            dict(feature=dict(path="candidate")),
+            (4, 2, 2),
+            "feat0",
+            tmp_path,
+            time.monotonic() + 3300,
+        )
+    assert len(calls) == 2
+    assert not (tmp_path / "training.log").exists()
+
+
+def test_full_numpy_rng_and_tensor_bits_are_hashed():
+    import numpy as np
+    import torch
+
+    value = dict(numpy=np.arange(624, dtype=np.uint32), tensor=torch.tensor([1.0]))
+    original = noise.tensor_digest(value)
+    value["numpy"][300] += 1  # Interior values disappear in a truncated ndarray repr.
+    assert noise.tensor_digest(value) != original
+    value["numpy"][300] -= 1
+    value["tensor"][0] = torch.nextafter(value["tensor"][0], torch.tensor(float("inf")))
+    assert noise.tensor_digest(value) != original
+    assert noise.tensor_digest([1, 23]) != noise.tensor_digest([12, 3])

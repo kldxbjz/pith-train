@@ -22,6 +22,9 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 ARMS = ("base0", "base1", "feat0")
+BASE_SHA = "a0b14f7abbf4f84c7a9fbb76eb5a759a63f65010"
+FEATURE_SHA = "d237e4c3d5ce9e38cf80e16a38dbd8f2210d0e53"
+BRIDGE = dict(step=16, layout="fused", prefix="thinker.", restore="fresh_process_strict")
 PROFILES = ((1, 1, 1), (2, 1, 1), (2, 2, 1), (2, 1, 2), (4, 2, 2))
 SETTINGS = dict(
     steps=32,
@@ -40,7 +43,6 @@ SETTINGS = dict(
     fp8=False,
     cp=1,
     hsdp_replica=1,
-    checkpointing=False,
 )
 METRICS = ("cross-entropy-loss", "load-balance-loss")
 STEP = re.compile(r"\bstep (\d+)/(\d+)\b")
@@ -95,7 +97,9 @@ def select_source(repo):
         sys.path.append(extra)
 
 
-def configure_cfg(cfg, plan, profile, make_adamw_optimizer, make_wsd_scheduler):
+def configure_cfg(
+    cfg, plan, profile, make_adamw_optimizer, make_wsd_scheduler, checkpoint_root=None
+):
     from datetime import timedelta
     from functools import partial
 
@@ -123,15 +127,22 @@ def configure_cfg(cfg, plan, profile, make_adamw_optimizer, make_wsd_scheduler):
     training.save_interval = training.save_location = None
     if hasattr(training, "strict_resume"):
         training.strict_resume = False
+    if checkpoint_root is not None:
+        require(hasattr(training, "strict_resume"), "Candidate must support strict resume")
+        training.strict_resume = True
+        training.save_interval = 16
+        training.save_location = Path(checkpoint_root)
     cfg.logging.wandb = None
     return cfg
 
 
-def build_cfg(plan, profile):
+def build_cfg(plan, profile, checkpoint_root=None):
     from pithtrain.modules.training import make_adamw_optimizer, make_wsd_scheduler
     from pithtrain.tasks.pretrain_lm import PretrainLMCfg
 
-    return configure_cfg(PretrainLMCfg(), plan, profile, make_adamw_optimizer, make_wsd_scheduler)
+    return configure_cfg(
+        PretrainLMCfg(), plan, profile, make_adamw_optimizer, make_wsd_scheduler, checkpoint_root
+    )
 
 
 def verify_config_structure(repo, plan):
@@ -160,6 +171,14 @@ def verify_config_structure(repo, plan):
         for key, names in fields.items():
             require(set(vars(getattr(cfg, key))) == names, f"Unknown native {key} field")
         require(cfg.training.max_steps == 32 and cfg.training.benchmark is False, "Wrong workload")
+        if "strict_resume" in fields["training"]:
+            configure_cfg(cfg, plan, profile, lambda: None, lambda: None, Path("new-checkpoints"))
+            require(
+                cfg.training.strict_resume is True
+                and cfg.training.save_interval == 16
+                and cfg.training.max_steps == 32,
+                "Feature checkpoint intervention changed",
+            )
         require(
             cfg.training.scheduler.keywords
             == dict(start_lr=1e-6, warmup_ratio=1.0, decay_ratio=0.0),
@@ -239,7 +258,10 @@ def child_env(repo, *, cpu=False):
 
 def prepare(args):
     base, feature = source_identity(args.base_repo), source_identity(args.feature_repo)
-    require(base["commit"] != feature["commit"], "Baseline and candidate commits must differ")
+    require(
+        base["commit"] == BASE_SHA and feature["commit"] == FEATURE_SHA,
+        "This experiment locks a0b14f7 -> d237e4c; do not substitute another comparison",
+    )
     require(
         base["production_sha256"] != feature["production_sha256"],
         "Identical production code is a noise control, not this regression baseline",
@@ -288,7 +310,8 @@ def prepare(args):
         "Runtime mismatch",
     )
     plan = dict(
-        schema="omni_native_noise_32_v1",
+        schema="omni_strict_bridge_noise_32_v2",
+        bridge=BRIDGE,
         base=base,
         feature=feature,
         dataset=str(args.dataset.resolve()),
@@ -308,14 +331,20 @@ def prepare(args):
     print("CPU_PREFLIGHT_PASS; 3 x 32 steps per mesh; GPU_NOT_RUN")
 
 
-def parse_training_log(text):
+def parse_training_log(text, first=1, last=32):
+    require(
+        (first, last) in {(1, 32), (1, 16), (17, 32)},
+        "Only full runs or the fixed bridge segments are valid",
+    )
     records = []
     for line in text.splitlines():
         step = STEP.search(line)
         if not step:
             continue
         index, total = map(int, step.groups())
-        require(total == 32 and index == len(records) + 1, "Missing/duplicate/out-of-order step")
+        require(
+            total == 32 and index == len(records) + first, "Missing/duplicate/out-of-order step"
+        )
         item = dict(step=index)
         for metric in (*METRICS, "learning-rate", "gradient-norm"):
             values = re.findall(rf"(?<![\w-]){metric} {NUMBER}(?=\s|$)", line)
@@ -328,7 +357,10 @@ def parse_training_log(text):
             math.isclose(item["learning-rate"], expected_lr, rel_tol=1e-6), "Wrong warmup schedule"
         )
         records.append(item)
-    require(len(records) == 32, f"Expected exactly 32 completed steps, found {len(records)}")
+    require(
+        len(records) == last - first + 1,
+        f"Expected exactly steps {first}..{last}, found {len(records)}",
+    )
     return records
 
 
@@ -387,7 +419,9 @@ def compare_records(runs):
 def verify_plan(path):
     plan = json.loads(path.read_text())
     require(
-        plan["schema"] == "omni_native_noise_32_v1" and plan["settings"] == SETTINGS,
+        plan["schema"] == "omni_strict_bridge_noise_32_v2"
+        and plan["settings"] == SETTINGS
+        and plan["bridge"] == BRIDGE,
         "Workload changed",
     )
     require(
@@ -407,32 +441,51 @@ def verify_plan(path):
     for key in ("base", "feature"):
         require(source_identity(plan[key]["path"]) == plan[key], f"{key} source changed")
     require(
+        plan["base"]["commit"] == BASE_SHA and plan["feature"]["commit"] == FEATURE_SHA,
+        "Comparison range changed",
+    )
+    require(
         sha(Path(plan["model"]) / "config.json") == plan["input"]["model_sha256"], "Model changed"
     )
     return plan
 
 
 def tensor_digest(value):
+    import numpy as np
     import torch
 
     h = hashlib.sha256()
+
+    def block(value):
+        h.update(len(value).to_bytes(8, "big"))
+        h.update(value)
 
     def add(item):
         if isinstance(item, torch.Tensor):
             if hasattr(item, "to_local"):
                 item = item.to_local()
             item = item.detach().cpu().contiguous()
-            h.update(str((str(item.dtype), list(item.shape))).encode())
-            h.update(item.reshape(-1).view(torch.uint8).numpy().tobytes())
+            block(b"tensor")
+            block(str((str(item.dtype), list(item.shape))).encode())
+            block(item.reshape(-1).view(torch.uint8).numpy().tobytes())
+        elif isinstance(item, np.ndarray):
+            block(b"numpy")
+            block(str((str(item.dtype), list(item.shape))).encode())
+            block(item.tobytes(order="C"))
         elif isinstance(item, dict):
-            for key in sorted(item):
-                h.update(str(key).encode())
+            block(b"dict")
+            block(str(len(item)).encode())
+            for key in sorted(item, key=repr):
+                add(key)
                 add(item[key])
         elif isinstance(item, (tuple, list)):
+            block(type(item).__name__.encode())
+            block(str(len(item)).encode())
             for element in item:
                 add(element)
         else:
-            h.update(repr(item).encode())
+            block(type(item).__name__.encode())
+            block(repr(item).encode())
 
     add(value)
     return h.hexdigest()
@@ -473,11 +526,29 @@ class StepCapture(logging.Handler):
             self.lines.append(message)
 
 
+def runtime_digest(data):
+    from pithtrain.contexts import distributed, training
+    from pithtrain.modules.distributed_checkpoint import _pack, _runtime
+
+    values, _ = _runtime(
+        training.model,
+        training.optimizers,
+        training.schedulers,
+        data.checkpoint_state,
+        distributed.device,
+    )
+    return tensor_digest(_pack(values))
+
+
 def arm(args):
     require(os.environ.get("PITHTRAIN_RUN_OMNI_GPU_TESTS") == "1", "GPU scheduling opt-in required")
     plan = verify_plan(args.plan)
     profile = tuple(map(int, args.profile.split(",")))
     require(profile in PROFILES, "Unknown profile")
+    require(
+        args.segment in (("produce", "restore") if args.arm == "feat0" else ("full",)),
+        "Only feat0 may perform the fixed step16 bridge; it cannot bypass it",
+    )
     source = plan["feature" if args.arm == "feat0" else "base"]
     select_source(source["path"])
     import torch
@@ -486,7 +557,6 @@ def arm(args):
     require(
         verify_dataset(Path(plan["dataset"]), Path(plan["model"])) == plan["input"], "Input changed"
     )
-
     from pithtrain.contexts import distributed, training
     from pithtrain.contexts import logging as log_context
     from pithtrain.modules.distributed import setup_distributed
@@ -499,7 +569,8 @@ def arm(args):
         "Wrong code imported",
     )
     require(int(os.environ.get("WORLD_SIZE", "0")) == profile[0], "Wrong allocation world size")
-    cfg = build_cfg(plan, profile)
+    checkpoint_root = args.output / "checkpoints" if args.arm == "feat0" else None
+    cfg = build_cfg(plan, profile, checkpoint_root)
     setup_logging(cfg)
     capture = StepCapture()
     log_context.stdout.addHandler(capture)
@@ -509,23 +580,114 @@ def arm(args):
         data = ObservedData(pretrain_lm.setup_dataset(cfg))
         setup_training(cfg)
         initial = tensor_digest(dict(training.model.named_parameters()))
+        first, last = (
+            (16, 32)
+            if args.segment == "restore"
+            else (0, 16)
+            if args.segment == "produce"
+            else (0, 32)
+        )
+        boundary_path = args.output / f"boundary-rank-{distributed.rank:05d}.json"
+        boundary = None
+        bridge = None
+        if args.segment == "restore":
+            from pithtrain.modules.checkpoint import load_checkpoint
+            from pithtrain.modules.distributed_checkpoint import resume_contract
+
+            boundary = json.loads(boundary_path.read_text())
+            require(boundary["pid"] != os.getpid(), "Restore must run in a fresh process")
+            require(
+                boundary["source"] == source
+                and boundary["input"] == plan["input"]
+                and boundary["settings"] == SETTINGS,
+                "Stale boundary metadata",
+            )
+            require(
+                boundary["profile"] == list(profile) and boundary["rank"] == distributed.rank,
+                "Boundary topology mismatch",
+            )
+            require(
+                all(not opt.state for opt in training.optimizers), "Fresh optimizer must be empty"
+            )
+            load_checkpoint(
+                args.output / "converted",
+                16,
+                data_state=data.checkpoint_state,
+                strict=True,
+                resume_config=resume_contract(cfg),
+            )
+            restored = runtime_digest(data)
+            require(
+                restored == boundary["runtime_sha256"],
+                "Exact step16 state/RNG/cursor restoration failed",
+            )
+            require(data.consumed_samples == 128, "Wrong restored cursor")
+            require(initial == boundary["initial_weights_sha256"], "Fresh initialization changed")
+            bridge = dict(
+                protocol=BRIDGE,
+                producer_pid=boundary["pid"],
+                restorer_pid=os.getpid(),
+                before_sha256=boundary["runtime_sha256"],
+                restored_sha256=restored,
+                exact_boundary=True,
+                strict_hf_strict=True,
+            )
         gc.disable()
-        for step in range(32):
+        for step in range(first, last):
             pretrain_lm.train_step(cfg, data, step)
         gc.enable()
         require(
-            data.consumed_samples == 256 and list(data.batches) == list(range(32)),
+            data.consumed_samples == last * 8 and list(data.batches) == list(range(first, last)),
             "Incomplete real-data consumption",
         )
-        require(all(s.last_epoch == 32 for s in training.schedulers), "Scheduler skipped updates")
+        require(all(s.last_epoch == last for s in training.schedulers), "Scheduler skipped updates")
         require(
             all(
-                opt.state and all(int(v["step"].item()) == 32 for v in opt.state.values())
+                opt.state and all(int(v["step"].item()) == last for v in opt.state.values())
                 for opt in training.optimizers
             ),
             "Optimizer skipped updates",
         )
-        records = parse_training_log("\n".join(capture.lines)) if distributed.rank == 0 else None
+        records = (
+            parse_training_log("\n".join(capture.lines), first + 1, last)
+            if distributed.rank == 0
+            else None
+        )
+        if args.segment == "produce":
+            from pithtrain.modules.checkpoint import find_checkpoint
+
+            require(
+                find_checkpoint(checkpoint_root) == 16, "Native step16 strict checkpoint missing"
+            )
+            require(
+                (checkpoint_root / "torch-dcp/00000016/strict-manifest.json").is_file(),
+                "Strict publication missing",
+            )
+            write_json(
+                boundary_path,
+                dict(
+                    source=source,
+                    input=plan["input"],
+                    settings=SETTINGS,
+                    profile=list(profile),
+                    rank=distributed.rank,
+                    pid=os.getpid(),
+                    runtime_sha256=runtime_digest(data),
+                    initial_weights_sha256=initial,
+                    records=records,
+                    batches=data.batches,
+                ),
+            )
+            dist.barrier()
+            return
+        batches = {str(k): v for k, v in data.batches.items()}
+        if boundary is not None:
+            require(
+                set(boundary["batches"]) == {str(n) for n in range(16)},
+                "Incomplete prefix evidence",
+            )
+            batches = {**boundary["batches"], **batches}
+            records = boundary["records"] + records if records is not None else None
         dist.barrier()
         write_json(
             args.output / f"rank-{distributed.rank:05d}.json",
@@ -538,9 +700,10 @@ def arm(args):
                 profile=list(profile),
                 input=plan["input"],
                 initial_weights_sha256=initial,
-                batches=data.batches,
+                batches=batches,
                 consumed_samples=data.consumed_samples,
                 records=records,
+                bridge=bridge,
                 gpu=torch.cuda.get_device_name(),
                 torch=torch.__version__,
                 max_allocated_bytes=torch.cuda.max_memory_allocated(),
@@ -580,6 +743,19 @@ def validate_arm(plan, folder, profile, arm_name):
         )
         require(set(report["batches"]) == {str(n) for n in range(32)}, "Missing batch evidence")
         require("H100" in report["gpu"] and report["native_fa4"] is True, "Wrong execution backend")
+        bridge = report.get("bridge")
+        if arm_name == "feat0":
+            require(
+                bridge
+                and bridge["protocol"] == BRIDGE
+                and bridge["exact_boundary"] is True
+                and bridge["strict_hf_strict"] is True
+                and bridge["producer_pid"] != bridge["restorer_pid"]
+                and bridge["before_sha256"] == bridge["restored_sha256"],
+                "Missing or failed strict/HF boundary",
+            )
+        else:
+            require(bridge is None, "Baseline must remain a continuous native run")
     records = parse_training_log((folder / "training.log").read_text())
     require(records == reports[0]["records"], "Live rank-zero metrics disagree with training log")
     return reports, records
@@ -621,6 +797,84 @@ def run_command(command, log_path, env, timeout):
     require(status == 0, f"Native arm failed with exit {status}; later arms NOT RUN")
 
 
+def execute_arm(plan_path, plan, profile, arm_name, arm_output, deadline):
+    target = plan["feature" if arm_name == "feat0" else "base"]["path"]
+    arm_deadline = min(deadline, time.monotonic() + 600)
+
+    def execute(command, filename, cpu=False):
+        remaining = arm_deadline - time.monotonic()
+        require(remaining > 0, "Arm/global budget exhausted; no shortened run")
+        run_command(command, arm_output / filename, child_env(target, cpu=cpu), remaining)
+
+    def native(segment, filename):
+        execute(
+            [
+                sys.executable,
+                "-m",
+                "torch.distributed.run",
+                "--standalone",
+                "--nnodes=1",
+                f"--nproc-per-node={profile[0]}",
+                str(Path(__file__).resolve()),
+                "arm",
+                "--plan",
+                str(plan_path),
+                "--profile",
+                ",".join(map(str, profile)),
+                "--arm",
+                arm_name,
+                "--segment",
+                segment,
+                "--output",
+                str(arm_output),
+            ],
+            filename,
+        )
+
+    if arm_name != "feat0":
+        native("full", "training.log")
+        return
+    native("produce", "produce.log")
+    converter = str(Path(target) / "examples/convert_checkpoint/qwen3-omni-text/script.py")
+    execute(
+        [
+            sys.executable,
+            converter,
+            "dcp2hf",
+            str(arm_output / "checkpoints/torch-dcp/00000016"),
+            str(arm_output / "hf"),
+            "--expert-layout",
+            "fused",
+            "--prefix",
+            "thinker.",
+        ],
+        "export.log",
+        cpu=True,
+    )
+    execute(
+        [
+            sys.executable,
+            converter,
+            "hf2dcp",
+            str(arm_output / "hf"),
+            str(arm_output / "converted/torch-dcp/00000016"),
+            "--restore-resume",
+            "--prefix",
+            "thinker.",
+        ],
+        "import.log",
+        cpu=True,
+    )
+    native("restore", "restore.log")
+    # This is one logical 32-step feature arm; either missing half fails strict parsing.
+    with (arm_output / "training.log").open("x") as log:
+        log.write(
+            (arm_output / "produce.log").read_text()
+            + "\n"
+            + (arm_output / "restore.log").read_text()
+        )
+
+
 def run(args):
     require(os.environ.get("PITHTRAIN_RUN_OMNI_GPU_TESTS") == "1", "GPU scheduling opt-in required")
     plan = verify_plan(args.plan)
@@ -650,28 +904,7 @@ def run(args):
                 arm_output.mkdir()
                 current_arm = f"{name}/{arm_name}"
                 arm_status[current_arm] = "RUNNING"
-                target = plan["feature" if arm_name == "feat0" else "base"]["path"]
-                command = [
-                    sys.executable,
-                    "-m",
-                    "torch.distributed.run",
-                    "--standalone",
-                    "--nnodes=1",
-                    f"--nproc-per-node={world}",
-                    str(Path(__file__).resolve()),
-                    "arm",
-                    "--plan",
-                    str(args.plan),
-                    "--profile",
-                    f"{world},{pp},{ep}",
-                    "--arm",
-                    arm_name,
-                    "--output",
-                    str(arm_output),
-                ]
-                run_command(
-                    command, arm_output / "training.log", child_env(target), min(600, remaining)
-                )
+                execute_arm(args.plan, plan, profile, arm_name, arm_output, started + 3300)
                 validate_arm(plan, arm_output, profile, arm_name)
                 arm_status[current_arm] = "COMPLETED_32_NATIVE_UPDATES"
             result = compare_profile(plan, folder, profile)
@@ -722,6 +955,7 @@ def parse_args(argv=None):
     arm_parser.add_argument("--plan", type=Path, required=True)
     arm_parser.add_argument("--profile", required=True)
     arm_parser.add_argument("--arm", choices=ARMS, required=True)
+    arm_parser.add_argument("--segment", choices=("full", "produce", "restore"), required=True)
     arm_parser.add_argument("--output", type=Path, required=True)
     return parser.parse_args(argv)
 
