@@ -26,6 +26,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 
 from pithtrain.models.qwen3_omni_image_inputs import validate_image_inputs
 from pithtrain.models.qwen3_omni_vision import Qwen3OmniMoeVisionEncoder
+from tests.acceptance.omni_image_evidence import module_update_evidence, training_groups
 from tests.test_qwen3_omni_vision import hf_positions
 
 REPO = Path(__file__).resolve().parents[2]
@@ -248,6 +249,7 @@ def gpu_reference(args):
             p.copy_(expected[name])
     opt = torch.optim.AdamW(native.parameters(), lr=1e-4, weight_decay=0)
     ref_opt = torch.optim.AdamW(reference.parameters(), lr=1e-4, weight_decay=0)
+    groups = training_groups(config)
     reports = []
     for step in range(4):
         losses, refs, logits_errors = [], [], []
@@ -286,14 +288,7 @@ def gpu_reference(args):
         opt.step()
         ref_opt.step()
         updates = [n for n, p in actual.items() if not torch.equal(before[n], p)]
-        for prefix in (
-            "visual.patch_embed.",
-            "visual.blocks.",
-            "visual.merger.",
-            "visual.merger_list.",
-            "model.layers.",
-        ):
-            assert any(n.startswith(prefix) for n in updates), prefix
+        modules = module_update_evidence(actual, before, groups)
         reports.append(
             dict(
                 step=step,
@@ -302,6 +297,7 @@ def gpu_reference(args):
                 logits_errors=logits_errors,
                 gradient_errors=errors,
                 updated_parameters=updates,
+                training_modules=modules,
             )
         )
         opt.zero_grad(set_to_none=True)

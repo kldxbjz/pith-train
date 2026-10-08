@@ -12,6 +12,12 @@ from torch.distributed.tensor import DTensor, distribute_tensor
 
 from pithtrain.modules.microbatch import Microbatch
 from pithtrain.modules.training_data import global_loss_mean, global_target_count
+from tests.acceptance.omni_image_evidence import (
+    OptimizerStepEvidence,
+    fixture_image_index,
+    module_update_evidence,
+    training_groups,
+)
 from tests.acceptance.omni_image_training import (
     HFReference,
     commit,
@@ -99,7 +105,7 @@ def run(args):
     # see identical shared layout but only stage 0 sees pixels.
     global_batches = []
     for index in range(8):
-        batch = copy.deepcopy(batches[index % 2])
+        batch = copy.deepcopy(batches[fixture_image_index(index, distributed.dp_size)])
         batch.labels = batch.labels.clone()
         if index == 0:
             batch.labels.fill_(-100)
@@ -150,19 +156,11 @@ def run(args):
     before = {n: local_tensor(p).detach().clone() for n, p in actual.items()}
     for optimizer in training.optimizers:
         optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
     updated = [n for n, p in actual.items() if not torch.equal(before[n], local_tensor(p))]
-    all_updated = [None] * world
-    dist.all_gather_object(all_updated, updated)
-    changed = set().union(*(set(items) for items in all_updated))
-    for prefix in (
-        "visual.patch_embed.",
-        "visual.blocks.",
-        "visual.merger.",
-        "visual.merger_list.",
-        "model.layers.",
-    ):
-        assert any(n.startswith(prefix) for n in changed), prefix
+    groups = training_groups(config)
+    modules = module_update_evidence(actual, before, groups, reduce=dist.all_reduce)
+    for optimizer in training.optimizers:
+        optimizer.zero_grad(set_to_none=True)
     zero = [
         Microbatch(
             model_inputs=mb.model_inputs,
@@ -180,9 +178,20 @@ def run(args):
     all_errors = [None] * world
     dist.all_gather_object(all_errors, zero_error)
     assert len(set(all_errors)) == 1
-    # Exercise the unmodified task loop with the real image reader, four steps.
-    for step in range(4):
-        pretrain_lm.train_step(cfg, data, step)
+    # Observe every real task optimizer step, after backward/gradient scaling,
+    # without replacing train_step, model execution or optimizer behavior.
+    assert len(training.optimizers) == 1
+    observer = OptimizerStepEvidence(actual, groups, reduce=dist.all_reduce)
+    optimizer = training.optimizers[0]
+    pre_hook = optimizer.register_step_pre_hook(observer.before_step)
+    post_hook = optimizer.register_step_post_hook(observer.after_step)
+    try:
+        for step in range(4):
+            pretrain_lm.train_step(cfg, data, step)
+    finally:
+        pre_hook.remove()
+        post_hook.remove()
+    assert len(observer.steps) == 4
     assert data.consumed_samples == 32
     report = dict(
         status="PASSED",
@@ -193,6 +202,8 @@ def run(args):
         target_count=int(count),
         gradient_errors=errors,
         updated_parameters=updated,
+        training_modules=modules,
+        real_reader_module_updates=observer.steps,
         real_reader_steps=4,
         consumed_samples=32,
         zero_target_rejection=zero_error,

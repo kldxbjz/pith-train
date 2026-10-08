@@ -44,7 +44,7 @@ for i in range(4):
  assert total-free < 1000*1024*1024, f"GPU {i} is busy"'
 }
 run_gate cpu-tests 180 env CUDA_VISIBLE_DEVICES= "$python" -m pytest \
-  tests/test_qwen3_omni_vision.py tests/test_omni_image_contract.py tests/test_omni_training.py \
+  tests/test_qwen3_omni_vision.py tests/test_omni_image_contract.py tests/test_omni_image_acceptance_evidence.py tests/test_omni_training.py \
   tests/test_qwen3_omni_data.py tests/test_omni_model_registration.py -q --junitxml="$out/cpu.xml"
 run_gate cpu-no-skips 15 "$python" -c 'import sys,xml.etree.ElementTree as E
 r=E.parse(sys.argv[1]); suites=list(r.iter("testsuite")); assert suites
