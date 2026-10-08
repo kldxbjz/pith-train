@@ -64,11 +64,17 @@ def test_registration_and_setup_use_shared_resolver():
         "Qwen3OmniMoeThinkerTextModel",
     )
     namespace = {name: object() for name in names}
+    namespace["resolve_text_model_config"] = resolve_text_model_config
     exec(compile(ast.Module(body=[resolver], type_ignores=[]), str(path), "exec"), namespace)
     assert (
         namespace["model_class_for_config"](SimpleNamespace(model_type="qwen3_omni_moe_text"))
         is namespace["Qwen3OmniMoeThinkerTextModel"]
     )
+    thinker = Qwen3OmniMoeThinkerConfig(text_config=Qwen3OmniMoeTextConfig())
+    for nested in (thinker, Qwen3OmniMoeConfig(thinker_config=thinker)):
+        assert (
+            namespace["model_class_for_config"](nested) is namespace["Qwen3OmniMoeThinkerTextModel"]
+        )
     with pytest.raises(ValueError, match="Unsupported"):
         namespace["model_class_for_config"](SimpleNamespace(model_type="unknown"))
     setup = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "setup_model")

@@ -397,6 +397,7 @@ def apply_fsdp(model, hsdp_replica: int = 1):
 
 def model_class_for_config(module_config):
     """Resolve a registered pipeline model before allocating any parameters."""
+    module_config = resolve_text_model_config(module_config)
     if module_config.model_type == "deepseek_v2":
         return DeepSeekV2Model
     elif module_config.model_type == "qwen3_moe":
