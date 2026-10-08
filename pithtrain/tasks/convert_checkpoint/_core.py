@@ -23,6 +23,16 @@ from pithtrain.contexts import logging
 from pithtrain.modules.logging import LoggingCfg, setup_logging
 
 from ._registry import CONVERTERS
+from .qwen3_omni_moe import (
+    SIDECAR,
+    ConversionError,
+    Qwen3OmniTextConverter,
+    canonical_to_hf,
+    export_config,
+    load_canonical,
+    read_json,
+    require_empty_destination,
+)
 
 
 @dataclass(init=False, slots=True)
@@ -41,6 +51,18 @@ class ConvertCheckpointCfg(SlottedDefault):
     max_shard_size: int = 8 * 1024**3
     """Maximum dcp2hf shard size in bytes (default 8GB)."""
 
+    omni_text_config: Path | None = None
+    """Omni text config for native DCP export without a conversion sidecar."""
+
+    omni_prefix: Literal["thinker.", ""] = "thinker."
+    """Exact HF text namespace, for Omni import and export."""
+
+    omni_expert_layout: Literal["split", "fused"] = "fused"
+    """Omni export layout: released indexed/split or Transformers 5.17 fused."""
+
+    omni_text_only: bool = False
+    """Explicitly exclude known media/Talker weights on Omni import; report every key."""
+
     logging: LoggingCfg = field(default_factory=LoggingCfg)
     """Logging configuration."""
 
@@ -49,10 +71,21 @@ def hf2dcp(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
     """Convert HuggingFace checkpoint to DCP format."""
     load_path, save_path = Path(cfg.load_path), Path(cfg.save_path)
 
+    if (load_path / "config.json").exists():
+        read_json(load_path / "config.json")
     for converter in CONVERTERS:
         if converter.detect_hf(load_path):
             stdout.info("Dispatching hf2dcp to %s converter" % converter.name)
-            converter.hf2dcp(load_path, save_path, stdout)
+            if isinstance(converter, Qwen3OmniTextConverter):
+                converter.hf2dcp(
+                    load_path,
+                    save_path,
+                    stdout,
+                    prefix=cfg.omni_prefix,
+                    text_only=cfg.omni_text_only,
+                )
+            else:
+                converter.hf2dcp(load_path, save_path, stdout)
             return
 
     with open(Path(load_path, "model.safetensors.index.json")) as f:
@@ -76,14 +109,42 @@ def hf2dcp(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
 def dcp2hf(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
     """Convert DCP checkpoint to HuggingFace format."""
     load_path, save_path = Path(cfg.load_path), Path(cfg.save_path)
-    max_shard_size = cfg.max_shard_size
+    if cfg.max_shard_size <= 0:
+        raise ValueError("max_shard_size must be positive")
+    config = export_config(load_path, cfg.omni_text_config)
+    if config is not None:
+        require_empty_destination(save_path)
+        canonical = load_canonical(load_path, config)
+        hf_state = canonical_to_hf(
+            canonical, config, prefix=cfg.omni_prefix, layout=cfg.omni_expert_layout
+        )
+        del canonical  # release unstacked source experts before writing fused copies
+        _write_hf(hf_state, save_path, cfg.max_shard_size, stdout)
+        (save_path / "config.json").write_text(json.dumps(config.to_dict(), indent=2) + "\n")
+        manifest = {
+            "format_version": 1,
+            "scope": "thinker_text_only",
+            "text_config": config.to_dict(),
+            "source_prefix": cfg.omni_prefix,
+            "source_expert_layout": cfg.omni_expert_layout,
+        }
+        (save_path / SIDECAR).write_text(json.dumps(manifest, indent=2) + "\n")
+        return
     stdout.info("Converting DCP checkpoint from %s" % load_path)
 
     model_prefix = "app.model."
     state_dict, metadata = dict(), FileSystemReader(load_path).read_metadata()
+    if any(
+        ".experts." in key and key.endswith(".gate_up_proj") for key in metadata.state_dict_metadata
+    ) and not any(converter.detect_dcp(metadata) for converter in CONVERTERS):
+        raise ConversionError(
+            "Unidentified fused expert DCP: Omni export requires omni_text_config or its sidecar"
+        )
     for key, tensor_meta in metadata.state_dict_metadata.items():
         if key.startswith(model_prefix):
-            state_dict[key] = torch.empty(tensor_meta.size, dtype=tensor_meta.properties.dtype)
+            state_dict[key] = torch.empty(
+                tensor_meta.size, dtype=tensor_meta.properties.dtype, device="cpu"
+            )
     dcp.load(state_dict, checkpoint_id=load_path, no_dist=True)
     stdout.info("Loaded %d model weights from DCP" % len(state_dict))
 
@@ -99,6 +160,11 @@ def dcp2hf(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
     for canon, tensor in canonical.items():
         hf_state_dict[canon if canon.startswith("lm_head.") else "model." + canon] = tensor
 
+    _write_hf(hf_state_dict, save_path, cfg.max_shard_size, stdout)
+
+
+def _write_hf(hf_state_dict, save_path, max_shard_size, stdout):
+    """Shared shard writer; family-specific validation precedes this function."""
     shards: List[Tuple[str, Dict[str, torch.Tensor]]] = []
     current_shard: Dict[str, torch.Tensor] = dict()
     current_size, shard_idx = 0, 0
