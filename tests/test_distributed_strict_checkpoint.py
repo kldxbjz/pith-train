@@ -37,12 +37,15 @@ class Cursor:
 
     def __init__(self):
         self.consumed = 0
-        self.pending = self.fail_apply = False
+        self.pending = self.fail_apply = self.malformed = False
 
     def state_dict(self):
         if self.pending:
             raise ValueError("uncommitted batch")
-        return dict(version=1, fingerprint="cpu-protocol", consumed_samples=self.consumed)
+        value = dict(version=1, fingerprint="cpu-protocol", consumed_samples=self.consumed)
+        if self.malformed:
+            del value["fingerprint"]
+        return value
 
     def load_state_dict(self, value):
         self.consumed = value["consumed_samples"]
@@ -147,6 +150,18 @@ def mutate(root, case):
         state["model"][key]["value"] = torch.ones(1)
     elif case == "dtype":
         state["model"][key]["value"] = state["model"][key]["value"].double()
+    elif case.startswith("moment-"):
+        moment = state["optimizer"][0]["state"][0]["exp_avg"]
+        if case == "moment-shape":
+            moment["value"] = torch.ones(1)
+        elif case == "moment-dtype":
+            moment["value"] = moment["value"].double()
+        elif case == "moment-mesh":
+            moment["tensor"]["mesh"] = [999]
+        elif case == "moment-nonfinite":
+            moment["value"].flatten()[0] = float("nan")
+        else:
+            raise AssertionError(case)
     elif case == "topology":
         payload["header"]["topology"]["ep_size"] = 999
     elif case == "optimizer-order":
@@ -209,6 +224,10 @@ def worker(rank, root, profile, mode):
                 "dtype",
                 "topology",
                 "optimizer-order",
+                "moment-shape",
+                "moment-dtype",
+                "moment-mesh",
+                "moment-nonfinite",
                 "missing-rng",
                 "cursor",
             )
@@ -226,6 +245,14 @@ def worker(rank, root, profile, mode):
                 else:
                     raise AssertionError(f"Accepted {case}")
                 equal(snapshot(parts), before)
+            before = snapshot(parts)
+            data.malformed = rank == 1
+            with pytest.raises(DistributedCheckpointError, match="load contract"):
+                load_checkpoint(
+                    root / "good", 1, data_state=data, strict=True, resume_config=contract
+                )
+            data.malformed = False
+            equal(snapshot(parts), before)
             before = snapshot(parts)
             data.fail_apply = rank == 1
             with pytest.raises(DistributedCheckpointError, match="apply strict checkpoint"):

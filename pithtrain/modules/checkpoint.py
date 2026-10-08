@@ -120,13 +120,12 @@ def unwrap_dtensor_experts(value: Any, expected_n: int) -> Optional[Tuple[Any, i
         if dt.placements[0].dim != 0:
             return None
         local = dt._local_tensor
-        if local.shape[0] >= expected_n:
-            return None
         dp_rank = dt.device_mesh.get_local_rank()
         dp_size = dt.device_mesh.size()
-        chunk, remainder = divmod(expected_n, dp_size)
-        dp_offset = dp_rank * chunk + min(dp_rank, remainder)
-        return local, local.shape[0], dp_offset
+        local_n, dp_offset = Shard.local_shard_size_and_offset(expected_n, dp_size, dp_rank)
+        if local.shape[0] != local_n:
+            raise ValueError("Expert local shard size disagrees with Shard(0) placement")
+        return local, local_n, dp_offset
 
     if isinstance(value, DTensor):
         return _info(value)
@@ -381,6 +380,19 @@ def to_localized_model(
     model_keys = set(model.state_dict().keys())
     fqn_map = {strip_prefix(k): k for k in model_keys}
     result = repack(canonical, fqn_map, named_modules, restack_tensors)
+    # A rank with an empty expert shard has no canonical expert entries to
+    # restack. Recreate only that zero-element local tensor; never substitute
+    # live values for a missing nonempty checkpoint parameter.
+    for name, parameter in model.named_parameters():
+        if (
+            name not in result
+            and ".experts." in name
+            and isinstance(parameter, DTensor)
+            and len(parameter.placements) == 1
+            and parameter.placements[0] == Shard(0)
+            and parameter.to_local().shape[0] == 0
+        ):
+            result[name] = parameter.detach().clone()
     rewrap_dtensor_experts(result, model)
     return result
 

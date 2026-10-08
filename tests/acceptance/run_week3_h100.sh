@@ -13,6 +13,8 @@ cd "$repo"
 git diff --quiet HEAD
 mkdir -p "$out"
 export PYTHONPATH="$repo" PYTHONDONTWRITEBYTECODE=1 HF_HUB_OFFLINE=1 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2
+export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+unset PYTEST_ADDOPTS PYTEST_PLUGINS
 start=$SECONDS
 run_gate() {
   local name=$1 cap=$2 remaining

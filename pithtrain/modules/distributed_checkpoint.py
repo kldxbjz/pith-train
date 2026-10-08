@@ -313,9 +313,11 @@ def save(root, step, *, data_state, config):
             data, step=step, global_batch_size=batch, fingerprint=data["fingerprint"]
         ),
     )
-    _agree(
-        dict(step=step, config=config, data=data, root=str(Path(root).resolve())), "save contract"
+    contract = _phase(
+        "save contract arguments",
+        lambda: dict(step=step, config=config, data=data, root=str(Path(root).resolve())),
     )
+    _agree(contract, "save contract")
     values, layout = _phase(
         "capture shards", lambda: _runtime(model, opts, scheds, data_state, device)
     )
@@ -381,15 +383,16 @@ def load(root, step, *, data_state, config):
     model, opts, scheds, device, batch, data = _phase(
         "load arguments", lambda: _objects(data_state, step, config)
     )
-    _agree(
-        dict(
+    contract = _phase(
+        "load contract arguments",
+        lambda: dict(
             step=step,
             config=config,
             fingerprint=data["fingerprint"],
             root=str(Path(root).resolve()),
         ),
-        "load contract",
     )
+    _agree(contract, "load contract")
     location = Path(root, "torch-dcp", f"{step:08d}")
 
     def read():

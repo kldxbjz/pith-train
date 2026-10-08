@@ -43,8 +43,12 @@ from tests.test_strict_checkpoint import assert_tree_equal, native_shaped_cpu_mo
 
 def configuration(profile):
     config = fixtures.config.__wrapped__()
-    if profile in {"ep", "pp-ep"}:
+    if profile in {"ep", "pp-ep", "dp-chunks"}:
         config.num_experts = 4
+    if profile == "dp-chunks":
+        config.num_experts = 5
+    if profile == "dp-empty":
+        config.num_experts = config.num_experts_per_tok = 1
     return config
 
 
@@ -52,6 +56,8 @@ def geometry(profile):
     return {
         "single": (1, 1, 1),
         "dp": (2, 1, 1),
+        "dp-chunks": (4, 1, 1),
+        "dp-empty": (2, 1, 1),
         "pp": (2, 2, 1),
         "ep": (2, 1, 2),
         "pp-ep": (4, 2, 2),
@@ -119,7 +125,7 @@ def make_runtime(profile, rank):
 
 def advance(model, opt, sch, data):
     for parameter in model.parameters():
-        parameter.grad = torch.ones_like(parameter) * 0.01
+        parameter.grad = parameter.detach() * 0.1 + torch.ones_like(parameter) * 0.01
     opt.step()
     sch.step()
     opt.zero_grad(set_to_none=True)
@@ -164,7 +170,7 @@ def produce(root, profile):
     return root / "original/torch-dcp/00000001"
 
 
-@pytest.mark.parametrize("profile", ["single", "dp", "pp", "ep", "pp-ep"])
+@pytest.mark.parametrize("profile", ["single", "dp", "dp-chunks", "dp-empty", "pp", "ep", "pp-ep"])
 def test_public_strict_hf_strict_roundtrip(tmp_path, profile):
     src = produce(tmp_path, profile)
     original = read_payloads(src)[1]
@@ -180,7 +186,7 @@ def test_public_strict_hf_strict_roundtrip(tmp_path, profile):
         expected = fixtures.model(config, dtype)
         opt = torch.optim.AdamW(expected.parameters(), lr=0.01, foreach=False)
         for parameter in expected.parameters():
-            parameter.grad = torch.ones_like(parameter) * 0.01
+            parameter.grad = parameter.detach() * 0.1 + torch.ones_like(parameter) * 0.01
         opt.step()
         exported = canonical_to_hf(canonical, config, prefix="")
         assert_tree_equal(exported, expected.state_dict())
@@ -412,3 +418,38 @@ def test_resume_rejects_outer_quantization(saved, tmp_path):
             fixtures.LOGGER,
         )
     assert not output.exists()
+
+
+@pytest.mark.parametrize("layout", ["fused", "split"])
+@pytest.mark.parametrize("component", ["dense", "gate", "down"])
+def test_changed_weights_cannot_restore_optimizer(saved, tmp_path, layout, component):
+    hf, output = tmp_path / "hf", tmp_path / "strict"
+    dcp2hf(
+        fixtures.make_cfg(load_path=saved, save_path=hf, omni_expert_layout=layout), fixtures.LOGGER
+    )
+    hashes = {p.name: file_hash(p) for p in (hf / RESUME_DIR).iterdir()}
+    path = next(hf.glob("*.safetensors"))
+    values = load_file(path)
+    suffix = {
+        "dense": "q_proj.weight",
+        "gate": "gate_up_proj" if layout == "fused" else "gate_proj.weight",
+        "down": "down_proj" if layout == "fused" else "down_proj.weight",
+    }[component]
+    key = next(k for k in values if k.endswith(suffix))
+    value = values[key].flatten()
+    value[0] = torch.nextafter(value[0], torch.tensor(float("inf")))
+    save_file(values, path)
+    with pytest.raises(ConversionError, match="HF weights changed"):
+        hf2dcp(
+            fixtures.make_cfg(load_path=hf, save_path=output, omni_restore_resume=True),
+            fixtures.LOGGER,
+        )
+    assert not output.exists()
+    assert hashes == {p.name: file_hash(p) for p in (hf / RESUME_DIR).iterdir()}
+    # A deliberate new initialization remains model-only, with no stale moments.
+    hf2dcp(fixtures.make_cfg(load_path=hf, save_path=output), fixtures.LOGGER)
+    import torch.distributed.checkpoint as dcp
+
+    metadata = dcp.FileSystemReader(output).read_metadata()
+    assert all(k.startswith("app.model.") for k in metadata.state_dict_metadata)
+    assert not (output / MANIFEST).exists()
