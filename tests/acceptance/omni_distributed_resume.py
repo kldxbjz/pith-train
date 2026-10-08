@@ -30,6 +30,9 @@ def parse_args(argv=None):
     )
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--restore-root", type=Path, help="Strict checkpoint root rebuilt via HF bridge"
+    )
     parser.add_argument("--world-size", type=int, required=True)
     parser.add_argument("--pp", type=int, default=1)
     parser.add_argument("--ep", type=int, default=1)
@@ -40,6 +43,8 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if (args.mode == "negative") != (args.negative_case is not None):
         parser.error("Supply --negative-case exactly when mode is negative")
+    if args.restore_root is not None and args.mode not in {"restore", "negative"}:
+        parser.error("--restore-root applies only to restore/negative")
     args.dataset, args.output = args.dataset.resolve(), args.output.resolve()
     if (
         min(args.world_size, args.pp, args.ep) < 1
@@ -153,7 +158,8 @@ def negative_case(args, cfg, data):
         if dist.get_rank() != 0:
             return
         shutil.copytree(
-            args.output / "checkpoints/torch-dcp/00000002", target / "torch-dcp/00000002"
+            (args.restore_root or args.output / "checkpoints") / "torch-dcp/00000002",
+            target / "torch-dcp/00000002",
         )
         location = target / "torch-dcp/00000002"
         path = location / f"rank-{args.world_size - 1:05d}.pt"
@@ -261,7 +267,7 @@ def run_gpu(args):
                 parameter.zero_()
         torch.manual_seed(9917 + rank)
         load_checkpoint(
-            args.output / "checkpoints",
+            args.restore_root or args.output / "checkpoints",
             2,
             data_state=data.checkpoint_state,
             strict=True,
@@ -288,6 +294,7 @@ def run_gpu(args):
                 all_ranks_rejected=args.mode == "negative",
                 real_loader=True,
                 fsdp=True,
+                converted_checkpoint_root=str(args.restore_root) if args.restore_root else None,
                 exact_restore=args.mode == "restore",
                 consumed_samples=data.consumed_samples,
                 max_allocated_bytes=torch.cuda.max_memory_allocated(),

@@ -130,8 +130,9 @@ tolerance change. The original native/HF logit/CE/gradient gates are unchanged.
   scope and native acceptance are HSDP1/CP1 with PP/EP/FSDP layouts.
 - The strict container is a new **resume format**, not ordinary globally
   reshardable DCP. The standalone HF converter does not read this container
-  directly. A future strict-container weight-export adapter is required for
-  direct export; existing ordinary DCP converter behavior is unchanged.
+  directly at this document's frozen baseline. The follow-up in
+  [WEEK3_STRICT_CONVERTER.md](WEEK3_STRICT_CONVERTER.md) implements direct
+  export plus strict HF resume companions; ordinary DCP behavior is unchanged.
 - Rank-local CPU staging and rollback copies increase host RAM and storage
   usage. Only tiny verification is in scope; no 30B payload or numeric run.
 - Three-step continuation is not the repository's 32-step base0/base1/feature

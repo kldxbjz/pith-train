@@ -24,20 +24,27 @@ def main():
         action="store_true",
         help="Explicitly exclude known media/Talker keys on import",
     )
+    parser.add_argument(
+        "--restore-resume", action="store_true", help="HF companion to original strict container"
+    )
     parser.add_argument("--max-shard-size", type=int, default=8 * 1024**3)
     args = parser.parse_args()
     if (
         args.operation == "dcp2hf"
         and not args.text_config
         and not (args.load_path / SIDECAR).exists()
+        and not (args.load_path / "strict-manifest.json").exists()
     ):
         parser.error("Omni native DCP export requires --text-config (or converter sidecar)")
     if args.operation == "hf2dcp" and not Qwen3OmniTextConverter().detect_hf(args.load_path):
         parser.error("Omni import requires an Omni/Thinker/text config.json")
+    if args.restore_resume and args.operation != "hf2dcp":
+        parser.error("--restore-resume requires hf2dcp")
     cfg = ConvertCheckpointCfg()
     cfg.operation, cfg.load_path, cfg.save_path = args.operation, args.load_path, args.save_path
     cfg.omni_text_config, cfg.omni_prefix = args.text_config, args.prefix
     cfg.omni_expert_layout, cfg.omni_text_only = args.expert_layout, args.text_only
+    cfg.omni_restore_resume = args.restore_resume
     cfg.max_shard_size = args.max_shard_size
     launch(cfg)
 

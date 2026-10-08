@@ -63,6 +63,9 @@ class ConvertCheckpointCfg(SlottedDefault):
     omni_text_only: bool = False
     """Explicitly exclude known media/Talker weights on Omni import; report every key."""
 
+    omni_restore_resume: bool = False
+    """Rebuild original strict shards from an HF export with resume companion."""
+
     logging: LoggingCfg = field(default_factory=LoggingCfg)
     """Logging configuration."""
 
@@ -70,6 +73,28 @@ class ConvertCheckpointCfg(SlottedDefault):
 def hf2dcp(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
     """Convert HuggingFace checkpoint to DCP format."""
     load_path, save_path = Path(cfg.load_path), Path(cfg.save_path)
+
+    if cfg.omni_restore_resume:
+        from .qwen3_omni_moe import hf_to_canonical, read_hf_text, text_config
+        from .strict_omni import restore_from_hf
+
+        require_empty_destination(save_path)
+        raw = read_json(load_path / "config.json")
+        if raw.get("quantization_config"):
+            raise ConversionError("Quantized Omni checkpoints are unsupported")
+        config = text_config(raw)
+        state, excluded, _ = read_hf_text(
+            load_path, config, prefix=cfg.omni_prefix, text_only=cfg.omni_text_only
+        )
+        canonical, _ = hf_to_canonical(state, config, prefix=cfg.omni_prefix)
+        restore_from_hf(load_path, save_path, config, canonical)
+        stdout.info(
+            "Rebuilt original strict resume container at %s; excluded non-text keys (%d): %s",
+            save_path,
+            len(excluded),
+            excluded,
+        )
+        return
 
     if (load_path / "config.json").exists():
         read_json(load_path / "config.json")
@@ -111,10 +136,23 @@ def dcp2hf(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
     load_path, save_path = Path(cfg.load_path), Path(cfg.save_path)
     if cfg.max_shard_size <= 0:
         raise ValueError("max_shard_size must be positive")
-    config = export_config(load_path, cfg.omni_text_config)
+    from .strict_omni import MANIFEST, assemble, read_payloads, same_config, write_companion
+
+    if cfg.omni_restore_resume:
+        raise ConversionError("omni_restore_resume only applies to hf2dcp")
+    strict = (load_path / MANIFEST).exists()
+    if not strict and any(load_path.glob("rank-*.pt")):
+        raise ConversionError("Incomplete strict container: missing completion manifest")
+    if strict:
+        _, payloads, config, pieces = read_payloads(load_path)
+        explicit = export_config(load_path, cfg.omni_text_config)
+        if explicit is not None:
+            same_config(config, explicit)
+    else:
+        config = export_config(load_path, cfg.omni_text_config)
     if config is not None:
         require_empty_destination(save_path)
-        canonical = load_canonical(load_path, config)
+        canonical = assemble(config, pieces) if strict else load_canonical(load_path, config)
         hf_state = canonical_to_hf(
             canonical, config, prefix=cfg.omni_prefix, layout=cfg.omni_expert_layout
         )
@@ -129,6 +167,8 @@ def dcp2hf(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
             "source_expert_layout": cfg.omni_expert_layout,
         }
         (save_path / SIDECAR).write_text(json.dumps(manifest, indent=2) + "\n")
+        if strict:
+            write_companion(save_path, payloads, payloads[0]["header"]["step"])
         return
     stdout.info("Converting DCP checkpoint from %s" % load_path)
 
