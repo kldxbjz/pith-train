@@ -26,6 +26,7 @@ from pithtrain.contexts import distributed, training
 from pithtrain.models.deepseek_v2 import DeepSeekV2Model
 from pithtrain.models.gpt_oss import GptOssModel
 from pithtrain.models.qwen3_moe import Qwen3MoeModel
+from pithtrain.models.qwen3_omni_image import Qwen3OmniMoeThinkerImageModel
 from pithtrain.models.qwen3_omni_moe import Qwen3OmniMoeThinkerTextModel
 from pithtrain.models.qwen35_moe import Qwen35MoeModel
 from pithtrain.modules.load_balance import force_balance, make_load_balance_loss_fn
@@ -56,7 +57,7 @@ def is_muon_param(name: str, param: torch.Tensor) -> bool:
     norms, biases and sinks, the embeddings, the LM head, the MoE gate and router, and the 2D
     stacked expert biases.
     """
-    if param.ndim < 2:
+    if param.ndim < 2 or "visual." in name:
         return False
     if name.endswith(".bias") or name.endswith("_bias"):
         return False
@@ -146,6 +147,9 @@ class TrainingCfg(SlottedDefault):
     """
     Configuration for the model and how it is trained.
     """
+
+    native_vision: bool = False
+    """Opt into native Omni image training using a composite Thinker config."""
 
     sequence_length: int
     """
@@ -313,6 +317,9 @@ def init_weights(model: nn.Module, num_layers: int, init_std: float = 0.02) -> N
     # Scale down residual-stream projections (o_proj, down_proj) to bound variance growth.
     output_std = init_std / math.sqrt(2.0 * num_layers)
     for name, param in model.named_parameters():
+        if name.startswith("visual.") and param.dim() == 1:
+            nn.init.zeros_(param) if name.endswith("bias") else nn.init.ones_(param)
+            continue
         if param.dim() < 2:
             continue  # skip biases, layer-norm weights, etc.
         if "o_proj" in name or "down_proj" in name:
@@ -402,8 +409,13 @@ def apply_fsdp(model, hsdp_replica: int = 1):
     return model
 
 
-def model_class_for_config(module_config):
+def model_class_for_config(module_config, native_vision=False):
     """Resolve a registered pipeline model before allocating any parameters."""
+    if native_vision:
+        thinker = getattr(module_config, "thinker_config", module_config)
+        if getattr(thinker, "model_type", None) != "qwen3_omni_moe_thinker":
+            raise ValueError("native_vision requires a composite Omni Thinker config")
+        return Qwen3OmniMoeThinkerImageModel
     module_config = resolve_text_model_config(module_config)
     if module_config.model_type == "deepseek_v2":
         return DeepSeekV2Model
@@ -431,7 +443,8 @@ def setup_model(
     cp_group = distributed.cp_group
 
     modules = []
-    module_config = resolve_text_model_config(AutoConfig.from_pretrained(cfg.model))
+    source_config = AutoConfig.from_pretrained(cfg.model)
+    module_config = resolve_text_model_config(source_config)
     module_config.max_position_embeddings = cfg.sequence_length
 
     assert hasattr(module_config, "hidden_size")
@@ -445,10 +458,14 @@ def setup_model(
         )
 
     # All models read their parallel groups from the distributed context directly.
-    ModelClass = model_class_for_config(module_config)
-
-    modules.append(ModelClass(module_config, phase=0))
-    modules.append(ModelClass(module_config, phase=1))
+    ModelClass = model_class_for_config(source_config, native_vision=cfg.native_vision)
+    selected_config = (
+        getattr(source_config, "thinker_config", source_config)
+        if cfg.native_vision
+        else module_config
+    )
+    modules.append(ModelClass(selected_config, phase=0))
+    modules.append(ModelClass(selected_config, phase=1))
 
     # Apply scaled normal weight initialization before FSDP sharding.
     num_layers = module_config.num_hidden_layers

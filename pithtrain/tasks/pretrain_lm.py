@@ -84,7 +84,9 @@ def setup_dataset(cfg: PretrainLMCfg) -> PretrainData:
         pp_group=distributed.pp_group,
     )
     config = AutoConfig.from_pretrained(cfg.training.model)
-    data.validate_model(model_class_for_config(config), config)
+    data.validate_model(
+        model_class_for_config(config, native_vision=cfg.training.native_vision), config
+    )
     return data
 
 
