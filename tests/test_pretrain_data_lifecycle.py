@@ -57,9 +57,10 @@ class OtherData:
         self.events.append(("commit", step))
 
 
+@pytest.mark.parametrize("strict", [False, True])
 @pytest.mark.parametrize("fail_optimizer", [False, True])
 def test_task_commits_only_after_successful_optimizer_and_scheduler(
-    monkeypatch, tmp_path, fail_optimizer
+    monkeypatch, tmp_path, fail_optimizer, strict
 ):
     events = []
     data = OtherData(events)
@@ -76,7 +77,8 @@ def test_task_commits_only_after_successful_optimizer_and_scheduler(
         if fail_optimizer:
             raise RuntimeError("optimizer failed")
 
-    def save_checkpoint(root, step, *, data_state):
+    def save_checkpoint(root, step, *, data_state, **kwargs):
+        assert kwargs == ({"strict": True, "resume_config": {"test": "contract"}} if strict else {})
         assert root == tmp_path and data_state is data.checkpoint_state
         assert events[-1] == ("commit", step - 1)
         events.append(("save", step))
@@ -93,6 +95,7 @@ def test_task_commits_only_after_successful_optimizer_and_scheduler(
         micro_batch_size=1,
         moe_load_balance_coef=0,
         save_interval=1,
+        strict_resume=strict,
         max_steps=1,
         save_location=tmp_path,
     )
@@ -125,6 +128,7 @@ def test_task_commits_only_after_successful_optimizer_and_scheduler(
             reset=lambda: None, get_total_count_and_clear=lambda: (0, 0)
         ),
         save_checkpoint=save_checkpoint,
+        resume_contract=lambda cfg: {"test": "contract"},
     )
     if fail_optimizer:
         with pytest.raises(RuntimeError, match="optimizer failed"):
@@ -135,14 +139,15 @@ def test_task_commits_only_after_successful_optimizer_and_scheduler(
         assert events == [("read", 0), "optimizer", "scheduler", ("commit", 0), ("save", 1)]
 
 
-@pytest.mark.parametrize("has_data_state", [False, True])
-def test_launch_restores_through_provider_before_resuming(tmp_path, has_data_state):
+@pytest.mark.parametrize("has_data_state,strict", [(False, False), (True, False), (True, True)])
+def test_launch_restores_through_provider_before_resuming(tmp_path, has_data_state, strict):
     events = []
     data = OtherData(events)
     if not has_data_state:
         data.checkpoint_state = None
 
-    def load_checkpoint(root, step, *, data_state):
+    def load_checkpoint(root, step, *, data_state, **kwargs):
+        assert kwargs == ({"strict": True, "resume_config": {"test": "contract"}} if strict else {})
         assert root == tmp_path and step == 2 and data_state is data.checkpoint_state
         events.append("restore")
 
@@ -161,7 +166,12 @@ def test_launch_restores_through_provider_before_resuming(tmp_path, has_data_sta
         logging=SimpleNamespace(stdout=SimpleNamespace(info=lambda *_: None)),
         find_checkpoint=lambda root: 2,
         load_checkpoint=load_checkpoint,
+        resume_contract=lambda cfg: {"test": "contract"},
     )
     task.launch.__globals__["train_step"] = step
-    task.launch(SimpleNamespace(training=SimpleNamespace(save_location=tmp_path, max_steps=4)))
+    task.launch(
+        SimpleNamespace(
+            training=SimpleNamespace(save_location=tmp_path, max_steps=4, strict_resume=strict)
+        )
+    )
     assert events == ["restore", 2, 3]

@@ -202,6 +202,13 @@ class TrainingCfg(SlottedDefault):
     enough to pretrain from scratch.
     """
 
+    strict_resume: bool = False
+    """Opt into fixed-topology transactional resume, including every rank's data/RNG.
+
+    Currently requires prepared data, AdamW and StepLR/LambdaLR. Weight-only
+    initialization and changed-world-size resharding keep the legacy path.
+    """
+
     save_interval: Optional[int] = None
     """
     The interval (in steps) at which to save checkpoints. When None, checkpoint saving is disabled

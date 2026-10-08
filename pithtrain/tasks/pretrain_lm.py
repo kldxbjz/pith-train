@@ -23,6 +23,7 @@ from pithtrain.modules.checkpoint import (
 )
 from pithtrain.modules.data_config import DataCfg
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
+from pithtrain.modules.distributed_checkpoint import resume_contract
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
 from pithtrain.modules.logging import LoggingCfg, activate_wandb, setup_logging
 from pithtrain.modules.optimizer import clip_grad_norm
@@ -269,6 +270,11 @@ def train_step(cfg: PretrainLMCfg, dataset: PretrainData, step: int) -> None:
                 cfg.training.save_location,
                 completed,
                 data_state=dataset.checkpoint_state,
+                **(
+                    {"strict": True, "resume_config": resume_contract(cfg)}
+                    if getattr(cfg.training, "strict_resume", False)
+                    else {}
+                ),
             )
 
     # Run deferred GC here so cyclic collection never fires mid-forward/backward.
@@ -292,6 +298,11 @@ def launch(cfg: PretrainLMCfg) -> None:
             cfg.training.save_location,
             step,
             data_state=dataset.checkpoint_state,
+            **(
+                {"strict": True, "resume_config": resume_contract(cfg)}
+                if getattr(cfg.training, "strict_resume", False)
+                else {}
+            ),
         )
     step = step or 0
     gc.disable()
