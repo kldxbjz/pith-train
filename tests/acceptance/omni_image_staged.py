@@ -26,6 +26,7 @@ from tests.acceptance.omni_image_training import (
     hf_name,
     source_inputs,
 )
+from tests.acceptance.omni_reference_precision import FP32GradientReference
 
 
 def local_tensor(value):
@@ -105,8 +106,10 @@ def run(
     dist.barrier()
     data = pretrain_lm.setup_dataset(cfg)
     setup_training(cfg)
-    reference = reference_class(config, torch.bfloat16).to(distributed.device)
-    expected = dict(reference.named_parameters())
+    reference = FP32GradientReference(
+        reference_class(config, torch.bfloat16).to(distributed.device)
+    )
+    expected = reference.master_parameters
     actual = {}
     for module in training.model.module:
         for name, parameter in module.named_parameters():
@@ -160,11 +163,11 @@ def run(
         inputs = {k: v.to(distributed.device) for k, v in batch.model_inputs.items()}
         logits = reference(inputs)
         labels = batch.labels.to(distributed.device)
-        loss = (
-            F.cross_entropy(logits.float().flatten(0, 1), labels.flatten(), reduction="sum") / count
-        )
+        loss = F.cross_entropy(logits.float().flatten(0, 1), labels.flatten(), reduction="sum")
         loss.backward()
         hf_loss += loss.detach()
+    reference.normalize_gradients_(count)
+    hf_loss = hf_loss / count
     outputs = training.model.step(microbatches, pretrain_lm.objective)
     if distributed.pp_rank == 0:
         loss = global_loss_mean(torch.stack(outputs).sum(), count, group)
@@ -231,6 +234,7 @@ def run(
         local_target_count=partition["local_target_count"],
         target_count=int(count),
         gradient_errors=errors,
+        reference_precision=reference.precision_contract(),
         updated_parameters=updated,
         training_modules=modules,
         real_reader_module_updates=observer.steps,
