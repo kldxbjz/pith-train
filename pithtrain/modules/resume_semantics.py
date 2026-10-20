@@ -144,9 +144,14 @@ def callable_contract(function, *, bound_objects=()):
         if callable(value):
             raise ValueError("Unverifiable callable object in strict resume contract")
         if isinstance(value, (tuple, list)):
-            return [encode(v) for v in value]
+            return {"tuple" if isinstance(value, tuple) else "list": [encode(v) for v in value]}
         if isinstance(value, dict):
-            return {str(k): encode(v) for k, v in sorted(value.items())}
+            if any(type(key) not in (str, int) for key in value):
+                raise ValueError("Unverifiable callable mapping key type")
+            tagged = {
+                ("s:" if type(key) is str else "i:") + str(key): item for key, item in value.items()
+            }
+            return {"mapping": {key: encode(tagged[key]) for key in sorted(tagged)}}
         return _canonical_model_value(value)
 
     return seal(

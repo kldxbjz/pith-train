@@ -11,6 +11,7 @@ No allocation, credentials, uploads, or network access are performed here.
 
 import argparse
 import ast
+import copy
 import datetime as dt
 import hashlib
 import importlib.util
@@ -63,6 +64,27 @@ UNCHANGED_FUNCTIONS = {
         "OmniPretrainData.load_state_dict",
     ),
 }
+# Exact reviewed 1611d085 -> 045a90b numerical-equivalence projections. Any other
+# function, constructor, metadata helper dependency, or FSDP policy needs review.
+WSD_BASE_AST = "13007e5190f71f8f650364c5ea256f2fa71073200e0fb4b1b2e8dea47ed9cc41"
+WSD_FEATURE_AST = "0c60040146ebd9506f2fc6c3e4ac93ecf3d383b1f2cbedf6117f5fab764e9f7d"
+SCHEDULER_HELPER_DEPENDENCY_AST = "b9ff52a3d88d17be6603e4a6ba4bcd1842bc4a11e01a15fafca2b982dee2b044"
+FSDP_BASE_AST = "6392c9b7adf51d7749baf22811128d47a0a0aa0beacfd279d7089cb91b220bbf"
+FSDP_FEATURE_AST = "68d892b12594c666932b691ffceaedd385255c933a4f70a16632e11041581b64"
+TALKER_SELECTOR_AST = "ec92d7f8ec39b183a0c2f71afb3d554a383f7693b3078c809e4fc22a9704fe16"
+OLD_FSDP_EDGE = """
+for name, child in model[i].named_children():
+    if name != "layers" and next(child.parameters(), None) is not None:
+        fully_shard(child, mesh=attn_fsdp_mesh, reshard_after_forward=True, mp_policy=compute_mp)
+"""
+NEW_FSDP_EDGE = """
+edges = (model[i].fsdp_edge_modules() if isinstance(model[i], Qwen3OmniMoeTalkerTextModel)
+         else tuple(child for name, child in model[i].named_children()
+                    if name != "layers" and next(child.parameters(), None) is not None))
+for child in edges:
+    fully_shard(child, mesh=attn_fsdp_mesh, reshard_after_forward=True, mp_policy=compute_mp)
+"""
+
 EXCLUSIONS = [
     "Whole PR100/PR101 and changes already present in the reviewed baseline",
     "Image/audio/video/mixed modalities, encoder gradients and AV positions",
@@ -89,14 +111,105 @@ def write(path, value):
         stream.write("\n")
 
 
-def function_dump(path, qualified_name):
+def function_node(path, qualified_name):
     nodes = ast.parse(Path(path).read_text()).body
     found = None
     for part in qualified_name.split("."):
         found = next((n for n in nodes if getattr(n, "name", None) == part), None)
         require(found is not None, f"Missing audited function {qualified_name}")
         nodes = getattr(found, "body", ())
-    return ast.dump(found, include_attributes=False)
+    return found
+
+
+def function_dump(path, qualified_name):
+    return ast.dump(function_node(path, qualified_name), include_attributes=False)
+
+
+def ast_digest(node):
+    return hashlib.sha256(ast.dump(node, include_attributes=False).encode()).hexdigest()
+
+
+def scheduler_helper_audit(feature):
+    """Pin the metadata-only helper and its complete called dependency bodies.
+
+    The three excluded function bodies are never called by bind_scheduler_factory.
+    Their signatures/defaults/decorators, all imports, and every other module-level
+    statement remain pinned, so no new helper rebinding or import is accepted.
+    """
+    path = feature / "pithtrain/modules/resume_semantics.py"
+    tree = ast.parse(path.read_text())
+    unrelated = {"callable_contract", "scheduler_contract", "model_contract"}
+    found = set()
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name in unrelated:
+            found.add(node.name)
+            node.body = [ast.Pass()]
+    require(found == unrelated, "Scheduler metadata dependency layout changed")
+    actual = ast_digest(tree)
+    require(actual == SCHEDULER_HELPER_DEPENDENCY_AST, "Scheduler metadata helper changed")
+    return actual
+
+
+def reviewed_scheduler_audit(base, feature):
+    path = "pithtrain/modules/training.py"
+    a = function_node(base / path, "make_wsd_scheduler")
+    b = function_node(feature / path, "make_wsd_scheduler")
+    require(ast_digest(a) == WSD_BASE_AST, "Unreviewed baseline make_wsd_scheduler AST")
+    require(ast_digest(b) == WSD_FEATURE_AST, "Unreviewed feature make_wsd_scheduler AST")
+    # The exact feature pin covers the added import, factory/argument metadata,
+    # every LR calculation and the LambdaLR constructor. Undo only that wrapper.
+    projected = copy.deepcopy(b)
+    projected.body[-2:] = [ast.Return(value=copy.deepcopy(b.body[-1].value.args[0]))]
+    require(ast_digest(projected) == ast_digest(a), "Scheduler numerical body/constructor changed")
+    return {
+        "scope": "Identical WSD LR body and scheduler construction; metadata attribute only",
+        "baseline_function_ast_sha256": ast_digest(a),
+        "feature_function_ast_sha256": ast_digest(b),
+        "projected_function_ast_sha256": ast_digest(projected),
+        "metadata_dependency_ast_sha256": scheduler_helper_audit(feature),
+        "raw_ast_equal": False,
+    }
+
+
+def reviewed_fsdp_audit(base, feature):
+    path = "pithtrain/modules/training.py"
+    a = function_node(base / path, "apply_fsdp")
+    b = function_node(feature / path, "apply_fsdp")
+    require(ast_digest(a) == FSDP_BASE_AST, "Unreviewed baseline apply_fsdp AST")
+    require(ast_digest(b) == FSDP_FEATURE_AST, "Unreviewed feature apply_fsdp AST")
+    projected = copy.deepcopy(b)
+    before, after = ast.parse(OLD_FSDP_EDGE).body, ast.parse(NEW_FSDP_EDGE).body
+    matches = 0
+    for parent in ast.walk(projected):
+        for _, values in ast.iter_fields(parent):
+            if not isinstance(values, list):
+                continue
+            for index in range(len(values) - 1):
+                pair = values[index : index + 2]
+                if all(isinstance(value, ast.AST) for value in pair) and [
+                    ast.dump(value, include_attributes=False) for value in pair
+                ] == [ast.dump(value, include_attributes=False) for value in after]:
+                    values[index : index + 2] = copy.deepcopy(before)
+                    matches += 1
+                    break
+    require(
+        matches == 1 and ast_digest(projected) == ast_digest(a),
+        "Non-Talker FSDP policy or numerical implementation changed",
+    )
+    selector = function_node(
+        feature / "pithtrain/models/qwen3_omni_talker_pipeline.py",
+        "Qwen3OmniMoeTalkerTextModel.fsdp_edge_modules",
+    )
+    require(ast_digest(selector) == TALKER_SELECTOR_AST, "Talker FSDP edge selector changed")
+    return {
+        "scope": "Existing non-Talker native registered module trees only; no Talker verdict",
+        "baseline_function_ast_sha256": ast_digest(a),
+        "feature_function_ast_sha256": ast_digest(b),
+        "projected_function_ast_sha256": ast_digest(projected),
+        "talker_selector_ast_sha256": ast_digest(selector),
+        "raw_ast_equal": False,
+        "projection_count": matches,
+    }
 
 
 def common_audit(base, feature):
@@ -112,15 +225,20 @@ def common_audit(base, feature):
         a, b = digest(base / name), digest(feature / name)
         require(a == b, f"Numerical file changed; review a new baseline/scope: {name}")
         files[name] = a
-    functions = {}
+    functions, scoped_functions = {}, {}
     for name, symbols in UNCHANGED_FUNCTIONS.items():
         for symbol in symbols:
             a = function_dump(base / name, symbol)
             b = function_dump(feature / name, symbol)
-            require(
-                a == b, f"Numerical function changed; explicit re-review required: {name}:{symbol}"
-            )
-            functions[f"{name}:{symbol}"] = hashlib.sha256(a.encode()).hexdigest()
+            key = f"{name}:{symbol}"
+            if a == b:
+                functions[key] = hashlib.sha256(a.encode()).hexdigest()
+            elif key == "pithtrain/modules/training.py:make_wsd_scheduler":
+                scoped_functions[key] = reviewed_scheduler_audit(base, feature)
+            elif key == "pithtrain/modules/training.py:apply_fsdp":
+                scoped_functions[key] = reviewed_fsdp_audit(base, feature)
+            else:
+                raise ValueError(f"Numerical function changed; explicit re-review required: {key}")
     # The public numerical opt-in exists independently of checkpoint features.
     for repo in (base, feature):
         cfg_tree = ast.parse((repo / "pithtrain/modules/training.py").read_text())
@@ -178,6 +296,7 @@ def common_audit(base, feature):
         "common_deterministic_default": False,
         "identical_files": files,
         "identical_functions": functions,
+        "scoped_equivalent_functions": scoped_functions,
         "text_get_batch_prefix_sha256": hashlib.sha256(prefixes[0].encode()).hexdigest(),
         "media_opt_in_defaults": defaults,
     }
