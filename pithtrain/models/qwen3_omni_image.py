@@ -39,8 +39,8 @@ class Qwen3OmniMoeThinkerImageDecoderLayer(Qwen3OmniMoeThinkerTextDecoderLayer):
             residual[..., : self.text_hidden_size],
             residual[..., self.text_hidden_size :],
         )
-        # Inline the eager body inside this single fullgraph region.
-        hidden = Qwen3OmniMoeThinkerTextDecoderLayer.forward_stage5.__wrapped__(
+        # Inline the shared arithmetic inside this single fullgraph region.
+        hidden = Qwen3OmniMoeThinkerTextDecoderLayer._forward_stage5(
             self, moe_outs, moe_local_idxs, topk_weight, hidden
         )
         return inject_deepstack(
