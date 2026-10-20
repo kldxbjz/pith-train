@@ -29,9 +29,10 @@ def test_production_dataset_routes_explicit_native_audio_flag():
         def validate_model(self, cls, config):
             calls.append((cls, config))
 
-    def choose(config, *, native_vision, native_audio):
+    def choose(config, *, native_vision, native_audio, native_video, native_multimodal):
         assert config == "composite"
         assert native_audio is True and native_vision is False
+        assert native_video is False and native_multimodal is False
         return "native-audio-class"
 
     distributed = SimpleNamespace(
@@ -48,7 +49,13 @@ def test_production_dataset_routes_explicit_native_audio_flag():
     exec(compile(ast.Module(body=[function], type_ignores=[]), "dataset", "exec"), namespace)
     config = SimpleNamespace(
         data=SimpleNamespace(validate=lambda: None, format="prepared_bundle"),
-        training=SimpleNamespace(model="path", native_audio=True, native_vision=False),
+        training=SimpleNamespace(
+            model="path",
+            native_audio=True,
+            native_vision=False,
+            native_video=False,
+            native_multimodal=False,
+        ),
     )
     assert isinstance(namespace["setup_dataset"](config), Data)
     assert calls == [("native-audio-class", "composite")]
