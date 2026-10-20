@@ -48,12 +48,17 @@ class Qwen3OmniMoeThinkerImageDecoderLayer(Qwen3OmniMoeThinkerTextDecoderLayer):
             hidden, lanes, self.idx, self.text_hidden_size, self.deepstack_count
         )
 
-    def reference_forward(self, payload, rotary_posemb, cu_seqlens=None):
+    def reference_forward_with_hidden(self, payload, rotary_posemb, cu_seqlens=None):
+        """Return both the transported payload and HF's pre-DeepStack hidden state."""
         hidden, lanes = payload[..., : self.text_hidden_size], payload[..., self.text_hidden_size :]
         hidden = super().reference_forward(hidden, rotary_posemb, cu_seqlens)
-        return inject_deepstack(
+        injected = inject_deepstack(
             hidden, lanes, self.idx, self.text_hidden_size, self.deepstack_count
         )
+        return injected, hidden
+
+    def reference_forward(self, payload, rotary_posemb, cu_seqlens=None):
+        return self.reference_forward_with_hidden(payload, rotary_posemb, cu_seqlens)[0]
 
 
 class Qwen3OmniMoeThinkerImageModel(Qwen3OmniMoeThinkerTextModel):
