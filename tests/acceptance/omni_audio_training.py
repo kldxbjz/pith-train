@@ -125,7 +125,9 @@ def main():
         preflight(args)
         return
     assert os.environ.get("PITHTRAIN_RUN_OMNI_GPU_TESTS") == "1", "GPU execution is opt-in"
-    assert torch.cuda.is_available() and "H100" in torch.cuda.get_device_name(), "Requires H100"
+    assert torch.cuda.is_available(), "Requires CUDA"
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    assert "H100" in torch.cuda.get_device_name(), "Requires H100"
     assert int(os.environ["WORLD_SIZE"]) == args.pp * args.dp, "Use the requested CP1 topology"
     from tests.acceptance.omni_image_staged import run
 

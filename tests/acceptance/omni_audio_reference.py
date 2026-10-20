@@ -102,15 +102,46 @@ def error_ratio(actual, expected):
     return 0.0 if denominator == 0 else ((actual - expected).square().sum() / denominator).item()
 
 
-def check_gradients(actual, expected):
+class GradientParityError(AssertionError):
+    def __init__(self, diagnostics, context):
+        self.diagnostics, self.context = diagnostics, context
+        super().__init__(
+            {name: row for name, row in diagnostics.items() if row["status"] != "PASSED"}
+        )
+
+
+def check_gradients(actual, expected, context=None):
     assert actual.keys() == expected.keys()
-    errors = {}
+    diagnostics = {}
     for name, parameter in actual.items():
-        target = expected[name]
-        assert parameter.grad is not None and target.grad is not None, name
-        errors[name] = error_ratio(parameter.grad, target.grad)
-        assert errors[name] < 1e-2, (name, errors[name])
-    return errors
+        left, right = parameter.grad, expected[name].grad
+        row = {"status": "FAILED", "threshold": 1e-2}
+        diagnostics[name] = row
+        if left is None or right is None:
+            row.update(actual_missing=left is None, reference_missing=right is None)
+            continue
+        row.update(actual_shape=list(left.shape), reference_shape=list(right.shape))
+        if (
+            left.shape != right.shape
+            or not torch.isfinite(left).all()
+            or not torch.isfinite(right).all()
+        ):
+            row["reason"] = "shape mismatch or nonfinite gradients"
+            continue
+        left, right = left.double(), right.double()
+        row.update(
+            nse=error_ratio(left, right),
+            actual_l2=left.norm().item(),
+            reference_l2=right.norm().item(),
+            actual_max_abs=left.abs().max().item() if left.numel() else 0.0,
+            reference_max_abs=right.abs().max().item() if right.numel() else 0.0,
+            difference_max_abs=(left - right).abs().max().item() if left.numel() else 0.0,
+        )
+        if row["nse"] < 1e-2:
+            row["status"] = "PASSED"
+    if any(row["status"] != "PASSED" for row in diagnostics.values()):
+        raise GradientParityError(diagnostics, context)
+    return {name: row["nse"] for name, row in diagnostics.items()}
 
 
 def encoder_gate(config, device):
@@ -245,7 +276,17 @@ def text_gate(config, batches, device):
         torch.testing.assert_close(loss, expected_loss, rtol=1e-3, atol=1e-3)
         loss.backward()
         expected_loss.backward()
-        gradients = check_gradients(actual, expected)
+        gradients = check_gradients(
+            actual,
+            expected,
+            context=dict(
+                component="audio_text",
+                step=step,
+                loss=loss.item(),
+                expected_loss=expected_loss.item(),
+                logits_errors=logits_errors,
+            ),
+        )
         feature_errors = [error_ratio(a.grad, b.grad) for a, b in feature_pairs]
         assert max(feature_errors) < 1e-2, feature_errors
         before = {name: parameter.detach().clone() for name, parameter in actual.items()}
@@ -317,6 +358,9 @@ def main():
     except Exception as error:
         report["status"] = "FAILED"
         report["error"] = repr(error)
+        if isinstance(error, GradientParityError):
+            report["gradient_diagnostics"] = error.diagnostics
+            report["failure_context"] = error.context
         raise
     finally:
         args.output.write_text(json.dumps(report, indent=2) + "\n")
