@@ -25,15 +25,23 @@ new source freeze. Old CPU/GPU results are not transferred to the successor. No 
 | Full conversion | qwen3_omni_full.py, including Talker/Code2Wav | Actual released payload; 28010-key header checks are not payload validation |
 | Speech codec/text/waveform training | omni_speech, local replicas and FSDP2 | Native numerical and next-update checkpoint gates |
 | SFT | Task/data/objective and native training entry | Final-source integration and resume |
-| GRPO text policy | Real optimizer loop, explicit rollout/reward/publisher protocol | Concrete external provider integration and native execution |
+| GRPO text policy | Real native optimizer loop plus owned local HF worker, fixed reference, exact-answer reward and CPU/Gloo DP/PP/EP publication | Production-provider native integration, original independent numerical gates and released/full-size execution |
 | Full text-to-speech generation | Native controller and complete HF reference entry | Natural nonempty output for each media, EOS/caps/multi-turn |
 | Strict continuation | Data/media/processor and model/forward/scheduler contracts | Final-source positive and pre-mutation negative gates |
 
 Open implementation boundaries must not be relabelled as passing: speech
 training is CP=EP=PP=1; Thinker topology support does not imply Talker topology
-support. Speech FSDP training does not establish FSDP generation. GRPO currently
-optimizes text tokens, with caller-supplied rollout/reward/weight transport;
-RVQ/audio-policy RL and a deployed provider are not implemented. Generation
+support. Speech FSDP training does not establish FSDP generation. GRPO optimizes
+text tokens. `examples/omni_rl/local-hf/script.py` now connects actual native
+training to one owned local HF policy/reference worker, configurable local
+prompt/media input and exact-answer reward. Explicit CPU/Gloo transport supports
+native DP/PP/EP at CP1/HSDP1; it is not an external serving service. CPU HF/Adam
+continuation and Gloo shard/partition transport tests are distinct evidence.
+`omni_hf_provider.py` supplies the bounded w4/PP2/EP2 production CLI integration
+and strict fresh-process update gate; GPU execution is still NOT_RUN. The old
+`omni_posttraining.py` independent numerical oracle remains separately required.
+Released/full-size provider memory and execution are not established. RVQ/audio-
+policy RL and external reward/serving backends remain unsupported. Generation
 has no serializable KV/in-flight stream resume. Training checkpoint recovery
 does not validate interrupted generation. Padding/packing, every precision or
 optimizer, and changed-topology strict restore require their own explicit
