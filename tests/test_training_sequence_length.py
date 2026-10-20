@@ -39,7 +39,7 @@ def setup_entry(cp_size):
         FP8GroupedLinear=object(),
         GroupedLinear=object(),
         AutoConfig=SimpleNamespace(from_pretrained=lambda _: model_config),
-        model_class_for_config=lambda _, native_vision=False, native_video=False: construct,
+        model_class_for_config=lambda _, **flags: construct,
         resolve_text_model_config=resolve_text_model_config,
     )
     exec("from __future__ import annotations\n" + ast.unparse(function), namespace)
@@ -56,6 +56,8 @@ def test_model_entry_accepts_unsharded_and_valid_sharded_lengths(cp_size, length
         fp8=False,
         native_vision=False,
         native_video=False,
+        native_audio=False,
+        native_multimodal=False,
         model="fixture-config",
         sequence_length=length,
     )
@@ -85,6 +87,8 @@ def test_model_entry_rejects_uneven_multi_rank_cp_before_allocation(cp_size, len
         fp8=False,
         native_vision=False,
         native_video=False,
+        native_audio=False,
+        native_multimodal=False,
         model="fixture-config",
         sequence_length=length,
     )

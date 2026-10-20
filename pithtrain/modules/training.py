@@ -29,6 +29,7 @@ from pithtrain.models.qwen3_moe import Qwen3MoeModel
 from pithtrain.models.qwen3_omni_audio_model import Qwen3OmniMoeThinkerAudioModel
 from pithtrain.models.qwen3_omni_image import Qwen3OmniMoeThinkerImageModel
 from pithtrain.models.qwen3_omni_moe import Qwen3OmniMoeThinkerTextModel
+from pithtrain.models.qwen3_omni_multimodal import Qwen3OmniMoeThinkerMultimodalModel
 from pithtrain.models.qwen3_omni_video import Qwen3OmniMoeThinkerVideoModel
 from pithtrain.models.qwen35_moe import Qwen35MoeModel
 from pithtrain.modules.load_balance import force_balance, make_load_balance_loss_fn
@@ -150,6 +151,9 @@ class TrainingCfg(SlottedDefault):
     """
     Configuration for the model and how it is trained.
     """
+
+    native_multimodal: bool = False
+    """Joint native text/image/audio/video Thinker with fixed encoder collectives."""
 
     native_video: bool = False
     """Opt into native video-only Thinker input with temporal RoPE and DeepStack."""
@@ -418,14 +422,16 @@ def apply_fsdp(model, hsdp_replica: int = 1):
     return model
 
 
-def model_class_for_config(module_config, native_vision=False, native_audio=False, native_video=False):
+def model_class_for_config(module_config, native_vision=False, native_audio=False, native_video=False, native_multimodal=False):
     """Resolve a registered pipeline model before allocating any parameters."""
-    if sum((native_vision, native_audio, native_video)) > 1:
-        raise ValueError("Select one native image, audio or video mode")
-    if native_vision or native_audio or native_video:
+    if sum((native_vision, native_audio, native_video, native_multimodal)) > 1:
+        raise ValueError("Select one native image, audio, video or multimodal mode")
+    if native_vision or native_audio or native_video or native_multimodal:
         thinker = getattr(module_config, "thinker_config", module_config)
         if getattr(thinker, "model_type", None) != "qwen3_omni_moe_thinker":
             raise ValueError("Native media training requires a composite Omni Thinker config")
+        if native_multimodal:
+            return Qwen3OmniMoeThinkerMultimodalModel
         if native_audio:
             return Qwen3OmniMoeThinkerAudioModel
         return Qwen3OmniMoeThinkerVideoModel if native_video else Qwen3OmniMoeThinkerImageModel
@@ -473,11 +479,11 @@ def setup_model(
     # All models read their parallel groups from the distributed context directly.
     ModelClass = model_class_for_config(
         source_config, native_vision=cfg.native_vision, native_audio=cfg.native_audio,
-        native_video=cfg.native_video,
+        native_video=cfg.native_video, native_multimodal=cfg.native_multimodal,
     )
     selected_config = (
         getattr(source_config, "thinker_config", source_config)
-        if cfg.native_vision or cfg.native_audio or cfg.native_video
+        if cfg.native_vision or cfg.native_audio or cfg.native_video or cfg.native_multimodal
         else module_config
     )
     modules.append(ModelClass(selected_config, phase=0))
