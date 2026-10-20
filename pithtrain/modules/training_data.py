@@ -163,6 +163,8 @@ class OmniPretrainData:
 
         self.root, self.cfg = Path(cfg.dataset).resolve(), cfg
         self.is_text = list(cfg.modalities) == ["text"]
+        self._media_validator = None
+        self._media_model_config = None
         self.pp_rank, self.pp_size, self.pp_group = pp_rank, pp_size, pp_group
         if (
             type(pp_size) is not int
@@ -270,9 +272,24 @@ class OmniPretrainData:
         self.begin_step(step)
         if self._dense is not None:
             return self._dense.get_batch(step, device)
-        return self._media_microbatches(device)
+        # Each PP group first finishes its local read/broadcast protocol. Then
+        # agree globally before any rank enters model/EP collectives.
+        result, failure = None, None
+        try:
+            result = self._media_microbatches(device)
+        except Exception as error:
+            failure = f"{type(error).__name__}: {error}"
+        failures = [failure]
+        if dist.is_initialized():
+            failures = [None] * dist.get_world_size()
+            dist.all_gather_object(failures, failure)
+        if any(error is not None for error in failures):
+            raise RuntimeError(f"Global media batch rejected: {failures}")
+        return result
 
     def validate_model(self, model_class, model_config):
+        self._media_validator = getattr(model_class, "validate_media_batch", None)
+        self._media_model_config = getattr(model_config, "thinker_config", model_config)
         text_config = getattr(
             getattr(model_config, "thinker_config", model_config), "text_config", model_config
         )
@@ -383,6 +400,10 @@ class OmniPretrainData:
                 self._make_iterator()
             with torch.device("cpu"):
                 batch = next(self._iterator)
+            if self._media_validator is not None:
+                self._media_validator(
+                    batch.model_inputs["input_ids"], batch.model_inputs, self._media_model_config
+                )
             for name, value in batch.model_inputs.items():
                 destination = media_inputs if name in _MEDIA_INPUTS else shared
                 destination[name] = value.to(device, non_blocking=True).contiguous()
