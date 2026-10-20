@@ -231,3 +231,105 @@ def test_cpu_conversion_does_not_query_gpu(monkeypatch, tmp_path):
     new.gpu_before(
         ["python", "script.py", "dcp2hf"], tmp_path / "convert.log", {"CUDA_VISIBLE_DEVICES": ""}
     )
+
+
+@pytest.fixture
+def fake_arm(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    calls = []
+    plan = {"final_binding_path": str(tmp_path / "binding.json")}
+    Path(plan["final_binding_path"]).write_text("{}")
+    engine = SimpleNamespace(
+        PROFILES=((1, 1, 1),),
+        ARMS=("base0", "base1", "feat0"),
+        validate_arm=lambda *a: calls.append(("validate", a[-1])),
+        execute_arm=lambda *a: calls.append(("execute", a[3], a[-1])),
+        run_command=lambda *a: None,
+    )
+    monkeypatch.setattr(new, "engine_for_plan", lambda path: (engine, {}, plan))
+    monkeypatch.setenv("PITHTRAIN_RUN_OMNI_GPU_TESTS", "1")
+    args = argparse.Namespace(plan=tmp_path / "plan.json", profile="1,1,1", arm="feat0")
+    return args, engine, calls
+
+
+def test_single_arm_preserves_predecessor_order_and_deadline(fake_arm):
+    args, _, calls = fake_arm
+    before = new.time.monotonic()
+    new.run_one(args)
+    assert [call[:2] for call in calls] == [
+        ("validate", "base0"),
+        ("validate", "base1"),
+        ("execute", "feat0"),
+        ("validate", "feat0"),
+    ]
+    assert before < calls[2][2] <= new.time.monotonic() + 600
+    report = json.loads((args.plan.parent / "runs/w1-pp1-ep1/feat0/execution.json").read_text())
+    assert report["status"] == "COMPLETED_32_NATIVE_UPDATES"
+    assert report["timeout_seconds"] == 600
+    assert not (args.plan.parent / "runs/.sequential-arm-lock").exists()
+
+
+def test_incomplete_predecessor_does_not_launch_feature(fake_arm):
+    args, engine, calls = fake_arm
+
+    def reject(*a):
+        raise ValueError("Missing baseline report")
+
+    engine.validate_arm = reject
+    with pytest.raises(ValueError, match="Missing baseline report"):
+        new.run_one(args)
+    assert calls == []
+    assert not (args.plan.parent / "runs/.sequential-arm-lock").exists()
+
+
+def test_global_55_minute_bound_blocks_later_arm(fake_arm):
+    args, _, calls = fake_arm
+    out = args.plan.parent / "runs"
+    out.mkdir()
+    (out / "experiment-clock.json").write_text(
+        json.dumps(
+            {
+                "started_unix": new.time.time() - 3301,
+                "total_timeout_seconds": 3300,
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="55-minute experiment budget exhausted"):
+        new.run_one(args)
+    assert calls == []
+
+
+def test_arm_failure_retained_and_not_silently_retried(fake_arm):
+    args, engine, calls = fake_arm
+    args.arm = "base0"
+
+    def fail(*a):
+        calls.append(("failed-execution",))
+        raise RuntimeError("Worker failed")
+
+    engine.execute_arm = fail
+    with pytest.raises(RuntimeError, match="Worker failed"):
+        new.run_one(args)
+    report = json.loads((args.plan.parent / "runs/w1-pp1-ep1/base0/execution.json").read_text())
+    assert report["status"] == "FAILED_OR_INTERRUPTED"
+    with pytest.raises(FileExistsError):
+        new.run_one(args)
+    assert calls == [("failed-execution",)]
+
+
+def test_parallel_attempt_preserves_active_lock(fake_arm):
+    args, _, calls = fake_arm
+    lock = args.plan.parent / "runs/.sequential-arm-lock"
+    lock.mkdir(parents=True)
+    with pytest.raises(FileExistsError):
+        new.run_one(args)
+    assert lock.is_dir() and calls == []
+
+
+def test_gpu_opt_in_required_before_running_arm(fake_arm, monkeypatch):
+    args, _, calls = fake_arm
+    monkeypatch.delenv("PITHTRAIN_RUN_OMNI_GPU_TESTS")
+    with pytest.raises(ValueError, match="GPU opt-in"):
+        new.run_one(args)
+    assert calls == []
