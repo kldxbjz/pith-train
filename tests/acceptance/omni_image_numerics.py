@@ -44,6 +44,54 @@ def eager_visual_forward(self, hidden_states, lengths, position_embeddings):
     return self.proj(torch.cat(outputs).reshape(hidden_states.shape))
 
 
+def eager_text_forward(self, hidden_states, rotary_posemb, cu_seqlens=None):
+    """Diagnostic only: HF eager arithmetic in place of native FA4 attention."""
+    assert cu_seqlens is None
+    b, length, _ = hidden_states.shape
+    q = self.q_norm(self.q_proj(hidden_states).view(b, length, self.num_heads, self.head_dim))
+    k = self.k_norm(self.k_proj(hidden_states).view(b, length, self.num_kv_heads, self.head_dim))
+    v = self.v_proj(hidden_states).view(b, length, self.num_kv_heads, self.head_dim)
+    cos, sin = (value.unsqueeze(2) for value in rotary_posemb)
+    q = q * cos + self.rotate_half(q) * sin
+    k = k * cos + self.rotate_half(k) * sin
+    q, k, v = (x.transpose(1, 2) for x in (q, k, v))
+    k, v = (x.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1) for x in (k, v))
+    scores = (q @ k.transpose(-2, -1)) * self.scaling
+    mask = torch.full(
+        (length, length), torch.finfo(q.dtype).min, dtype=q.dtype, device=q.device
+    ).triu(1)
+    probabilities = (scores + mask).softmax(dim=-1, dtype=torch.float32).to(q.dtype)
+    output = (probabilities @ v).transpose(1, 2).contiguous()
+    return self.o_proj(output.reshape(b, length, -1))
+
+
+def local_expert_checks(native, reference, snapshots):
+    """Identical actual normalized inputs, weights, and free routing; local kernel diagnosis."""
+    reports = {}
+    for index, native_layer in enumerate(native.layers.values()):
+        left, right = native_layer.mlp, reference.model.layers[index].mlp
+        source = snapshots[f"layer.{index}.router"]["input"]
+        a = source.detach().clone().unsqueeze(0).requires_grad_()
+        b = source.detach().clone().unsqueeze(0).requires_grad_()
+        output = left.reference_forward(a)
+        target = right(b)
+        probe = torch.linspace(-1, 1, output.numel(), device=output.device).reshape_as(output)
+        params, expected = dict(left.named_parameters()), dict(right.named_parameters())
+        assert params.keys() == expected.keys()
+        gradients = torch.autograd.grad((output.float() * probe).sum(), [a, *params.values()])
+        targets = torch.autograd.grad((target.float() * probe).sum(), [b, *expected.values()])
+        reports[str(index)] = dict(
+            output_error=error_ratio(output, target),
+            gradient_errors={
+                name: error_ratio(actual, expected)
+                for name, actual, expected in zip(
+                    ["input", *params], gradients, targets, strict=True
+                )
+            },
+        )
+    return reports
+
+
 def capture_modules(model, reference):
     """Hooks observe tensors only; neither their values nor route selection changes."""
     snapshots, handles = {}, []
@@ -135,14 +183,18 @@ def probe(args, variant):
     with torch.no_grad():
         for name, p in actual.items():
             p.copy_(expected[name])
-    if variant == "visual-eager":
+    if variant in ("visual-eager", "all-eager"):
         for block in native.visual.blocks:
             block.attn.forward = MethodType(eager_visual_forward, block.attn)
+    if variant in ("text-eager", "all-eager"):
+        for layer in native.layers.values():
+            layer.self_attn.forward = MethodType(eager_text_forward, layer.self_attn)
     snapshots, handles = capture_modules(native, False)
     ref_snapshots, ref_handles = capture_modules(reference, True)
     opt = torch.optim.AdamW(native.parameters(), lr=1e-4, weight_decay=0)
     ref_opt = torch.optim.AdamW(reference.parameters(), lr=1e-4, weight_decay=0)
     reports = []
+    expert_checks = None
     count = sum(int((b.labels != -100).sum()) for b in batches)
     for step in range(args.steps):
         losses, refs, logits_errors, layers = [], [], [], []
@@ -153,6 +205,11 @@ def probe(args, variant):
             target = reference(inputs)
             logits_errors.append(error_ratio(logits, target))
             layers.append(compare_snapshots(snapshots, ref_snapshots))
+            if expert_checks is None:
+                expert_checks = local_expert_checks(native, reference, ref_snapshots)
+                print(
+                    json.dumps(dict(variant=variant, local_expert_checks=expert_checks)), flush=True
+                )
             losses.append(
                 F.cross_entropy(logits.float().flatten(0, 1), labels.flatten(), reduction="sum")
                 / count
@@ -201,14 +258,22 @@ def probe(args, variant):
         ref_opt.zero_grad(set_to_none=True)
     for handle in handles + ref_handles:
         handle.remove()
-    return dict(status="DIAGNOSTIC_ONLY", variant=variant, commit=commit(), steps=reports)
+    return dict(
+        status="DIAGNOSTIC_ONLY",
+        variant=variant,
+        commit=commit(),
+        steps=reports,
+        local_expert_checks=expert_checks,
+    )
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--variant", choices=("baseline", "visual-eager"), required=True)
+    parser.add_argument(
+        "--variant", choices=("baseline", "visual-eager", "text-eager", "all-eager"), required=True
+    )
     parser.add_argument("--steps", type=int, choices=range(1, 5), default=4)
     args = parser.parse_args()
     assert not args.output.exists(), "Use a new diagnostic evidence file"
