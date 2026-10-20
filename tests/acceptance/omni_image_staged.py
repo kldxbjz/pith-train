@@ -50,6 +50,8 @@ def run(
     pixel_key="pixel_values",
     training_flag="native_vision",
     sequence_length=512,
+    hf_name_fn=hf_name,
+    training_groups_fn=training_groups,
 ):
     from pithtrain.contexts import distributed, training
     from pithtrain.modules.distributed import setup_distributed
@@ -76,6 +78,7 @@ def run(
     assert (modality, pixel_key, training_flag) in {
         ("image", "pixel_values", "native_vision"),
         ("video", "pixel_values_videos", "native_video"),
+        ("audio", "input_features", "native_audio"),
     }
     setattr(t, training_flag, True)
     t.fp8, t.moe_load_balance_coef = False, 0.0
@@ -107,7 +110,7 @@ def run(
     actual = {}
     for module in training.model.module:
         for name, parameter in module.named_parameters():
-            key = hf_name(name)
+            key = hf_name_fn(name)
             assert key not in actual and key in expected, key
             actual[key] = parameter
             with torch.no_grad():
@@ -177,7 +180,7 @@ def run(
     for optimizer in training.optimizers:
         optimizer.step()
     updated = [n for n, p in actual.items() if not torch.equal(before[n], local_tensor(p))]
-    groups = training_groups(config)
+    groups = training_groups_fn(config)
     modules = module_update_evidence(actual, before, groups, reduce=dist.all_reduce)
     for optimizer in training.optimizers:
         optimizer.zero_grad(set_to_none=True)
@@ -220,6 +223,8 @@ def run(
         rank=rank,
         pp=args.pp,
         ep=args.ep,
+        dp=distributed.dp_size,
+        cp=1,
         scenario=args.scenario,
         target_layout=layout,
         target_partitions=partitions,
