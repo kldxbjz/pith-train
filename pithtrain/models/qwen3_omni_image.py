@@ -33,7 +33,8 @@ class Qwen3OmniMoeThinkerImageDecoderLayer(Qwen3OmniMoeThinkerTextDecoderLayer):
         dispatch, residual, routing = super().forward_stage1(hidden, rotary_posemb, cu_seqlens)
         return dispatch, torch.cat((residual, lanes), -1), routing
 
-    @torch.compile(fullgraph=True)
+    # Preserve explicit BF16 rounding at residual, routing and DeepStack boundaries.
+    @torch.compile(fullgraph=True, options={"emulate_precision_casts": True})
     def forward_stage5(self, moe_outs, moe_local_idxs, topk_weight, residual):
         hidden, lanes = (
             residual[..., : self.text_hidden_size],
