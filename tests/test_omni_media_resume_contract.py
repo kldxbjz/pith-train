@@ -182,3 +182,142 @@ def test_gradient_diagnostics_report_all_parameters_and_missing_gradients():
     assert set(failure.value.diagnostics) == {"exact", "missing"}
     assert failure.value.diagnostics["exact"]["status"] == "PASSED"
     assert failure.value.diagnostics["missing"]["actual_missing"] is True
+
+
+@pytest.mark.parametrize(
+    "component,modalities,flag,prefixes",
+    [
+        ("audio", ("audio",), "native_audio", ("audio_tower.",)),
+        ("video", ("video",), "native_video", ("visual.",)),
+        (
+            "multimodal",
+            ("text", "image", "audio", "video"),
+            "native_multimodal",
+            ("audio_tower.", "visual."),
+        ),
+    ],
+)
+def test_component_cli_and_source_contract(tmp_path, component, modalities, flag, prefixes):
+    from tests.acceptance.omni_media_resume import component_spec, reader_config
+
+    args = parse_args(
+        [
+            "--component",
+            component,
+            "--mode",
+            "prepare",
+            "--dataset",
+            str(tmp_path / "data"),
+            "--output",
+            str(tmp_path / "out"),
+            "--world-size",
+            "4",
+            "--pp",
+            "2",
+            "--ep",
+            "2",
+        ]
+    )
+    spec = component_spec(args.component)
+    contract = spec.contract()
+    assert spec.modalities == modalities and spec.training_flag == flag
+    assert spec.required_components == prefixes
+    assert contract["epoch_samples"] == 32 and contract["seed"] == 1234
+    assert all(len(value) == 64 for value in contract["sources"].values())
+    data, training = reader_config(args.dataset, spec)
+    assert data.modalities == modalities and data.epoch_samples == 32
+    assert training.seed == 1234 and training.sequence_length == 2048
+    assert training.global_batch_size == 8 and training.micro_batch_size == 1
+    assert callable(spec.validate_inputs)
+
+
+def test_named_mixed_fixtures_retain_all_six_classes_without_iteration_loss():
+    from tests.acceptance.omni_media_resume import component_spec, fixture_batches
+
+    inputs = {name: object() for name in ("text", "image", "audio", "video", "av", "all")}
+    actual = fixture_batches(component_spec("multimodal"), inputs)
+    assert actual.keys() == inputs.keys()
+    assert all(actual[name] is inputs[name] for name in inputs)
+
+
+@pytest.mark.parametrize("missing", ("text", "image", "audio", "video", "av", "all"))
+def test_mixed_prepare_cannot_omit_any_fixture_class(missing):
+    from tests.acceptance.omni_media_resume import component_spec, fixture_batches
+
+    inputs = {name: object() for name in ("text", "image", "audio", "video", "av", "all")}
+    del inputs[missing]
+    with pytest.raises(AssertionError, match="six input classes"):
+        fixture_batches(component_spec("multimodal"), inputs)
+
+
+def test_single_component_list_fixtures_keep_every_batch():
+    from tests.acceptance.omni_media_resume import fixture_batches
+
+    first, second = object(), object()
+    assert fixture_batches(audio_spec(), [first, second]) == {"0": first, "1": second}
+
+
+@pytest.mark.parametrize("missing", ("audio", "visual"))
+def test_global_production_step_requires_both_tower_inputs(missing):
+    from tests.acceptance.omni_media_resume import require_input_components
+
+    audio = SimpleNamespace(media_inputs={"input_features": torch.ones(1)})
+    visual = SimpleNamespace(media_inputs={"pixel_values_videos": torch.ones(1)})
+    text = SimpleNamespace(media_inputs=None)
+    with pytest.raises(AssertionError, match="No production input"):
+        require_input_components(
+            [text, visual if missing == "audio" else audio], ("audio_tower.", "visual.")
+        )
+    # Component coverage is global, not a per-DP-rank or per-microbatch constraint.
+    require_input_components([text, audio, visual], ("audio_tower.", "visual."))
+
+
+@pytest.mark.parametrize("field", ["audio", "image", "video", "av-layout"])
+def test_complete_thinker_next_input_observation_detects_any_tower_or_av_change(field):
+    batch = microbatch()
+    batch.media_inputs.update(pixel_values=torch.ones(1, 4), pixel_values_videos=torch.ones(2, 4))
+    batch.model_context["video_second_per_grid"] = torch.tensor([0.5])
+    observed = ObservedMediaData(SimpleNamespace(get_batch=lambda *args: [batch]))
+    observed.get_batch(0, "cpu")
+    if field == "av-layout":
+        batch.model_context["video_second_per_grid"][0] = 0.75
+    else:
+        key = {"audio": "input_features", "image": "pixel_values", "video": "pixel_values_videos"}[
+            field
+        ]
+        batch.media_inputs[key].fill_(2)
+    observed.get_batch(1, "cpu")
+    with pytest.raises(AssertionError):
+        equal(observed.batches[0], observed.batches[1])
+
+
+def test_component_groups_include_both_towers_every_layer_and_deepstack():
+    from tests.acceptance.omni_media_resume import component_spec
+
+    config = SimpleNamespace(
+        text_config=SimpleNamespace(num_hidden_layers=4),
+        audio_config=SimpleNamespace(encoder_layers=2),
+        vision_config=SimpleNamespace(depth=3, deepstack_visual_indexes=[0, 2]),
+    )
+    groups = component_spec("multimodal").training_groups(config)
+    for name in (
+        "audio_tower.conv2d1.weight",
+        "audio_tower.conv2d2.weight",
+        "audio_tower.conv2d3.weight",
+        "audio_tower.conv_out.weight",
+        "audio_tower.ln_post.weight",
+        "audio_tower.proj1.weight",
+        "audio_tower.proj2.weight",
+        "visual.patch_embed.weight",
+        "visual.pos_embed.weight",
+        "visual.merger.weight",
+        "visual.merger_list.0.weight",
+        "visual.merger_list.1.weight",
+        *(f"audio_tower.layers.{i}.weight" for i in range(2)),
+        *(f"visual.blocks.{i}.weight" for i in range(3)),
+        *(f"model.layers.{i}.weight" for i in range(4)),
+        "model.embed_tokens.weight",
+        "model.norm.weight",
+        "lm_head.weight",
+    ):
+        assert len([group for group in groups if name.startswith(group)]) == 1, name
