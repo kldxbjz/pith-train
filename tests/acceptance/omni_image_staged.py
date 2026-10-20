@@ -166,7 +166,9 @@ def run(
         loss = F.cross_entropy(logits.float().flatten(0, 1), labels.flatten(), reduction="sum")
         loss.backward()
         hf_loss += loss.detach()
-    reference.normalize_gradients_(count)
+    # global_target_count returns FP32 for native loss/gradient division. The
+    # independently counted integer layout was checked against every rank above.
+    reference.normalize_gradients_(layout["global_target_count"])
     hf_loss = hf_loss / count
     outputs = training.model.step(microbatches, pretrain_lm.objective)
     if distributed.pp_rank == 0:
