@@ -81,3 +81,28 @@ def test_production_scheduler_factory_binds_all_arguments(factory_name, monkeypa
     assert left != right
     assert left["identity"]["factory"]["identity"]["arguments"]["s:max_steps"] == 10
     assert right["identity"]["factory"]["identity"]["arguments"]["s:max_steps"] == 20
+
+
+@pytest.mark.parametrize(
+    "left,right",
+    [({1: 0.5}, {"1": 0.5}), ((0.5,), [0.5]), ({1: 0.5, "1": 0.1}, {"1": 0.1})],
+)
+def test_callable_contract_preserves_container_and_mapping_key_types(left, right):
+    def factory(value):
+        return lambda step: value
+
+    assert callable_contract(factory(left)) != callable_contract(factory(right))
+    assert callable_contract(factory(left)) == callable_contract(factory(left))
+
+
+def test_scheduler_mapping_key_change_cannot_share_policy_contract():
+    def make(table):
+        return lambda step: table.get(step, 1.0)
+
+    parameter = torch.nn.Parameter(torch.ones(1))
+    optimizer = torch.optim.AdamW([parameter], lr=0.02)
+    integer = torch.optim.lr_scheduler.LambdaLR(optimizer, make({1: 0.5}))
+    textual = torch.optim.lr_scheduler.LambdaLR(optimizer, make({"1": 0.5}))
+    assert integer.lr_lambdas[0](1) == 0.5
+    assert textual.lr_lambdas[0](1) == 1.0
+    assert scheduler_contract(integer) != scheduler_contract(textual)

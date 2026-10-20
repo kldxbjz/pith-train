@@ -1,6 +1,8 @@
 """CPU fail-closed tests for final-commit binding of the frozen noise engine."""
 
 import argparse
+import ast
+import copy
 import json
 import subprocess
 from pathlib import Path
@@ -347,4 +349,217 @@ def test_common_numerical_optin_cannot_change(binding, replacement):
     p = args.base_repo / "pithtrain/modules/training.py"
     p.write_text(p.read_text().replace("deterministic: bool = False", replacement))
     with pytest.raises(ValueError, match="Common deterministic config"):
+        new.common_audit(args.base_repo, args.feature_repo)
+
+
+@pytest.fixture
+def reviewed_binding(binding):
+    """Use actual reviewed source, reconstructing the hash-pinned original ASTs.
+
+    No external checkout or GPU is needed in CI. The two reconstructed baseline
+    functions must match the independently recorded 1611d085 function hashes.
+    """
+    args, _ = binding
+    path = "pithtrain/modules/training.py"
+    current = new.ROOT / path
+    feature_nodes = {
+        name: new.function_node(current, name) for name in ("make_wsd_scheduler", "apply_fsdp")
+    }
+    originals = copy.deepcopy(feature_nodes)
+    wsd = originals["make_wsd_scheduler"]
+    wsd.body[-2:] = [ast.Return(value=copy.deepcopy(wsd.body[-1].value.args[0]))]
+    fsdp = originals["apply_fsdp"]
+    loop = next(n for n in fsdp.body if isinstance(n, ast.For))
+    # The exact baseline edge loop is independently pinned as part of the entire
+    # function, not accepted merely because the production projection accepts it.
+    loop.body[1:3] = ast.parse(new.OLD_FSDP_EDGE).body
+    assert new.ast_digest(wsd) == new.WSD_BASE_AST
+    assert new.ast_digest(fsdp) == new.FSDP_BASE_AST
+    for repo, nodes in ((args.base_repo, originals), (args.feature_repo, feature_nodes)):
+        source = (repo / path).read_text()
+        for name, node in nodes.items():
+            source = source.replace(f"def {name}(): return 0", ast.unparse(node))
+        (repo / path).write_text(source)
+    for name in (
+        "pithtrain/modules/resume_semantics.py",
+        "pithtrain/models/qwen3_omni_talker_pipeline.py",
+    ):
+        target = args.feature_repo / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((new.ROOT / name).read_bytes())
+    return args
+
+
+def test_actual_reviewed_function_binding_and_roundtrip(reviewed_binding, monkeypatch):
+    args = reviewed_binding
+    monkeypatch.setattr(new, "BASE_SHA", commit(args.base_repo, "exact reviewed baseline ASTs"))
+    args.expected_feature_commit = commit(args.feature_repo, "exact reviewed feature ASTs")
+    args.output = args.output.with_name("reviewed-binding.json")
+    new.create_binding(args)
+    bound = new.load_binding(args.output)
+    audit = bound["source_audit"]
+    assert len(audit["identical_functions"]) == 9
+    assert len(audit["scoped_equivalent_functions"]) == 2
+    for report in audit["scoped_equivalent_functions"].values():
+        assert report["raw_ast_equal"] is False
+        assert report["baseline_function_ast_sha256"] == report["projected_function_ast_sha256"]
+    assert bound["numerical_execution"] == "NOT_RUN"
+    assert bound["settings"]["steps"] == 32 and len(bound["profiles"]) == 5
+
+
+@pytest.mark.parametrize(
+    "before,after,error",
+    [
+        ("return 1.0", "return 0.5", "feature make_wsd_scheduler"),
+        ("LambdaLR(opt, lr_lambda)", "LambdaLR(opt, lambda _: 1.0)", "feature make_wsd_scheduler"),
+        ("start_lr=start_lr", "start_lr=0.0", "feature make_wsd_scheduler"),
+        ("reduce_dtype=torch.float32", "reduce_dtype=torch.bfloat16", "feature apply_fsdp"),
+        (
+            "set_gradient_divide_factor(1.0)",
+            "set_gradient_divide_factor(2.0)",
+            "feature apply_fsdp",
+        ),
+        ("reshard_after_forward=True", "reshard_after_forward=False", "feature apply_fsdp"),
+        ('name != "layers"', 'name != "changed"', "feature apply_fsdp"),
+    ],
+)
+def test_reviewed_numerical_or_constructor_drift_rejected(reviewed_binding, before, after, error):
+    args = reviewed_binding
+    p = args.feature_repo / "pithtrain/modules/training.py"
+    source = p.read_text()
+    # ast.unparse uses single quotes; normalize the one string-expression case.
+    before, after = before.replace('"', "'"), after.replace('"', "'")
+    assert before in source
+    p.write_text(source.replace(before, after, 1))
+    with pytest.raises(ValueError, match=error):
+        new.common_audit(args.base_repo, args.feature_repo)
+
+
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        ("scheduler._pith_factory_contract = contract", "scheduler.base_lrs = [0.0]"),
+        ("return schedulers", "return schedulers[::-1]"),
+        ('separators=(",", ":")', 'separators=(", ", ":")'),
+        ("Path(source).read_bytes()", "b'changed implementation'"),
+        ("return str(value)", "return 'changed canonical value'"),
+        ("import hashlib", "import json as hashlib"),
+    ],
+)
+def test_metadata_helper_dependencies_are_not_a_waiver(reviewed_binding, before, after):
+    args = reviewed_binding
+    p = args.feature_repo / "pithtrain/modules/resume_semantics.py"
+    source = p.read_text()
+    assert before in source
+    p.write_text(source.replace(before, after, 1))
+    with pytest.raises(ValueError, match="Scheduler metadata helper changed"):
+        new.common_audit(args.base_repo, args.feature_repo)
+
+
+def test_metadata_helper_rebinding_rejected(reviewed_binding):
+    args = reviewed_binding
+    p = args.feature_repo / "pithtrain/modules/resume_semantics.py"
+    p.write_text(p.read_text() + "\nbind_scheduler_factory = lambda *args: ()\n")
+    with pytest.raises(ValueError, match="Scheduler metadata helper changed"):
+        new.common_audit(args.base_repo, args.feature_repo)
+
+
+def test_unrelated_contract_body_does_not_claim_numerical_change(reviewed_binding):
+    args = reviewed_binding
+    p = args.feature_repo / "pithtrain/modules/resume_semantics.py"
+    tree = ast.parse(p.read_text())
+    function = next(n for n in tree.body if getattr(n, "name", None) == "callable_contract")
+    function.body.append(
+        ast.Raise(exc=ast.Call(func=ast.Name(id="RuntimeError"), args=[], keywords=[]))
+    )
+    p.write_text(ast.unparse(ast.fix_missing_locations(tree)))
+    assert (
+        len(new.common_audit(args.base_repo, args.feature_repo)["scoped_equivalent_functions"]) == 2
+    )
+
+
+def test_unrelated_contract_decorator_cannot_rebind_helper(reviewed_binding):
+    args = reviewed_binding
+    p = args.feature_repo / "pithtrain/modules/resume_semantics.py"
+    p.write_text(
+        p.read_text().replace("def callable_contract", "@unsafe_rebind\ndef callable_contract")
+    )
+    with pytest.raises(ValueError, match="Scheduler metadata helper changed"):
+        new.common_audit(args.base_repo, args.feature_repo)
+
+
+def test_changed_talker_edge_selector_still_requires_review(reviewed_binding):
+    args = reviewed_binding
+    p = args.feature_repo / "pithtrain/models/qwen3_omni_talker_pipeline.py"
+    tree = ast.parse(p.read_text())
+    owner = next(n for n in tree.body if getattr(n, "name", None) == "Qwen3OmniMoeTalkerTextModel")
+    method = next(n for n in owner.body if getattr(n, "name", None) == "fsdp_edge_modules")
+    method.body = [ast.Return(value=ast.Tuple(elts=[], ctx=ast.Load()))]
+    p.write_text(ast.unparse(ast.fix_missing_locations(tree)))
+    with pytest.raises(ValueError, match="Talker FSDP edge selector changed"):
+        new.common_audit(args.base_repo, args.feature_repo)
+
+
+@pytest.mark.parametrize("shape", ["cosine", "linear"])
+def test_metadata_wrapper_preserves_actual_cpu_lr_sequence(reviewed_binding, shape):
+    import math
+    from types import SimpleNamespace
+
+    import torch
+
+    args = reviewed_binding
+    rates, schedulers = [], []
+    for repo in (args.base_repo, args.feature_repo):
+        path = repo / "pithtrain/modules/training.py"
+        node = new.function_node(path, "make_wsd_scheduler")
+        parameter = torch.nn.Parameter(torch.ones(1))
+        optimizer = torch.optim.AdamW([parameter], lr=1e-4)
+        namespace = {
+            "__name__": __name__,
+            "math": math,
+            "Literal": __import__("typing").Literal,
+            "TrainingCfg": SimpleNamespace,
+            "LRScheduler": torch.optim.lr_scheduler.LRScheduler,
+            "LambdaLR": torch.optim.lr_scheduler.LambdaLR,
+            "training": SimpleNamespace(optimizers=(optimizer,)),
+        }
+        exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
+        (scheduler,) = namespace["make_wsd_scheduler"](
+            SimpleNamespace(lr=1e-4, max_steps=32),
+            start_lr=1e-6,
+            warmup_ratio=0.25,
+            final_lr=1e-7,
+            decay_ratio=0.25,
+            decay_shape=shape,
+        )
+        sequence = [scheduler.get_last_lr()]
+        for _ in range(32):
+            optimizer.step()
+            scheduler.step()
+            sequence.append(scheduler.get_last_lr())
+        rates.append(sequence)
+        schedulers.append(scheduler)
+    assert rates[0] == rates[1]
+    assert not hasattr(schedulers[0], "_pith_factory_contract")
+    assert schedulers[1]._pith_factory_contract["identity"]["arguments"]["s:max_steps"] == 32
+
+
+@pytest.mark.parametrize(
+    "before,after,error",
+    [
+        ("return 1.0", "return 0.5", "baseline make_wsd_scheduler"),
+        (
+            "set_gradient_divide_factor(1.0)",
+            "set_gradient_divide_factor(2.0)",
+            "baseline apply_fsdp",
+        ),
+    ],
+)
+def test_reviewed_baseline_drift_rejected(reviewed_binding, before, after, error):
+    args = reviewed_binding
+    p = args.base_repo / "pithtrain/modules/training.py"
+    source = p.read_text()
+    assert before in source
+    p.write_text(source.replace(before, after, 1))
+    with pytest.raises(ValueError, match=error):
         new.common_audit(args.base_repo, args.feature_repo)
