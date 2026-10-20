@@ -151,14 +151,14 @@ def encoder_gate(config, device):
 
 
 class HFReference(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, dtype=torch.bfloat16):
         super().__init__()
         self.config = copy.deepcopy(config)
         self.config.text_config._attn_implementation = "eager"
         self.config.audio_config._attn_implementation = "eager"
         previous = torch.get_default_dtype()
         try:
-            torch.set_default_dtype(torch.bfloat16)
+            torch.set_default_dtype(dtype)
             with torch.device("cpu"), torch.random.fork_rng(devices=[]):
                 torch.manual_seed(739)
                 self.audio_tower = HFAudio(self.config.audio_config)
