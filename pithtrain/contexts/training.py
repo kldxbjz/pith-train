@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
-    import torch.nn as nn
     from torch.optim import Optimizer
     from torch.optim.lr_scheduler import LRScheduler
 
@@ -32,7 +31,7 @@ This and the two class bindings below are read from module constructors and kern
 configuration object, so they live here rather than being passed down.
 """
 
-Linear: type[nn.Linear | linear.FP8Linear]
+Linear: type[linear.BF16Linear | linear.FP8Linear]
 """
 The dense linear class the models construct.
 """
@@ -55,4 +54,14 @@ The optimizers stepping this model, one per parameter class under Muon.
 schedulers: tuple[LRScheduler, ...]
 """
 One learning-rate scheduler per optimizer, in the same order.
+"""
+
+current_microbatch: int | None = None
+"""
+Index into the micro-batch list of the step in flight, or None outside a step.
+
+Routing replay reads it to find which micro-batch a gate call belongs to, which the model cannot
+tell from the layer alone: DualPipeV interleaves a rank's two chunks across micro-batches. It is
+set before each forward only, which suffices because the backward replays the saved graph without
+re-entering module code.
 """

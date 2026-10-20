@@ -9,7 +9,11 @@ from transformers.models.gpt_oss.configuration_gpt_oss import GptOssConfig
 
 from pithtrain.contexts import distributed, training
 from pithtrain.models.interface import RoutingInfo
-from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
+from pithtrain.modules.load_balance import (
+    MoELoadBalanceLossInjector,
+    MoELoadBalanceLossTracker,
+    replay_indices,
+)
 from pithtrain.operators.clamped_swiglu import clamped_swiglu
 from pithtrain.operators.deepgemm_quantize import fp8cast_blockwise_transpose_batched
 from pithtrain.operators.ep_dispatch import prepare_dispatch
@@ -17,6 +21,7 @@ from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen
 from pithtrain.operators.fp8_weight_cache import FP8WeightCacheControl
 from pithtrain.operators.grouped_linear import FP8GroupedLinearFunc, GroupedLinearFunc
 from pithtrain.operators.indexed_bias_add import indexed_bias_add
+from pithtrain.operators.linear import BF16Linear
 from pithtrain.operators.token_scatter import (
     padded_index_gather,
     precompute_group_indices,
@@ -171,13 +176,13 @@ class GptOssTopKRouter(nn.Module):
 
     @torch.compile(fullgraph=True)
     def forward(
-        self, hidden_states: torch.Tensor
+        self, hidden_states: torch.Tensor, replay_idx: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         logits = F.linear(hidden_states, self.weight, self.bias)
         topk_logits, topk_idx = torch.topk(logits, k=self.num_experts_per_tok, dim=-1, sorted=True)
-        if self.router_replay is not None:
-            topk_idx = self.router_replay(topk_idx)
+        if replay_idx is not None:
+            topk_idx = replay_idx
             topk_logits = logits.gather(-1, topk_idx)
         topk_weight = F.softmax(topk_logits, dim=-1, dtype=torch.float32)
         if self.load_balance_loss_fn is None:
@@ -202,7 +207,8 @@ class GptOssMoE(nn.Module):
 
     def reference_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
-        topk_idx, topk_weight, lb_loss = self.router(hidden_states)
+        replay_idx = replay_indices(self.router, hidden_states, self.num_experts_per_tok)
+        topk_idx, topk_weight, lb_loss = self.router(hidden_states, replay_idx)
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
         hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
@@ -301,7 +307,8 @@ class GptOssDecoderLayer(nn.Module):
         cu_seqlens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, RoutingInfo | None]:
         hidden_states, residual = self.forward_stage1_compute(hidden_states, rotary_posemb, cu_seqlens)  # fmt: skip
-        topk_idx, topk_weight, lb_loss = self.mlp.router(hidden_states)
+        replay_idx = replay_indices(self.mlp.router, hidden_states, self.mlp.num_experts_per_tok)
+        topk_idx, topk_weight, lb_loss = self.mlp.router(hidden_states, replay_idx)
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
         dispatch_tokens, routing = prepare_dispatch(hidden_states, topk_idx, topk_weight, self.mlp.num_experts, distributed.ep_size, self.mlp.experts_per_rank, distributed.ep_group)  # fmt: skip
@@ -384,7 +391,7 @@ class GptOssModel(nn.Module):
             self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         if stage_index == stage_count - 1:
             self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+            self.lm_head = BF16Linear(config.hidden_size, config.vocab_size, bias=False)
         self.layers = nn.ModuleDict(
             {
                 str(i): GptOssDecoderLayer(config, i)

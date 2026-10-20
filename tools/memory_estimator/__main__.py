@@ -213,6 +213,14 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.fp8_training != "disabled":
+        print(
+            "Warning: --fp8-training is set, but the estimator does not model FP8 overhead "
+            "(quantized weight and input tensor caches). The estimate below is a lower bound "
+            "and real usage will be higher.",
+            file=sys.stderr,
+        )
+
     # Load model config
     model_cfg = ModelConfig.from_json(args.model)
 
