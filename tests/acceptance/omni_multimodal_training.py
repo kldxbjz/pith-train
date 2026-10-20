@@ -41,6 +41,7 @@ from tests.acceptance.omni_image_staged import expected_shard, local_tensor
 from tests.acceptance.omni_image_training import REPO, commit, error_ratio, tensor_hash
 from tests.acceptance.omni_image_training import HFReference as ImageReference
 from tests.acceptance.omni_native_resume import equal
+from tests.acceptance.omni_optimizer_probe import isolated_optimizer_probe
 from tests.acceptance.omni_reference_attention import (
     add_reference_attention_argument,
     configure_reference_attention,
@@ -442,11 +443,13 @@ def staged(args):
         errors[name] = error_ratio(local_tensor(parameter.grad), local_tensor(target))
         assert errors[name] < 1e-2, (name, errors[name])
     before = {name: local_tensor(param).detach().clone() for name, param in actual.items()}
-    for optimizer in training.optimizers:
-        optimizer.step()
-    updates = module_update_evidence(
-        actual, before, component_groups(config), reduce=dist.all_reduce
-    )
+    with isolated_optimizer_probe(training.model, lambda: make_adamw_optimizer(t)) as probes:
+        for optimizer in probes:
+            optimizer.step()
+        updates = module_update_evidence(
+            actual, before, component_groups(config), reduce=dist.all_reduce
+        )
+    del probes, optimizer
     for optimizer in training.optimizers:
         optimizer.zero_grad(set_to_none=True)
     contract, checkpoint = resume_contract(cfg), args.output / "checkpoint"

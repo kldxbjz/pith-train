@@ -26,6 +26,7 @@ from tests.acceptance.omni_image_training import (
     hf_name,
     source_inputs,
 )
+from tests.acceptance.omni_optimizer_probe import isolated_optimizer_probe
 from tests.acceptance.omni_reference_attention import (
     configure_reference_attention,
     reference_contract,
@@ -189,11 +190,13 @@ def run(
         errors[key] = error_ratio(local_tensor(parameter.grad), local_tensor(target))
         assert errors[key] < 1e-2, (key, errors[key])
     before = {n: local_tensor(p).detach().clone() for n, p in actual.items()}
-    for optimizer in training.optimizers:
-        optimizer.step()
-    updated = [n for n, p in actual.items() if not torch.equal(before[n], local_tensor(p))]
-    groups = training_groups_fn(config)
-    modules = module_update_evidence(actual, before, groups, reduce=dist.all_reduce)
+    with isolated_optimizer_probe(training.model, lambda: make_adamw_optimizer(t)) as probes:
+        for optimizer in probes:
+            optimizer.step()
+        updated = [n for n, p in actual.items() if not torch.equal(before[n], local_tensor(p))]
+        groups = training_groups_fn(config)
+        modules = module_update_evidence(actual, before, groups, reduce=dist.all_reduce)
+    del probes, optimizer
     for optimizer in training.optimizers:
         optimizer.zero_grad(set_to_none=True)
     zero = [
