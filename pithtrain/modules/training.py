@@ -30,6 +30,7 @@ from pithtrain.models.qwen3_omni_audio_model import Qwen3OmniMoeThinkerAudioMode
 from pithtrain.models.qwen3_omni_image import Qwen3OmniMoeThinkerImageModel
 from pithtrain.models.qwen3_omni_moe import Qwen3OmniMoeThinkerTextModel
 from pithtrain.models.qwen3_omni_multimodal import Qwen3OmniMoeThinkerMultimodalModel
+from pithtrain.models.qwen3_omni_talker_pipeline import Qwen3OmniMoeTalkerTextModel
 from pithtrain.models.qwen3_omni_video import Qwen3OmniMoeThinkerVideoModel
 from pithtrain.models.qwen35_moe import Qwen35MoeModel
 from pithtrain.modules.load_balance import force_balance, make_load_balance_loss_fn
@@ -66,9 +67,15 @@ def is_muon_param(name: str, param: torch.Tensor) -> bool:
         return False
     if name.endswith(".bias") or name.endswith("_bias"):
         return False
-    if name.endswith("embed_tokens.weight") or name.endswith("lm_head.weight"):
+    if name.endswith(
+        ("embed_tokens.weight", "lm_head.weight", "codec_embedding.weight", "codec_head.weight")
+    ):
         return False
-    if ".gate.weight" in name or ".router.weight" in name:
+    if (
+        ".gate.weight" in name
+        or ".router.weight" in name
+        or (".model.layers." in "." + name and name.endswith("shared_expert_gate.weight"))
+    ):
         return False
     return True
 
@@ -398,11 +405,19 @@ def apply_fsdp(model, hsdp_replica: int = 1):
         assert isinstance(model[i], PIPELINE_STAGE_MODELS)
         # Stage-edge modules (embed / norm / lm_head): every non-"layers" child that
         # owns parameters. reshard_after_forward=True since each runs once per step.
-        for name, child in model[i].named_children():
-            if name != "layers" and next(child.parameters(), None) is not None:
-                fully_shard(
-                    child, mesh=attn_fsdp_mesh, reshard_after_forward=True, mp_policy=compute_mp
-                )
+        edges = (
+            model[i].fsdp_edge_modules()
+            if isinstance(model[i], Qwen3OmniMoeTalkerTextModel)
+            else tuple(
+                child
+                for name, child in model[i].named_children()
+                if name != "layers" and next(child.parameters(), None) is not None
+            )
+        )
+        for child in edges:
+            fully_shard(
+                child, mesh=attn_fsdp_mesh, reshard_after_forward=True, mp_policy=compute_mp
+            )
         for layer in model[i].layers.values():
             if hasattr(layer.mlp, "experts"):
                 fully_shard(
@@ -461,6 +476,8 @@ def model_class_for_config(
         return DeepSeekV2Model
     elif module_config.model_type == "qwen3_moe":
         return Qwen3MoeModel
+    elif module_config.model_type == "qwen3_omni_moe_talker_text":
+        return Qwen3OmniMoeTalkerTextModel
     elif module_config.model_type == "qwen3_omni_moe_text":
         return Qwen3OmniMoeThinkerTextModel
     elif module_config.model_type == "gpt_oss":
