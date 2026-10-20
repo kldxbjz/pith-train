@@ -45,15 +45,25 @@ def multimodal_position_ids(input_ids, context, config, *, require_media=True):
     Independent image/audio/video spans can appear in any order in the same row.
     """
     allowed = {
-        "input_ids", "attention_mask", "position_ids", "pixel_values", "image_grid_thw",
-        "pixel_values_videos", "video_grid_thw", "video_second_per_grid",
-        "input_features", "feature_attention_mask", "audio_feature_lengths",
+        "input_ids",
+        "attention_mask",
+        "position_ids",
+        "pixel_values",
+        "image_grid_thw",
+        "pixel_values_videos",
+        "video_grid_thw",
+        "video_second_per_grid",
+        "input_features",
+        "feature_attention_mask",
+        "audio_feature_lengths",
         "use_audio_in_video",
     }
     if set(context) - allowed:
         raise ValueError(f"Unsupported multimodal inputs: {sorted(set(context) - allowed)}")
     if (
-        input_ids.ndim != 2 or input_ids.shape[0] != 1 or input_ids.shape[1] == 0
+        input_ids.ndim != 2
+        or input_ids.shape[0] != 1
+        or input_ids.shape[1] == 0
         or input_ids.dtype not in (torch.int32, torch.int64)
     ):
         raise ValueError("Native multimodal training needs one nonempty integer row")
@@ -66,13 +76,23 @@ def multimodal_position_ids(input_ids, context, config, *, require_media=True):
     if mask is not None and (mask.shape != input_ids.shape or not (mask == 1).all()):
         raise ValueError("Native multimodal microbatches must be unpadded")
     merge = config.vision_config.spatial_merge_size
-    images = [] if context.get("image_grid_thw") is None else image_grid(context["image_grid_thw"], merge)
-    videos = [] if context.get("video_grid_thw") is None else video_grid(context["video_grid_thw"], merge)
+    images = (
+        []
+        if context.get("image_grid_thw") is None
+        else image_grid(context["image_grid_thw"], merge)
+    )
+    videos = (
+        []
+        if context.get("video_grid_thw") is None
+        else video_grid(context["video_grid_thw"], merge)
+    )
     seconds = context.get("video_second_per_grid")
     if videos:
         if (
-            seconds is None or seconds.shape != (len(videos),)
-            or not torch.isfinite(seconds).all() or not (seconds > 0).all()
+            seconds is None
+            or seconds.shape != (len(videos),)
+            or not torch.isfinite(seconds).all()
+            or not (seconds > 0).all()
         ):
             raise ValueError("Every video needs positive finite video_second_per_grid")
     elif seconds is not None:
@@ -85,11 +105,14 @@ def multimodal_position_ids(input_ids, context, config, *, require_media=True):
             raise ValueError(f"{key} and its grid must be supplied together")
         if pixels is not None and (
             pixels.shape != (sum(t * h * w for t, h, w in grids), patch_width)
-            or not pixels.is_floating_point() or not torch.isfinite(pixels).all()
+            or not pixels.is_floating_point()
+            or not torch.isfinite(pixels).all()
         ):
             raise ValueError(f"Invalid {key} shape, dtype or finite values")
-    has_audio = any(context.get(k) is not None for k in
-                    ("input_features", "feature_attention_mask", "audio_feature_lengths"))
+    has_audio = any(
+        context.get(k) is not None
+        for k in ("input_features", "feature_attention_mask", "audio_feature_lengths")
+    )
     counts = []
     if has_audio:
         lengths = audio_feature_lengths(context, config, require_features=require_media)
@@ -102,8 +125,11 @@ def multimodal_position_ids(input_ids, context, config, *, require_media=True):
     pieces, cursor, offset = [], 0, 0.0
     image_index = video_index = audio_index = 0
     reserved = {
-        config.image_token_id, config.video_token_id, config.audio_token_id,
-        config.vision_end_token_id, config.audio_end_token_id,
+        config.image_token_id,
+        config.video_token_id,
+        config.audio_token_id,
+        config.vision_end_token_id,
+        config.audio_end_token_id,
     }
 
     def linear(count, start):
@@ -156,11 +182,11 @@ def multimodal_position_ids(input_ids, context, config, *, require_media=True):
                             v < video.shape[1] and video[0, v] <= audio[0, a]
                         )
                         if take_video:
-                            merged.append(video[:, v:v + 1])
+                            merged.append(video[:, v : v + 1])
                             content.append(config.video_token_id)
                             v += 1
                         else:
-                            merged.append(audio[:, a:a + 1])
+                            merged.append(audio[:, a : a + 1])
                             content.append(config.audio_token_id)
                             a += 1
                     media = torch.cat(merged, dim=1)
@@ -169,7 +195,7 @@ def multimodal_position_ids(input_ids, context, config, *, require_media=True):
             else:
                 raise ValueError("Vision-start must delimit image, video, or synchronized AV")
         expected = opening + content + ending
-        if tokens[cursor:cursor + len(expected)] != expected:
+        if tokens[cursor : cursor + len(expected)] != expected:
             raise ValueError("Media delimiters, placeholder count or AV temporal ordering differ")
         pieces.append(linear(len(opening), offset))
         offset += len(opening)
@@ -192,22 +218,34 @@ def multimodal_position_ids(input_ids, context, config, *, require_media=True):
         raise ValueError("Unused media grids or audio features")
     positions = torch.cat(pieces, dim=1).unsqueeze(1)
     supplied = context.get("position_ids")
-    if supplied is not None and (supplied.shape != positions.shape or not torch.equal(supplied, positions)):
+    if supplied is not None and (
+        supplied.shape != positions.shape or not torch.equal(supplied, positions)
+    ):
         raise ValueError("position_ids do not match multimodal geometry")
     return positions
 
 
-def pack_multimodal_features(embeddings, input_ids, config, image_output, video_output, audio_output):
+def pack_multimodal_features(
+    embeddings, input_ids, config, image_output, video_output, audio_output
+):
     """Insert final encoder outputs and sparse DeepStack lanes without cached state."""
     count = len(config.vision_config.deepstack_visual_indexes)
     lanes = [torch.zeros_like(embeddings) for _ in range(count)]
-    for token_id, output in ((config.image_token_id, image_output), (config.video_token_id, video_output)):
+    for token_id, output in (
+        (config.image_token_id, image_output),
+        (config.video_token_id, video_output),
+    ):
         if output is None:
             continue
         mask = input_ids == token_id
         features = output.pooler_output
-        if features.shape != (int(mask.sum()), embeddings.shape[-1]) or len(output.deepstack_features) != count:
-            raise ValueError("Vision encoder output differs from placeholders/DeepStack configuration")
+        if (
+            features.shape != (int(mask.sum()), embeddings.shape[-1])
+            or len(output.deepstack_features) != count
+        ):
+            raise ValueError(
+                "Vision encoder output differs from placeholders/DeepStack configuration"
+            )
         embeddings = embeddings.masked_scatter(mask[..., None], features.to(embeddings.dtype))
         for index, values in enumerate(output.deepstack_features):
             if values.shape != features.shape:
@@ -232,21 +270,27 @@ def encode_multimodal(visual, audio_tower, embeddings, input_ids, context, confi
     """
     grids, pixels, image_count = [], [], 0
     for grid_key, pixel_key in (
-        ("image_grid_thw", "pixel_values"), ("video_grid_thw", "pixel_values_videos")
+        ("image_grid_thw", "pixel_values"),
+        ("video_grid_thw", "pixel_values_videos"),
     ):
         if context.get(grid_key) is not None:
             grids.append(context[grid_key])
             pixels.append(context[pixel_key])
             if grid_key == "image_grid_thw":
-                image_count = int(context[grid_key].prod(-1).sum()) // config.vision_config.spatial_merge_size**2
+                image_count = (
+                    int(context[grid_key].prod(-1).sum())
+                    // config.vision_config.spatial_merge_size**2
+                )
     has_vision = bool(grids)
     if not has_vision:
         vision = config.vision_config
         merge = vision.spatial_merge_size
         grids = [input_ids.new_tensor([[1, merge, merge]])]
-        pixels = [embeddings.new_zeros(
-            (merge**2, vision.in_channels * vision.temporal_patch_size * vision.patch_size**2)
-        )]
+        pixels = [
+            embeddings.new_zeros(
+                (merge**2, vision.in_channels * vision.temporal_patch_size * vision.patch_size**2)
+            )
+        ]
     # Zero dependencies impose the same backward order (audio -> visual ->
     # embedding) as well as the same forward order, even across absent modalities.
     vision_pixels = torch.cat(pixels) + embeddings.sum().to(pixels[0].dtype) * 0
@@ -256,12 +300,14 @@ def encode_multimodal(visual, audio_tower, embeddings, input_ids, context, confi
         vision_anchor = vision_anchor + values.sum()
     image_output = video_output = None
     if has_vision:
+
         def take(start, end):
             return VisionOutput(
                 output.last_hidden_state,
                 output.pooler_output[start:end],
                 tuple(values[start:end] for values in output.deepstack_features),
             )
+
         if image_count:
             image_output = take(0, image_count)
         if context.get("video_grid_thw") is not None:

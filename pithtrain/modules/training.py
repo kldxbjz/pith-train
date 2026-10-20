@@ -422,14 +422,20 @@ def apply_fsdp(model, hsdp_replica: int = 1):
     return model
 
 
-def model_class_for_config(module_config, native_vision=False, native_audio=False, native_video=False, native_multimodal=False):
+def model_class_for_config(
+    module_config,
+    native_vision=False,
+    native_audio=False,
+    native_video=False,
+    native_multimodal=False,
+):
     """Resolve a registered pipeline model before allocating any parameters."""
     if sum((native_vision, native_audio, native_video, native_multimodal)) > 1:
-        raise ValueError("Select one native image, audio, video or multimodal mode")
+        raise ValueError("Select one native mode; combined media uses native_multimodal")
     if native_vision or native_audio or native_video or native_multimodal:
         thinker = getattr(module_config, "thinker_config", module_config)
         if getattr(thinker, "model_type", None) != "qwen3_omni_moe_thinker":
-            raise ValueError("Native media training requires a composite Omni Thinker config")
+            raise ValueError("native_vision/native_audio/native_video/native_multimodal requires a composite Omni Thinker config")
         if native_multimodal:
             return Qwen3OmniMoeThinkerMultimodalModel
         if native_audio:
@@ -478,8 +484,11 @@ def setup_model(
 
     # All models read their parallel groups from the distributed context directly.
     ModelClass = model_class_for_config(
-        source_config, native_vision=cfg.native_vision, native_audio=cfg.native_audio,
-        native_video=cfg.native_video, native_multimodal=cfg.native_multimodal,
+        source_config,
+        native_vision=cfg.native_vision,
+        native_audio=cfg.native_audio,
+        native_video=cfg.native_video,
+        native_multimodal=cfg.native_multimodal,
     )
     selected_config = (
         getattr(source_config, "thinker_config", source_config)

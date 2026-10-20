@@ -4,6 +4,7 @@ All encoder state travels through this microbatch's ordinary activation graph.
 CP, packing and padding are deliberately rejected by the initial media contract.
 """
 
+from pithtrain.contexts import training
 from pithtrain.models.qwen3_omni_audio import Qwen3OmniMoeAudioEncoder
 from pithtrain.models.qwen3_omni_image import Qwen3OmniMoeThinkerImageModel
 from pithtrain.models.qwen3_omni_multimodal_inputs import (
@@ -11,7 +12,6 @@ from pithtrain.models.qwen3_omni_multimodal_inputs import (
     multimodal_position_ids,
 )
 from pithtrain.models.qwen3_omni_vision import Qwen3OmniMoeVideoEncoder
-from pithtrain.contexts import training
 
 
 class Qwen3OmniMoeThinkerMultimodalModel(Qwen3OmniMoeThinkerImageModel):
@@ -24,7 +24,9 @@ class Qwen3OmniMoeThinkerMultimodalModel(Qwen3OmniMoeThinkerImageModel):
         if config.audio_config.output_dim != config.text_config.hidden_size:
             raise ValueError("Audio projection width must equal text hidden size")
         super().__init__(config, phase)
-        self.audio_tower = Qwen3OmniMoeAudioEncoder(config.audio_config) if self.stage_index == 0 else None
+        self.audio_tower = (
+            Qwen3OmniMoeAudioEncoder(config.audio_config) if self.stage_index == 0 else None
+        )
 
     @staticmethod
     def validate_media_batch(input_ids, context, config):
@@ -34,8 +36,12 @@ class Qwen3OmniMoeThinkerMultimodalModel(Qwen3OmniMoeThinkerImageModel):
         context = model_context or {}
         multimodal_position_ids(input_ids, context, self.image_config)
         return encode_multimodal(
-            self.visual, self.audio_tower, self.embed_tokens(input_ids),
-            input_ids, context, self.image_config,
+            self.visual,
+            self.audio_tower,
+            self.embed_tokens(input_ids),
+            input_ids,
+            context,
+            self.image_config,
         )
 
     def forward_posemb(self, length, cu_seqlens=None, model_context=None):

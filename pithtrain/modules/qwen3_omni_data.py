@@ -286,7 +286,8 @@ class Qwen3OmniCollator:
                     video_audio_modes.append(details["has_audio"])
                     if details["has_audio"]:
                         waveform, audio_details = decode_video_audio(
-                            path, start_seconds=details["start_seconds"],
+                            path,
+                            start_seconds=details["start_seconds"],
                             duration_seconds=details["duration_seconds"],
                             sampling_rate=self.sampling_rate,
                             max_seconds=self.max_audio_seconds,

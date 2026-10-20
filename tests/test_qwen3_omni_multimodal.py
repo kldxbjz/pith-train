@@ -6,7 +6,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
-from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeThinkerConfig
+from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+    Qwen3OmniMoeThinkerConfig,
+)
 from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
     Qwen3OmniMoeAudioEncoder as HFAudio,
 )
@@ -30,11 +32,16 @@ from tests.test_qwen3_omni_vision import vision_config
 
 def config():
     return Qwen3OmniMoeThinkerConfig(
-        vision_config=vision_config(), audio_config=audio_config(),
+        vision_config=vision_config(),
+        audio_config=audio_config(),
         text_config=dict(hidden_size=24, vocab_size=32),
-        image_token_id=10, video_token_id=11, audio_token_id=12,
-        vision_start_token_id=13, vision_end_token_id=14,
-        audio_start_token_id=15, audio_end_token_id=16,
+        image_token_id=10,
+        video_token_id=11,
+        audio_token_id=12,
+        vision_start_token_id=13,
+        vision_end_token_id=14,
+        audio_start_token_id=15,
+        audio_end_token_id=16,
         position_id_per_seconds=13,
     )
 
@@ -74,7 +81,9 @@ def context(kind, *, seconds=0.73, frames=201):
         else:
             tokens += [13] + [11] * 18 + [14, 5]
     if lengths:
-        out["feature_attention_mask"] = torch.arange(max(lengths))[None] < torch.tensor(lengths)[:, None]
+        out["feature_attention_mask"] = (
+            torch.arange(max(lengths))[None] < torch.tensor(lengths)[:, None]
+        )
         out["input_features"] = torch.randn(len(lengths), 16, max(lengths))
     tokens += [6, 7, 8]
     out["input_ids"] = torch.tensor([tokens])
@@ -87,7 +96,8 @@ def hf_positions(cfg, inputs):
     owner.get_llm_pos_ids_for_vision = HFPositions.get_llm_pos_ids_for_vision.__get__(owner)
     lengths = inputs.get("feature_attention_mask")
     return HFPositions.get_rope_index(
-        owner, inputs["input_ids"],
+        owner,
+        inputs["input_ids"],
         image_grid_thw=inputs.get("image_grid_thw"),
         video_grid_thw=inputs.get("video_grid_thw"),
         attention_mask=inputs["attention_mask"],
@@ -104,10 +114,16 @@ def test_exact_hf_positions_for_mixed_inputs_and_av(kind, seconds, frames):
     actual = multimodal_position_ids(inputs["input_ids"], inputs, cfg)
     torch.testing.assert_close(actual, hf_positions(cfg, inputs), rtol=0, atol=0)
     # All decoder stages can reconstruct positions without large encoder payloads.
-    metadata = {k: v for k, v in inputs.items() if k not in ("pixel_values", "pixel_values_videos", "input_features")}
+    metadata = {
+        k: v
+        for k, v in inputs.items()
+        if k not in ("pixel_values", "pixel_values_videos", "input_features")
+    }
     torch.testing.assert_close(
-        actual, multimodal_position_ids(inputs["input_ids"], metadata, cfg, require_media=False),
-        rtol=0, atol=0,
+        actual,
+        multimodal_position_ids(inputs["input_ids"], metadata, cfg, require_media=False),
+        rtol=0,
+        atol=0,
     )
 
 
@@ -117,8 +133,12 @@ class Encoders(nn.Module):
         self.config = copy.deepcopy(cfg)
         self.config.vision_config._attn_implementation = "eager"
         self.config.audio_config._attn_implementation = "eager"
-        self.visual = (HFVision if reference else Qwen3OmniMoeVideoEncoder)(self.config.vision_config)
-        self.audio_tower = (HFAudio if reference else Qwen3OmniMoeAudioEncoder)(self.config.audio_config)
+        self.visual = (HFVision if reference else Qwen3OmniMoeVideoEncoder)(
+            self.config.vision_config
+        )
+        self.audio_tower = (HFAudio if reference else Qwen3OmniMoeAudioEncoder)(
+            self.config.audio_config
+        )
         self.embed_tokens = nn.Embedding(32, 24)
 
     def forward(self, inputs):
@@ -132,7 +152,10 @@ class Encoders(nn.Module):
         ids = inputs["input_ids"]
         hidden = self.embed_tokens(ids)
         lanes = [torch.zeros_like(hidden) for _ in range(2)]
-        for token, pixels, grids in ((10, "pixel_values", "image_grid_thw"), (11, "pixel_values_videos", "video_grid_thw")):
+        for token, pixels, grids in (
+            (10, "pixel_values", "image_grid_thw"),
+            (11, "pixel_values_videos", "video_grid_thw"),
+        ):
             if pixels not in inputs:
                 continue
             output = self.visual(inputs[pixels], inputs[grids])
@@ -173,15 +196,19 @@ def test_composition_matches_hf_every_gradient_and_uniform_encoder_calls(kind):
         assert param.grad is not None and torch.isfinite(param.grad).all(), name
         if expected_grad is None:
             # HF omits the inactive encoder. Ours must provide exact zero, not None.
-            assert (name.startswith("visual.") and "pixel_values" not in inputs and "pixel_values_videos" not in inputs) or (
-                name.startswith("audio_tower.") and "input_features" not in inputs
-            ), name
+            assert (
+                name.startswith("visual.")
+                and "pixel_values" not in inputs
+                and "pixel_values_videos" not in inputs
+            ) or (name.startswith("audio_tower.") and "input_features" not in inputs), name
             assert torch.count_nonzero(param.grad) == 0, name
         else:
             torch.testing.assert_close(param.grad, expected_grad, rtol=2e-4, atol=2e-6, msg=name)
 
 
-@pytest.mark.parametrize("fault", ["order", "audio_count", "wrapper", "flag", "nan", "padding", "unused", "position"])
+@pytest.mark.parametrize(
+    "fault", ["order", "audio_count", "wrapper", "flag", "nan", "padding", "unused", "position"]
+)
 def test_bad_av_fails_before_encoder_collectives(fault):
     cfg, inputs = context("all")
     if fault == "order":
@@ -218,12 +245,16 @@ def test_interleaved_microbatch_graphs_and_optimizer_resume(tmp_path):
     for batch in inputs:
         sequential(batch).square().sum().backward()
     for name, param in model.named_parameters():
-        torch.testing.assert_close(param.grad, sequential.get_parameter(name).grad, rtol=2e-5, atol=2e-6)
+        torch.testing.assert_close(
+            param.grad, sequential.get_parameter(name).grad, rtol=2e-5, atol=2e-6
+        )
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
     checkpoint = tmp_path / "mixed.pt"
-    torch.save(dict(model=model.state_dict(), optimizer=optimizer.state_dict(), next_index=4), checkpoint)
+    torch.save(
+        dict(model=model.state_dict(), optimizer=optimizer.state_dict(), next_index=4), checkpoint
+    )
     restored = Encoders(cfg)
     restored_optimizer = torch.optim.AdamW(restored.parameters(), lr=1e-3)
     state = torch.load(checkpoint, weights_only=True)
