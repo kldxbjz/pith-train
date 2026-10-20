@@ -56,6 +56,15 @@ class OmniGenerationOutput:
     speech: SpeechGenerationOutput | None
 
 
+def _require_unsharded_generation(*roots):
+    # EOS and per-row chunk lengths change call counts. The training FSDP plan
+    # does not provide a synchronized generation protocol for those branches.
+    from torch.distributed.fsdp import FSDPModule
+
+    if any(isinstance(module, FSDPModule) for root in roots for module in root.modules()):
+        raise ValueError("Speech generation requires unsharded modules; FSDP is training-only")
+
+
 def _sample(logits, *, do_sample, temperature, top_k, top_p, generator):
     if not torch.isfinite(logits).any(dim=-1).all() or torch.isnan(logits).any():
         raise ValueError("Every generation row must have finite candidate logits")
@@ -105,6 +114,7 @@ def generate_speech_from_condition(
     codec decoder; individual finished batch rows produce no additional frames.
     ``reached_eos=False`` explicitly identifies truncation at the supplied cap.
     """
+    _require_unsharded_generation(talker, code2wav)
     if type(max_frames) is not int or max_frames < 1:
         raise ValueError("max_frames must be a positive finite integer")
     if not torch.isfinite(torch.tensor(repetition_penalty)) or repetition_penalty <= 0:
@@ -544,6 +554,7 @@ class Qwen3OmniMoeSpeechModel(nn.Module):
         This is an eager reference integration, not a KV-cache or DualPipeV
         speech-generation claim. Component methods remain independently usable.
         """
+        _require_unsharded_generation(self)
         if type(max_text_tokens) is not int or max_text_tokens < 1:
             raise ValueError("max_text_tokens must be a positive finite integer")
         if input_ids.ndim != 2 or input_ids.shape[0] != 1 or input_ids.shape[1] == 0:

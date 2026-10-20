@@ -188,3 +188,33 @@ def test_default_eos_immediate_response_produces_no_speech(official):
     )
     assert result.text_reached_eos and result.speech is None
     assert result.sequences[0, -1] == top.im_end_token_id
+
+
+@pytest.mark.parametrize("component", ["talker", "code2wav"])
+def test_actual_fsdp_generation_rejected_before_forward_or_mode_change(
+    official, tmp_path, component
+):
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import fully_shard
+
+    processor, top, native, _, table = pair(official)
+    prompt, _ = rendered_prompt(processor, False)
+    thinker = ScriptedThinker(table, [top.im_end_token_id])
+    model = speech.Qwen3OmniMoeSpeechModel(top, thinker, native, nn.Linear(4, 4))
+    assert not dist.is_initialized()
+    dist.init_process_group(
+        "gloo", init_method=(tmp_path / "rendezvous").as_uri(), rank=0, world_size=1
+    )
+    try:
+        mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+        fully_shard(getattr(model, component), mesh=mesh)
+        modes = [module.training for module in model.modules()]
+        with pytest.raises(ValueError, match="FSDP is training-only"):
+            model.generate(prompt, dict(attention_mask=torch.ones_like(prompt)))
+        with pytest.raises(ValueError, match="FSDP is training-only"):
+            speech.generate_speech_from_condition(model.talker, model.code2wav, None)
+        assert thinker.calls == 0
+        assert [module.training for module in model.modules()] == modes
+    finally:
+        dist.destroy_process_group()
