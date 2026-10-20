@@ -143,7 +143,7 @@ class Qwen3OmniMoeThinkerTextSparseMoeBlock(nn.Module):
         flat = hidden_states.reshape(-1, shape[-1])
         repeated = flat[:, None].expand(-1, self.num_experts_per_tok, -1).reshape(-1, shape[-1])
         tokens, reverse, offs, ks, sizes = scatter_for_grouped_gemm(
-            repeated, indices.reshape(-1), self.experts_per_rank
+            repeated, indices.reshape(-1), self.experts_per_rank, deterministic=True
         )
         outputs = padded_index_gather(self.experts(tokens, offs, ks, sizes), reverse)
         weighted = outputs.view(*indices.shape, -1) * weights.unsqueeze(-1)
@@ -272,6 +272,7 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
             distributed.ep_size,
             self.mlp.experts_per_rank,
             distributed.ep_group,
+            deterministic=True,
         )
         return tokens, residual, routing
 
@@ -281,7 +282,7 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
         if distributed.ep_size > 1:
             gathered_tokens = padded_index_gather(gathered_tokens, expand_idx)
         tokens, reverse, offs, ks, sizes = scatter_for_grouped_gemm(
-            gathered_tokens, expert_idxs, self.mlp.experts_per_rank
+            gathered_tokens, expert_idxs, self.mlp.experts_per_rank, deterministic=True
         )
         return padded_index_gather(self.mlp.experts(tokens, offs, ks, sizes), reverse)
 
