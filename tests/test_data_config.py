@@ -39,7 +39,9 @@ def task_config(**overrides):
         SlottedDefault=SlottedDefault,
         DataCfg=DataCfg,
         DistributedCfg=SimpleNamespace,
-        TrainingCfg=lambda: SimpleNamespace(native_vision=False, native_video=False, native_audio=False, native_multimodal=False),
+        TrainingCfg=lambda: SimpleNamespace(
+            native_vision=False, native_video=False, native_audio=False, native_multimodal=False
+        ),
         LoggingCfg=SimpleNamespace,
         DensePretrainData=DensePretrainData,
         OmniPretrainData=OmniPretrainData,

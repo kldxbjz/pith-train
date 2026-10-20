@@ -42,7 +42,7 @@ def decode_video_audio(path, *, start_seconds, duration_seconds, sampling_rate, 
             left, right = max(begin, 0), min(begin + len(values), count)
             if right <= left or written[left:right].any():
                 raise ValueError("Audio stream is disjoint or overlaps on the video timeline")
-            result[left:right] = values[left - begin:right - begin]
+            result[left:right] = values[left - begin : right - begin]
             written[left:right] = True
 
         for source in container.decode(audio=0):
@@ -53,7 +53,8 @@ def decode_video_audio(path, *, start_seconds, duration_seconds, sampling_rate, 
     if not written.any():
         raise ValueError("Synchronized video has no decodable audio")
     return result, dict(
-        sampling_rate=sampling_rate, samples=count,
+        sampling_rate=sampling_rate,
+        samples=count,
         audio_start_seconds=float(np.flatnonzero(written)[0] / sampling_rate),
         audio_end_seconds=float((np.flatnonzero(written)[-1] + 1) / sampling_rate),
         silence_samples=int((~written).sum()),
