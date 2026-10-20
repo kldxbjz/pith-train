@@ -25,6 +25,8 @@ from pithtrain.models.qwen3_moe import Qwen3MoeGate, Qwen3MoeModel
 from pithtrain.models.qwen35_moe import Qwen35MoeModel, Qwen35MoeTopKRouter
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.operators.grouped_linear import GroupedLinear
+from pithtrain.operators.linear import BF16Linear
+from pithtrain.operators.wgrad_accumulation import install_wgrad_accumulation
 from pithtrain.pipeline import DualPipeV, Microbatch
 
 
@@ -232,8 +234,10 @@ def main(model_name: str):
     dtype = torch.bfloat16
 
     # This test builds models directly, bypassing setup_model; bind the BF16 linear backend it sets.
+    # The fused classes act as nn.Linear in the single-device reference, and fused accumulation is
+    # installed on the DualPipeV copy only, as setup_model does.
     training.fp8 = False
-    training.Linear = nn.Linear
+    training.Linear = BF16Linear
     training.GroupedLinear = GroupedLinear
 
     packed = os.environ.get("PACKED_SEQLEN", "0") == "1"
@@ -374,6 +378,7 @@ def main(model_name: str):
     local_modules[1].load_state_dict(local_full_modules[1].state_dict())
     local_modules.zero_grad()
     apply_fsdp(local_modules, dtype)
+    install_wgrad_accumulation(local_modules)
 
     # Wrap the modules with DualPipeV.
     dualpipev_model = DualPipeV(local_modules)
