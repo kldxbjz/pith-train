@@ -120,6 +120,11 @@ class Qwen3OmniMoeVisionAttention(nn.Module):
         self.head_dim = config.hidden_size // config.num_heads
         self.qkv = nn.Linear(config.hidden_size, 3 * config.hidden_size, bias=True)
         self.proj = nn.Linear(config.hidden_size, config.hidden_size, bias=True)
+        self.attn_implementation = getattr(config, "_attn_implementation", None) or "sdpa"
+        if self.attn_implementation not in {"eager", "sdpa"}:
+            raise NotImplementedError(
+                f"Native vision attention does not implement {self.attn_implementation!r}"
+            )
 
     def forward(self, hidden_states, lengths, position_embeddings):
         q, k, v = self.qkv(hidden_states).reshape(-1, 3, self.num_heads, self.head_dim).unbind(1)
@@ -127,13 +132,27 @@ class Qwen3OmniMoeVisionAttention(nn.Module):
 
         def rotate(value):
             dtype = value.dtype
-            first, second = value.float().chunk(2, dim=-1)
-            return (value.float() * cos + torch.cat((-second, first), -1) * sin).to(dtype)
+            # Share one FP32 cast across both branches, as HF does. Two casts
+            # would separately round their backward contributions to BF16.
+            value = value.float()
+            first, second = value.chunk(2, dim=-1)
+            return (value * cos + torch.cat((-second, first), -1) * sin).to(dtype)
 
         q, k = rotate(q), rotate(k)
         outputs = []
-        # SDPA is native PyTorch; HF is used only in separate acceptance tests.
         for queries, keys, values in zip(q.split(lengths), k.split(lengths), v.split(lengths)):
+            if self.attn_implementation == "eager":
+                # Honor explicit HF eager semantics, including intermediate
+                # rounding. The default production path below remains SDPA.
+                queries, keys, values = (
+                    tensor.transpose(0, 1).unsqueeze(0) for tensor in (queries, keys, values)
+                )
+                scores = torch.matmul(queries, keys.transpose(2, 3)) * self.head_dim**-0.5
+                probabilities = F.softmax(scores, dim=-1, dtype=torch.float32).to(queries.dtype)
+                outputs.append(
+                    torch.matmul(probabilities, values).transpose(1, 2).contiguous().squeeze(0)
+                )
+                continue
             outputs.append(
                 F.scaled_dot_product_attention(
                     queries.transpose(0, 1),
