@@ -23,6 +23,7 @@ from unittest.mock import patch
 import torch
 import torch.distributed as dist
 
+from pithtrain.modules.reproducibility import runtime_determinism_snapshot
 from pithtrain.tasks.prepare_omni_data import verify_bundle
 from tests.acceptance.omni_distributed_resume import negative_case, snapshot
 from tests.acceptance.omni_image_evidence import OptimizerStepEvidence
@@ -400,6 +401,7 @@ def run_gpu(args, spec):
         hardware=torch.cuda.get_device_name(),
         torch=str(torch.__version__),
         cuda=torch.version.cuda,
+        runtime_determinism=runtime_determinism_snapshot(),
     )
     actual = {
         spec.hf_name(name): parameter
