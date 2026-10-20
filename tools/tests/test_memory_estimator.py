@@ -8,6 +8,7 @@ Run from repo root: pytest tools/tests/test_memory_estimator.py -v
 from __future__ import annotations
 
 import math
+import sys
 from pathlib import Path
 
 import pytest
@@ -297,3 +298,48 @@ class TestDeepSeekV2Lite:
 
         assert result.peak_bytes > 0, "peak_bytes should be positive"
         assert len(result.timeline) > 0, "timeline should not be empty"
+
+
+# ---------------------------------------------------------------------------
+# Test 6: FP8 warning
+# ---------------------------------------------------------------------------
+
+
+def _fp8_argv(extra: list[str]) -> list[str]:
+    return [
+        "memory_estimator",
+        "--model",
+        str(REPO_ROOT / "examples" / "pretrain_lm" / "qwen3-30b-a3b" / "config.json"),
+        "--pp-size",
+        "1",
+        "--total-gpus",
+        "1",
+        "--micro-batch-size",
+        "1",
+        "--global-batch-size",
+        "8",
+        "--sequence-length",
+        "512",
+        *extra,
+    ]
+
+
+class TestFp8Warning:
+    def test_main_warns_when_fp8_enabled(self, monkeypatch, capsys):
+        """--fp8-training must warn that FP8 overhead is not modeled (lower bound)."""
+        from tools.memory_estimator.__main__ import main as estimator_main
+
+        monkeypatch.setattr(sys, "argv", _fp8_argv(["--fp8-training", "deep-gemm"]))
+        estimator_main()
+        captured = capsys.readouterr()
+        assert "lower bound" in captured.err
+        assert "fp8" in captured.err.lower()
+
+    def test_main_silent_when_fp8_disabled(self, monkeypatch, capsys):
+        """No FP8 warning when the flag is left at its default."""
+        from tools.memory_estimator.__main__ import main as estimator_main
+
+        monkeypatch.setattr(sys, "argv", _fp8_argv([]))
+        estimator_main()
+        captured = capsys.readouterr()
+        assert "lower bound" not in captured.err
