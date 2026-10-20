@@ -66,7 +66,7 @@ def result():
         sequences=torch.tensor([[1, 2, 3, 4]]),
         text_reached_eos=False,
         speech=speech,
-        logits=[torch.tensor([[1.0, 2.0]])],
+        logits=[torch.tensor([[1.0, 2.0]]), torch.tensor([[2.0, 1.0]])],
     )
 
 
@@ -75,7 +75,7 @@ def result():
 )
 def test_comparison_rejects_each_real_output_axis(damage):
     actual, expected = result(), result()
-    rows = [expected.logits[0].clone()]
+    rows = [value.clone() for value in expected.logits]
     if damage == "text":
         actual.sequences[0, -1] = 7
     elif damage == "code":
@@ -156,8 +156,12 @@ def test_unforced_generation_and_control_paths_are_separate_and_bounded():
     assert "model.talker.generate" in hf_source and "model.code2wav.chunked_decode" in hf_source
     validate = ast.unparse(functions["validate"])
     assert "for sample in samples" in validate and "set(cases) != set(MEDIA)" in validate
-    assert "previous.logits[0].argmax" in validate
-    assert (gate.TEXT_TOKENS, gate.CODEC_FRAMES, gate.OUTPUT_NSE) == (2, 3, 1e-3)
+    assert "generated[1]" in validate
+    official = ast.unparse(functions["hf_generate"])
+    assert "model.generate(input_ids=" in official and "HFComposite" in official
+    assert "hf_features" not in functions and "hf_condition" not in functions
+    assert "require_nonempty_case" in validate and "multi_turn" in validate
+    assert (gate.TEXT_TOKENS, gate.CODEC_FRAMES, gate.OUTPUT_NSE) == (4, 8, 1e-3)
     assert gate.MEDIA == ("text", "image", "audio", "video", "mixed")
     assert "source_identity(args.expected_commit)" in ast.unparse(functions["main"])
     assert "runtime_precondition(args)" in ast.unparse(functions["main"])
@@ -172,7 +176,7 @@ def test_summary_is_complete_and_compact_without_raw_tensor_payloads():
 
     encoded = json.dumps(report, allow_nan=False).encode()
     assert len(encoded) < 4096
-    assert report["thinker_logits_nse"] == [0.0]
+    assert report["thinker_logits_nse"] == [0.0, 0.0]
 
 
 @pytest.mark.parametrize("existing", [False, True])
@@ -235,3 +239,273 @@ def test_preservation_removes_generation_cache_created_during_control():
         model.rope_deltas = torch.tensor([3])
     assert not hasattr(model, "rope_deltas")
     assert all(proof.values())
+
+
+@pytest.fixture(scope="module")
+def official_full_cpu():
+    """Actual TF5.17 composite, official revision, reduced dimensions only."""
+    import json
+
+    from transformers import AutoConfig
+    from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+        Qwen3OmniMoeTextConfig,
+    )
+    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+        Qwen3OmniMoeForConditionalGeneration,
+    )
+
+    torch.set_num_threads(1)
+    top = AutoConfig.from_pretrained(
+        "Qwen/Qwen3-Omni-30B-A3B-Instruct", revision=gate.chain.REVISION, local_files_only=True
+    )
+    thinker = copy.deepcopy(top.thinker_config)
+    path = Path(__file__).parent / "configs/qwen3_omni_text/tiny.json"
+    thinker.text_config = Qwen3OmniMoeTextConfig(**json.loads(path.read_text()))
+    v, a = thinker.vision_config, thinker.audio_config
+    v.depth, v.hidden_size, v.num_heads, v.intermediate_size = 3, 64, 4, 96
+    v.out_hidden_size, v.deepstack_visual_indexes = thinker.text_config.hidden_size, [0, 2]
+    a.encoder_layers, a.d_model, a.encoder_attention_heads, a.encoder_ffn_dim = 2, 64, 4, 96
+    a.downsample_hidden_size, a.output_dim = 8, thinker.text_config.hidden_size
+    config = gate.chain.tiny_config(thinker, top.to_dict())
+    for cfg in (
+        config.thinker_config,
+        config.talker_config,
+        config.code2wav_config,
+        config.thinker_config.text_config,
+        config.talker_config.text_config,
+        config.talker_config.code_predictor_config,
+    ):
+        cfg._attn_implementation = "eager"
+        cfg._experts_implementation = "eager"
+    torch.manual_seed(gate.chain.SEED)
+    model = Qwen3OmniMoeForConditionalGeneration(config).float().eval()
+    ids = torch.tensor(
+        [
+            [
+                config.im_start_token_id,
+                config.user_token_id,
+                198,
+                40,
+                41,
+                config.im_end_token_id,
+                198,
+                config.im_start_token_id,
+                config.assistant_token_id,
+                198,
+            ]
+        ]
+    )
+    batch = dict(
+        input_ids=ids,
+        model_context=dict(input_ids=ids, attention_mask=torch.ones_like(ids)),
+        prompt_lengths=[ids.shape[1]],
+        position_kwargs={},
+    )
+    return model, batch
+
+
+def cpu_generation_pair(official_full_cpu, monkeypatch):
+    """Real generation/Talker/decoder; HF Thinker adapter isolates CPU control flow.
+
+    This deliberately does not claim native CUDA Thinker numerical acceptance.
+    """
+    import pithtrain.models.qwen3_omni_speech as speech
+    from pithtrain.models.qwen3_omni_code2wav import Qwen3OmniMoeCode2Wav
+    from pithtrain.models.qwen3_omni_talker import Qwen3OmniMoeTalkerForConditionalGeneration
+
+    hf, batch = copy.deepcopy(official_full_cpu)
+
+    class CPUThinker(nn.Module):
+        def __init__(self, model):
+            super().__init__()
+            self.reference = model
+
+        @property
+        def embed_tokens(self):
+            return self.reference.get_input_embeddings()
+
+        def forward_epilog(self, logits):
+            return logits
+
+    def features(thinker, ids, context, layer):
+        output = thinker.reference(
+            **dict(context, input_ids=ids, output_hidden_states=True, use_cache=False)
+        )
+        return speech.ThinkerSpeechOutput(
+            thinker.forward_epilog(output.logits),
+            output.hidden_states[0],
+            output.hidden_states[layer],
+        )
+
+    monkeypatch.setattr(speech, "thinker_speech_forward", features)
+    talker = Qwen3OmniMoeTalkerForConditionalGeneration(
+        copy.deepcopy(hf.config.talker_config)
+    ).float()
+    decoder = Qwen3OmniMoeCode2Wav(copy.deepcopy(hf.config.code2wav_config)).float()
+    talker.load_state_dict(hf.talker.state_dict(), strict=True)
+    decoder.load_state_dict(hf.code2wav.state_dict(), strict=True)
+    native = speech.Qwen3OmniMoeSpeechModel(
+        hf.config, CPUThinker(copy.deepcopy(hf.thinker)), talker, decoder
+    )
+    return native, hf, batch
+
+
+@pytest.mark.parametrize("variant", ["cap", "multiturn", "delayed_eos"])
+def test_full_official_composite_matches_native_generation_protocol_cpu(
+    official_full_cpu, monkeypatch, variant
+):
+    native, hf, batch = cpu_generation_pair(official_full_cpu, monkeypatch)
+    options = dict(text_tokens=4, codec_frames=3)
+    if variant == "multiturn":
+        batch = gate.multi_turn(batch, hf.config)
+    with (
+        torch.no_grad(),
+        gate.preserve_generation_state(native, hf) as preserved,
+        gate.hf_position_metadata(hf, hf.config),
+    ):
+        if variant == "delayed_eos":
+            preliminary = gate.compute(hf, gate.hf_generate, batch, **options)
+            tokens = preliminary.sequences[0, batch["input_ids"].shape[1] :]
+            assert tokens[0] != tokens[1]
+            options["eos_id"] = int(tokens[1])
+        expected = gate.compute(hf, gate.hf_generate, batch, **options)
+        actual, rows = gate.compute(native, gate.native_generate, batch, **options)
+        report = gate.compare_generation(actual, rows, expected, batch["input_ids"].shape[1])
+        gate.require_nonempty_case(report, variant)
+        assert (
+            expected.reference_entrypoint
+            == "transformers.Qwen3OmniMoeForConditionalGeneration.generate"
+        )
+        assert len(rows) == len(expected.logits)
+        if variant == "cap":
+            assert len(report["generated_tokens"][0]) == 4 and not report["text_reached_eos"]
+        if variant == "delayed_eos":
+            assert report["text_reached_eos"] and len(report["generated_tokens"][0]) == 2
+    assert all(preserved.values())
+    assert "generate" not in hf.thinker.__dict__ and "generate" not in hf.talker.__dict__
+    assert "chunked_decode" not in hf.code2wav.__dict__
+
+
+def test_every_media_requires_nonempty_waveform():
+    empty = {"waveforms": []}
+    for media in gate.MEDIA:
+        with pytest.raises(AssertionError, match="every natural media"):
+            gate.require_nonempty_case(empty, media)
+
+
+def test_actual_code2wav_crosses_official_300_frame_chunk_cpu():
+    native, hf, _ = codec_pair()
+    speech = SimpleNamespace(
+        codes=torch.arange(48).reshape(1, 3, 16) % 23, code_lengths=torch.tensor([3])
+    )
+    with torch.no_grad(), gate.preserve_generation_state(native, hf) as preserved:
+        report = gate.chunk_boundary(native, hf, speech)
+    assert report["frames"] == 301 and report["chunk_size"] == 300 and report["chunks"] == 2
+    assert report["code_groups"] == 16 and report["finite"] and report["nse"] < 1e-3
+    assert report["scope"] == "decoder_component_chunk_boundary"
+    assert "not_natural_301_frame_generation" in report["source"]
+    assert all(preserved.values())
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_official_observer_returns_original_and_restores_on_error(failure):
+    model = MethodModel()
+    seen = []
+    original = model.generate
+
+    def observer(args, kwargs, result):
+        seen.append(result)
+        if failure:
+            raise RuntimeError("observer stopped")
+
+    with gate.observe_method(model, "generate", observer):
+        if failure:
+            with pytest.raises(RuntimeError, match="observer stopped"):
+                gate.compute(
+                    model, lambda module: module.generate(torch.ones(1, 2, dtype=torch.bfloat16))
+                )
+        else:
+            result = gate.compute(
+                model, lambda module: module.generate(torch.ones(1, 2, dtype=torch.bfloat16))
+            )
+            assert result is seen[0]
+    assert model.generate.__func__ is original.__func__ and "generate" not in model.__dict__
+
+
+def test_bf16_codec_reduction_and_all_embedding_gradients_match_official_expression():
+    from pithtrain.models.qwen3_omni_speech import codec_embeddings
+    from tests.test_omni_speech_integration import pair
+
+    native, hf = pair()
+    codes = torch.arange(2 * 4 * 16).reshape(2, 4, 16) % 23
+
+    def official_reduction(model, values):
+        # HF prepare_inputs_for_generation concatenates all16 embedding rows
+        # and sums once; use its actual independently paired embedding tables.
+        batch, frames, groups = values.shape
+        flat = values.reshape(batch * frames, groups)
+        embedded = [model.get_input_embeddings()(flat[:, :1])]
+        embedded += [
+            table(flat[:, index + 1 : index + 2])
+            for index, table in enumerate(model.code_predictor.get_input_embeddings())
+        ]
+        return torch.cat(embedded, 1).sum(1).reshape(batch, frames, -1)
+
+    actual = gate.compute(native, codec_embeddings, codes)
+    expected = gate.compute(hf, official_reduction, codes)
+    assert torch.equal(actual, expected)
+    for value in (actual, expected):
+        value.float().square().sum().backward()
+    used = []
+    for name, parameter in native.named_parameters():
+        reference = hf.get_parameter(name)
+        if parameter.grad is None:
+            assert reference.grad is None, name
+        else:
+            assert torch.equal(parameter.grad, reference.grad), name
+            assert torch.isfinite(parameter.grad).all() and parameter.grad.abs().sum() > 0
+            used.append(name)
+    assert len(used) == 16
+
+
+def test_bf16_teacher_force_recurrence_matches_hf_all_logits_and_gradients():
+    from pithtrain.models.qwen3_omni_speech import speech_teacher_force
+    from tests.test_omni_speech_integration import condition, independent_hf, pair
+
+    native, hf = pair()
+    torch.manual_seed(33)
+    codes = torch.randint(0, 23, (2, 4, 16))
+    lengths = torch.tensor([4, 2])
+    codes[1, 2:] = -100
+
+    def actual_forward(model):
+        torch.manual_seed(33)
+        return speech_teacher_force(model, condition(model), codes, lengths)
+
+    def reference_forward(model):
+        torch.manual_seed(33)
+        return independent_hf(model, condition(model), codes, lengths)
+
+    # Build conditioning from the same FP32 random tensors; the public projection
+    # inputs must match the BF16 parameter compute policy used by functional_call.
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        actual = gate.compute(native, actual_forward)
+        first, residual = gate.compute(hf, reference_forward)
+    for a, b in ((actual.first_logits, first), (actual.residual_logits, residual)):
+        assert gate.chain.nse(a, b) < 1e-3
+    for first_logits, residual_logits in (
+        (actual.first_logits, actual.residual_logits),
+        (first, residual),
+    ):
+        loss = torch.nn.functional.cross_entropy(
+            first_logits.float().flatten(0, 1), actual.first_labels.flatten(), reduction="sum"
+        )
+        loss += torch.nn.functional.cross_entropy(
+            residual_logits.float().flatten(0, 2), actual.residual_labels.flatten(), reduction="sum"
+        )
+        loss.backward()
+    for name, parameter in native.named_parameters():
+        reference = hf.get_parameter(name)
+        assert parameter.grad is not None and reference.grad is not None, name
+        assert torch.isfinite(parameter.grad).all() and torch.isfinite(reference.grad).all(), name
+        assert gate.chain.nse(parameter.grad, reference.grad) < 1e-2, name

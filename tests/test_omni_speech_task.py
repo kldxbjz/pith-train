@@ -1399,7 +1399,7 @@ def test_native_codec_contract_same_source_roundtrip_and_canonical_no_addresses(
     producer, resumed = native_codec_checkpoint_parts(), native_codec_checkpoint_parts()
     left, right = _model_contract(producer[0]), _model_contract(resumed[0])
     assert left == right
-    assert left["identity"]["schema"] == 2
+    assert left["identity"]["schema"] == 3
     assert left["identity"]["modules"]["code2wav.pre_transformer"]["numerical_attributes"]["theta"]
     target = tmp_path / "same-source.pt"
     save_checkpoint(target, **checkpoint_call_options(producer))
@@ -1436,3 +1436,65 @@ def test_model_contract_rejects_legacy_checkpoint_without_semantic_identity(tmp_
     with pytest.raises(ValueError, match="preflight"):
         load_checkpoint(target, **checkpoint_call_options(parts))
     assert_tree(checkpoint_complete_snapshot(parts), before)
+
+
+def _speech_schedule(factor):
+    return lambda step: 1.0 if step < 2 else factor
+
+
+@pytest.mark.parametrize("change", ["code", "closure"])
+def test_speech_changed_lambda_rejected_without_mutating_state(change, tmp_path):
+    from pithtrain.tasks.omni_speech import save_checkpoint
+
+    original, restored = (
+        list(native_codec_checkpoint_parts()),
+        list(native_codec_checkpoint_parts()),
+    )
+    original[2] = torch.optim.lr_scheduler.LambdaLR(original[1], _speech_schedule(1.0))
+    restored[2] = torch.optim.lr_scheduler.LambdaLR(
+        restored[1],
+        _speech_schedule(0.1) if change == "closure" else (lambda step: 1.0 if step < 2 else 0.1),
+    )
+    target = tmp_path / "speech-lambda.pt"
+    save_checkpoint(target, **checkpoint_call_options(original))
+    before = checkpoint_complete_snapshot(restored)
+    with pytest.raises(ValueError, match="preflight"):
+        load_checkpoint(target, **checkpoint_call_options(restored))
+    assert_tree(before, checkpoint_complete_snapshot(restored))
+
+
+def test_speech_identical_lambda_resume_second_optimizer_update(tmp_path):
+    torch.manual_seed(501)
+    initial = copy.deepcopy(ToySpeech(0.2).state_dict())
+
+    def build():
+        model, optimizer, _ = make("text_and_codec", dropout=0.2)
+        model.load_state_dict(initial)
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _speech_schedule(0.5))
+        return model, optimizer, scheduler, Data([[sample()], [sample(rank=1)]])
+
+    options = dict(device=torch.device("cpu"))
+    cfg = OmniSpeechCfg(mode="text_and_codec", max_updates=2, max_batches=2)
+    original, opt, sched, data = build()
+    torch.manual_seed(39)
+    state = launch(cfg, data, model=original, optimizer=opt, scheduler=sched, **options)
+    expected = checkpoint_complete_snapshot((original, opt, sched, data, state))
+    first, first_opt, first_sched, first_data = build()
+    torch.manual_seed(39)
+    path = tmp_path / "speech-resume.pt"
+    launch(
+        OmniSpeechCfg(mode="text_and_codec", max_updates=1, max_batches=1),
+        first_data,
+        model=first,
+        optimizer=first_opt,
+        scheduler=first_sched,
+        checkpoint_path=path,
+        **options,
+    )
+    resumed, opt, sched, data = build()
+    state = launch(
+        cfg, data, model=resumed, optimizer=opt, scheduler=sched, resume_from=path, **options
+    )
+    assert sched.last_epoch == 2
+    assert all(value["step"].item() == 2 for value in opt.state.values())
+    assert_tree(expected, checkpoint_complete_snapshot((resumed, opt, sched, data, state)))

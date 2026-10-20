@@ -875,10 +875,14 @@ def run_gpu(args):
             fingerprint("even-token-fraction-v1"),
         )
 
-        def publish(version, active_contract):
+        def publish(version, active_contract, semantics):
             canonical = gather_native(training.model, config)
             digest = root_phase(lambda: _weights_digest(canonical))
-            return PolicySnapshot(PolicyIdentity(version, digest, active_contract), canonical)
+            return PolicySnapshot(
+                PolicyIdentity(version, digest, active_contract, semantics["sha256"]),
+                canonical,
+                semantics,
+            )
 
         backend = PithTrainPolicyAdapter.from_training_context(
             export_policy=publish, training_cfg=cfg.training

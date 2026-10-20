@@ -1,9 +1,47 @@
 # Omni acceptance: current entry points and historical evidence
 
-The current scope is Qwen3-Omni Thinker multimodal pretraining with text
-prediction, against `Qwen/Qwen3-Omni-30B-A3B-Instruct` revision
+The target is complete Qwen3-Omni component and training/generation-chain support, against `Qwen/Qwen3-Omni-30B-A3B-Instruct` revision
 `26291f793822fb6be9555850f06dfe95f2d7e695` and Transformers 5.17.0.
-Talker/code2wav, SFT and RL are outside this scope.
+The scope now includes Thinker, native audio/vision, Talker and its residual code
+predictor, Code2Wav, multimodal input processing, conversion, speech training,
+SFT and project-relevant RL integration. It does not include Qwen2.5-Omni or
+other Omni families. An implemented interface is not end-to-end acceptance.
+
+The preserved a8a1302d25140e5f75e9f9fb83d46fdcd891fb59 CPU receipt has
+1813 PASS / 0 FAIL / 0 SKIP and eight passing hooks. It predates the scheduler,
+RL model/forward contract and official full-generation-entry corrections.
+Those corrections need a new source freeze; old CPU/GPU results are not
+transferred to the successor. No native GPU pass is claimed for a8a1302.
+
+| Component or path | Implementation | Acceptance still required |
+| --- | --- | --- |
+| Thinker MoE, T/H/W mRoPE, text loss and routing | Native staged model | Final-source numerical/gradient/topology gates |
+| Audio encoder, vision/DeepStack, image/audio/video/AV insertion | Native trainable components and preprocessing | Each media, gradients and integration |
+| Talker and 16-codebook residual predictor | Native differentiable model | Final-source output/gradient/update and generation |
+| Code2Wav | Native differentiable decoder, batch/chunk decode | Payload conversion, waveform gradients and cross-chunk parity |
+| Full conversion | qwen3_omni.py, including Talker/Code2Wav | Actual released payload; 28010-key header checks are not payload validation |
+| Speech codec/text/waveform training | omni_speech, local replicas and FSDP2 | Native numerical and next-update checkpoint gates |
+| SFT | Task/data/objective and native training entry | Final-source integration and resume |
+| GRPO text policy | Real optimizer loop, explicit rollout/reward/publisher protocol | Concrete external provider integration and native execution |
+| Full text-to-speech generation | Native controller and complete HF reference entry | Natural nonempty output for each media, EOS/caps/multi-turn |
+| Strict continuation | Data/media/processor and model/forward/scheduler contracts | Final-source positive and pre-mutation negative gates |
+
+Open implementation boundaries must not be relabelled as passing: speech
+training is CP=EP=PP=1; Thinker topology support does not imply Talker topology
+support. Speech FSDP training does not establish FSDP generation. GRPO currently
+optimizes text tokens, with caller-supplied rollout/reward/weight transport;
+RVQ/audio-policy RL and a deployed provider are not implemented. Generation
+has no serializable KV/in-flight stream resume. Training checkpoint recovery
+does not validate interrupted generation. Padding/packing, every precision or
+optimizer, and changed-topology strict restore require their own explicit
+support rather than inference from the basic path.
+
+The mandatory final matrix and resource plan must distinguish these code gaps,
+harness defects, infrastructure restrictions and model numerical failures.
+Full-size FP32-master Adam training cannot fit four 80GB cards: ideal four-way
+Thinker master+Adam shards alone use about 85.31 GiB/card (113.74 GiB including
+FP32 gradients), before activations and other components. Do not admit that
+configuration or promise all gates fit one two-hour allocation.
 
 Implementation, CPU contracts and native GPU acceptance are separate states.
 The Week3/Week4 documents preserve earlier implementation and execution
@@ -116,10 +154,9 @@ The historical `omni_noise_regression.py` keeps its original a0b14f7/d237e4c
 commit locks and workload hash. Use `omni_final_noise.py` for an explicitly
 reviewed newer feature SHA; do not edit the historical guards.
 
-The reviewed baseline is `d9c791d0c91978499ea3c4b823d46ed61fee014c`, a descendant of
-`be0b2cb59c865e0fecc05ae7b9a7ebef968bec11` with the same two stable expert-row ordering
-commits applied to the feature and PR101. It retains current upstream,
-reviewed #100/#101 fixes and the shared text stage5 helper. The common
+The reviewed baseline is `1611d085a7c244bb01a34caf8b58d19aef9eeeff`, the exact
+`BASE_SHA` enforced by `omni_final_noise.py`. The obsolete d9c791d baseline
+is not accepted by that driver. Preserve its source-comparison checks. The common
 ordering fix is excluded from this feature-vs-baseline noise comparison;
 it requires its own kernel/reference and strict-resume validation.
 The adapter checks identical numerical/model/data source and declares the

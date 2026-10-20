@@ -20,6 +20,13 @@ import torch.distributed as dist
 
 from pithtrain.config import SlottedDefault
 from pithtrain.modules.microbatch import Microbatch
+from pithtrain.modules.resume_semantics import (
+    callable_contract,
+    implementation_contract,
+    model_contract,
+    scheduler_contract,
+    seal,
+)
 from pithtrain.modules.strict_checkpoint import (
     _check_schema,
     _restore_rng,
@@ -54,6 +61,7 @@ class PolicyIdentity:
     version: int
     weights_sha256: str
     contract: RolloutContract
+    semantics_sha256: str
 
     def validate(self):
         self.contract.validate()
@@ -62,6 +70,9 @@ class PolicyIdentity:
         digest = self.weights_sha256
         if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
             raise ValueError("Policy snapshot must identify exact exported weights")
+        digest = self.semantics_sha256
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise ValueError("Policy snapshot must identify exact model/forward semantics")
 
 
 @dataclass(frozen=True)
@@ -70,6 +81,7 @@ class PolicySnapshot:
     # Transport is caller-owned: a CPU state dict for a toy policy, or a reviewed
     # checkpoint/shard descriptor for a real distributed serving adapter.
     payload: object
+    semantics: dict
 
 
 @dataclass(frozen=True)
@@ -324,15 +336,29 @@ class TorchPolicyAdapter:
             raise ValueError("Use the explicit PithTrain adapter for distributed policy training")
         self.model, self.optimizer, self.scheduler = model, optimizer, scheduler
         self.optimizer_contract = _optimizer_contract(model, (optimizer,))
-        self.forward = forward or (lambda inputs, context: model(*inputs, **context))
+        self.forward = forward
         devices = {value.device for value in (*model.parameters(), *model.buffers())}
         if len(devices) != 1 or next(iter(devices)).type not in ("cpu", "cuda"):
             raise ValueError("Local RL policy requires one CPU or CUDA model device")
         self.device = next(iter(devices))
 
+    def model_semantics(self):
+        model = model_contract(self.model)
+        forward = (
+            dict(default="model(*inputs, **context)", adapter=implementation_contract(type(self)))
+            if self.forward is None
+            else callable_contract(self.forward, bound_objects=((self.model, model),))
+        )
+        return seal(dict(schema=1, model=model, forward=forward))
+
+    def resume_semantics(self):
+        return dict(model=self.model_semantics(), scheduler=scheduler_contract(self.scheduler))
+
     def snapshot(self, version, contract):
         weights = _cpu_tree(self.model.state_dict())
-        return PolicySnapshot(PolicyIdentity(version, _weights_digest(weights), contract), weights)
+        semantics = self.model_semantics()
+        identity = PolicyIdentity(version, _weights_digest(weights), contract, semantics["sha256"])
+        return PolicySnapshot(identity, weights, semantics)
 
     def validate_batch_layout(self, batch, cfg, rewards):
         return None
@@ -342,7 +368,12 @@ class TorchPolicyAdapter:
         self.optimizer.zero_grad(set_to_none=True)
         outputs = []
         for mb in microbatches:
-            result = self.forward(mb.model_inputs, mb.context_for_stage(0) or {})
+            context = mb.context_for_stage(0) or {}
+            result = (
+                self.model(*mb.model_inputs, **context)
+                if self.forward is None
+                else self.forward(mb.model_inputs, context)
+            )
             logits = result[0] if isinstance(result, tuple) else result
             loss, metric = objective((logits,), mb.objective_inputs)
             loss.backward()
@@ -370,7 +401,8 @@ class TorchPolicyAdapter:
         path = Path(path)
         path.mkdir(parents=True, exist_ok=False)
         payload = dict(
-            schema=2,
+            schema=3,
+            semantics=self.resume_semantics(),
             model=_cpu_tree(self.model.state_dict()),
             optimizer=_cpu_tree(self.optimizer.state_dict()),
             optimizer_contract=self.optimizer_contract,
@@ -392,8 +424,10 @@ class TorchPolicyAdapter:
         # RNG byte tensors stay on CPU; model/optimizer loaders copy their own
         # tensors to the model device. Mapping all tensors to CUDA corrupts RNG.
         payload = torch.load(io.BytesIO(raw), map_location="cpu", weights_only=True)
-        if payload["schema"] != 2:
+        if payload["schema"] != 3:
             raise ValueError("Unsupported RL checkpoint schema")
+        if payload["semantics"] != self.resume_semantics():
+            raise ValueError("RL model/forward/scheduler semantics differ")
         _validate_local_rng(payload["rng"])
         state.validate_state_dict(payload["rl"])
         if payload["optimizer_contract"] != self.optimizer_contract:
@@ -494,6 +528,7 @@ class PithTrainPolicyAdapter:
         export_policy,
         clip_grad,
         validation_group=None,
+        training_config=None,
     ):
         if token_group is None:
             raise ValueError("Explicit stage-local DP token group required; WORLD may duplicate PP")
@@ -505,6 +540,7 @@ class PithTrainPolicyAdapter:
         self.pp_rank, self.pp_size, self.dp_rank = pp_rank, pp_size, dp_rank
         self.export_policy, self.clip_grad = export_policy, clip_grad
         self.validation_group = validation_group
+        self.training_config = copy.deepcopy(training_config)
 
     @classmethod
     def from_training_context(cls, *, export_policy, training_cfg, hsdp_replica=1):
@@ -530,13 +566,51 @@ class PithTrainPolicyAdapter:
             pp_size=distributed.pp_size,
             dp_rank=distributed.dp_rank,
             export_policy=export_policy,
+            training_config=training_cfg.to_json_dict(),
             clip_grad=lambda maximum: clip_grad_norm(training.model, maximum, 2, hsdp_replica),
         )
 
+    def model_semantics(self):
+        return seal(
+            dict(
+                schema=1,
+                model=model_contract(self.model),
+                forward=dict(
+                    adapter=implementation_contract(type(self)),
+                    step=implementation_contract(type(self.model).step),
+                ),
+                training=self.training_config,
+            )
+        )
+
+    def resume_semantics(self):
+        return dict(
+            model=self.model_semantics(),
+            schedulers=[scheduler_contract(scheduler) for scheduler in self.schedulers],
+        )
+
     def snapshot(self, version, contract):
-        snapshot = self.export_policy(version, contract)
+        # This is a collective publication boundary, not a hidden collective in
+        # state_dict/resume_config. Bind every PP/EP shard's numerical contract.
+        local, error = None, None
+        try:
+            local = self.model_semantics()
+        except Exception as exc:
+            error = str(exc)
+        _collective_error(error, self.validation_group)
+        ranks = [local]
+        if dist.is_initialized():
+            ranks = [None] * dist.get_world_size(self.validation_group)
+            dist.all_gather_object(ranks, local, group=self.validation_group)
+        semantics = seal(dict(schema=1, kind="native_policy_ranks", ranks=ranks))
+        snapshot = self.export_policy(version, contract, semantics)
         if not isinstance(snapshot, PolicySnapshot):
             raise ValueError("Policy publisher must return a real exported-weight snapshot")
+        if (
+            snapshot.semantics != semantics
+            or snapshot.identity.semantics_sha256 != semantics["sha256"]
+        ):
+            raise ValueError("Policy publisher omitted or changed model/forward semantics")
         return snapshot
 
     def validate_batch_layout(self, batch, cfg, rewards):
@@ -675,6 +749,7 @@ class OmniRLTrainer:
             backend=type(self.backend).__name__,
             torch_version=str(torch.__version__),
             optimizer_contract=copy.deepcopy(self.backend.optimizer_contract),
+            semantics=self.backend.resume_semantics(),
         )
 
     def state_dict(self):
@@ -814,6 +889,11 @@ class OmniRLTrainer:
             try:
                 snapshot = self.backend.snapshot(self.policy_version, self.contract)
                 snapshot.identity.validate()
+                if (
+                    seal(snapshot.semantics["identity"]) != snapshot.semantics
+                    or snapshot.identity.semantics_sha256 != snapshot.semantics["sha256"]
+                ):
+                    raise ValueError("Published policy semantics digest does not match contract")
                 if (
                     snapshot.identity.version != self.policy_version
                     or snapshot.identity.contract != self.contract

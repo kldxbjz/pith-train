@@ -386,13 +386,17 @@ def distributed_worker(rank, directory):
         opt = torch.optim.AdamW(model.parameters(), lr=0.02, weight_decay=0)
         sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda _: 1)
 
-        def export(version, cfg):
+        def export(version, cfg, semantics):
             # Use the local policy exporter on a single-rank-shaped double; no
             # actual external service or production sharded-weight export is tested.
             from pithtrain.tasks.omni_rl import PolicySnapshot, _weights_digest
 
             weights = copy.deepcopy(model.policy.state_dict())
-            return PolicySnapshot(PolicyIdentity(version, _weights_digest(weights), cfg), weights)
+            return PolicySnapshot(
+                PolicyIdentity(version, _weights_digest(weights), cfg, semantics["sha256"]),
+                weights,
+                semantics,
+            )
 
         backend = PithTrainPolicyAdapter(
             model,
@@ -562,15 +566,20 @@ def native_checkpoint_worker(rank, directory):
         initialize_mesh("fsdp-layout", rank)
         token_group = distributed.attn_mesh["dp", "cp"]._flatten().get_group()
         model = PipelineDouble(token_group)
+        model.policy = NormalizedPolicy()
         opt = torch.optim.AdamW(model.parameters(), lr=0.02, weight_decay=0, foreach=False)
-        sched = torch.optim.lr_scheduler.StepLR(opt, 1, gamma=0.9)
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, _schedule_factory(0.9))
         training.model, training.optimizers, training.schedulers = model, (opt,), (sched,)
 
-        def export(version, cfg):
+        def export(version, cfg, semantics):
             from pithtrain.tasks.omni_rl import PolicySnapshot, _weights_digest
 
             weights = copy.deepcopy(model.policy.state_dict())
-            return PolicySnapshot(PolicyIdentity(version, _weights_digest(weights), cfg), weights)
+            return PolicySnapshot(
+                PolicyIdentity(version, _weights_digest(weights), cfg, semantics["sha256"]),
+                weights,
+                semantics,
+            )
 
         backend = PithTrainPolicyAdapter(
             model,
@@ -603,6 +612,37 @@ def native_checkpoint_worker(rank, directory):
         third_model = copy.deepcopy(model.state_dict())
         third_optimizer = copy.deepcopy(opt.state_dict())
         third_task = trainer.state_dict()
+        from pithtrain.modules.distributed_checkpoint import DistributedCheckpointError
+
+        for drift in ("epsilon", "scheduler"):
+            if rank == 1:
+                if drift == "epsilon":
+                    model.policy.norm.eps = 1.0
+                else:
+                    sched.lr_lambdas = [_schedule_factory(0.1)]
+            before = copy.deepcopy(
+                (
+                    model.state_dict(),
+                    opt.state_dict(),
+                    sched.state_dict(),
+                    trainer.state_dict(),
+                    torch.get_rng_state(),
+                )
+            )
+            with pytest.raises(DistributedCheckpointError):
+                backend.load(root / "native", trainer, request_index=2)
+            tree_equal(
+                before,
+                (
+                    model.state_dict(),
+                    opt.state_dict(),
+                    sched.state_dict(),
+                    trainer.state_dict(),
+                    torch.get_rng_state(),
+                ),
+            )
+            model.policy.norm.eps = 1e-5
+            sched.lr_lambdas = [_schedule_factory(0.9)]
         backend.load(root / "native", trainer, request_index=2)
         assert trainer.requests == 2 and trainer.updates == trainer.policy_version == 1
         assert trainer.train_step() == third
@@ -646,10 +686,11 @@ def test_explicit_microbatch_media_and_position_context_are_forwarded_without_sl
 
     trainer = make_trainer(rollout=RewardingRollout(tamper=add_context))
     seen = []
+    model = trainer.backend.model
 
     def forward(inputs, context):
         seen.append({key: value.clone() for key, value in context.items()})
-        return trainer.backend.model(*inputs, **context)
+        return model(*inputs, **context)
 
     trainer.backend.forward = forward
     assert trainer.train_step()["status"] == "UPDATED"
@@ -914,3 +955,110 @@ def test_local_policy_rejects_mixed_device_buffers_before_training():
     model.register_buffer("unsupported", torch.empty(1, device="meta"))
     with pytest.raises(ValueError, match="one CPU or CUDA"):
         TorchPolicyAdapter(model, torch.optim.AdamW(model.parameters()))
+
+
+def _contract_snapshot(trainer):
+    from pithtrain.tasks.omni_rl import _local_rng_state
+
+    backend = trainer.backend
+    return copy.deepcopy(
+        (
+            backend.model.state_dict(),
+            backend.optimizer.state_dict(),
+            backend.scheduler.state_dict(),
+            trainer.state_dict(),
+            _local_rng_state(),
+            [parameter.grad for parameter in backend.model.parameters()],
+        )
+    )
+
+
+def _schedule_factory(factor):
+    return lambda step: 1.0 if step < 2 else factor
+
+
+@pytest.mark.parametrize("drift", ["code", "closure"])
+def test_changed_lambda_policy_rejected_before_any_rl_state_mutation(tmp_path, drift):
+    original = make_trainer()
+    original.backend.scheduler.lr_lambdas = [_schedule_factory(1.0)]
+    original.train_step()
+    original.backend.save(tmp_path / "policy", original)
+    restored = make_trainer()
+    restored.backend.scheduler.lr_lambdas = [
+        (lambda step: 1.0 if step < 2 else 0.1) if drift == "code" else _schedule_factory(0.1)
+    ]
+    # PyTorch's own scheduler serialization cannot distinguish these functions.
+    assert restored.backend.scheduler.state_dict()["lr_lambdas"] == [None]
+    before = _contract_snapshot(restored)
+    with pytest.raises(ValueError, match="semantics"):
+        restored.backend.load(tmp_path / "policy", restored)
+    tree_equal(before, _contract_snapshot(restored))
+
+
+class NormalizedPolicy(ToyPolicy):
+    def __init__(self, eps=1e-5):
+        super().__init__()
+        self.norm = torch.nn.LayerNorm(4, eps=eps)
+
+    def forward(self, ids, **context):
+        return self.norm(super().forward(ids, **context))
+
+
+def _normalized_trainer(eps):
+    model = NormalizedPolicy(eps)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.02)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _schedule_factory(1.0))
+    return OmniRLTrainer(
+        config(),
+        contract=contract(),
+        backend=TorchPolicyAdapter(model, optimizer, scheduler=scheduler),
+        rollout=RewardingRollout(),
+        reward=SymbolReward(),
+    )
+
+
+def test_rl_same_tensors_changed_epsilon_changes_publication_and_rejects_resume(tmp_path):
+    original, restored = _normalized_trainer(1e-5), _normalized_trainer(1.0)
+    tree_equal(original.backend.model.state_dict(), restored.backend.model.state_dict())
+    left, right = (trainer.backend.snapshot(0, contract()) for trainer in (original, restored))
+    assert left.identity.weights_sha256 == right.identity.weights_sha256
+    assert left.identity.semantics_sha256 != right.identity.semantics_sha256
+    assert left.identity != right.identity
+    assert left.semantics != right.semantics
+    original.backend.save(tmp_path / "policy", original)
+    before = _contract_snapshot(restored)
+    with pytest.raises(ValueError, match="semantics"):
+        restored.backend.load(tmp_path / "policy", restored)
+    tree_equal(before, _contract_snapshot(restored))
+
+
+def test_forward_adapter_closure_changes_publication_and_resume_contract(tmp_path):
+    def forward(model, scale):
+        return lambda inputs, context: model(*inputs, **context) * scale
+
+    original, restored = make_trainer(), make_trainer()
+    original.backend.forward = forward(original.backend.model, 1.0)
+    restored.backend.forward = forward(restored.backend.model, 0.5)
+    assert (
+        original.backend.snapshot(0, contract()).identity
+        != restored.backend.snapshot(0, contract()).identity
+    )
+    original.backend.save(tmp_path / "policy", original)
+    before = _contract_snapshot(restored)
+    with pytest.raises(ValueError, match="semantics"):
+        restored.backend.load(tmp_path / "policy", restored)
+    tree_equal(before, _contract_snapshot(restored))
+
+
+def test_identical_lambda_factory_resume_next_two_updates_are_bitwise_equal(tmp_path):
+    original = make_trainer()
+    original.backend.scheduler.lr_lambdas = [_schedule_factory(0.5)]
+    original.train_step()
+    original.backend.save(tmp_path / "policy", original)
+    expected = [original.train_step(), original.train_step()]
+    snapshot = _contract_snapshot(original)
+    restored = make_trainer()
+    restored.backend.scheduler.lr_lambdas = [_schedule_factory(0.5)]
+    restored.backend.load(tmp_path / "policy", restored)
+    assert [restored.train_step(), restored.train_step()] == expected
+    tree_equal(snapshot, _contract_snapshot(restored))

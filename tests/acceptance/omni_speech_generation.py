@@ -1,8 +1,9 @@
 """Bounded native Thinker -> 16-group Talker -> Code2Wav GPU generation parity.
 
-Uses the source-bound tiny speech_chain fixture, official HF 5.17 component
-forwards/helpers and cached Talker.generate as an independent reference. Five
-unforced greedy media cases are distinct from explicit EOS/ragged controls.
+Uses the source-bound tiny speech_chain fixture and the actual HF 5.17 full
+Qwen3OmniMoeForConditionalGeneration.generate entry point. Every media case
+requires unforced nonempty speech. EOS/ragged and decoder chunk controls are
+reported separately from natural end-to-end generation.
 No downloads, released-weight quality, sampling-quality or FSDP generation claim.
 """
 
@@ -20,9 +21,9 @@ from torch.func import functional_call
 
 from tests.acceptance import omni_speech_chain as chain
 
-SCHEMA = "qwen3_omni_generation_acceptance_v1"
-TEXT_TOKENS = 2
-CODEC_FRAMES = 3
+SCHEMA = "qwen3_omni_generation_acceptance_v2"
+TEXT_TOKENS = 4
+CODEC_FRAMES = 8
 OUTPUT_NSE = chain.OUTPUT_NSE
 MEDIA = chain.MEDIA
 
@@ -109,60 +110,47 @@ def prompt_sample(sample):
     )
 
 
-def hf_features(model, sequence, context):
-    from tests.acceptance.omni_multimodal_training import positions
-    from tests.acceptance.omni_reference_attention import reference_attention_kwargs
+def official_composite(reference):
+    """Use the real HF composite with the already paired official components.
 
-    inputs = dict(context, input_ids=sequence, attention_mask=torch.ones_like(sequence))
-    inputs.update(
-        position_ids=positions(model.config.thinker_config, inputs),
-        use_cache=False,
-        output_hidden_states=True,
-        **reference_attention_kwargs(model.thinker),
-    )
-    return model.thinker(**inputs)
-
-
-def hf_condition(model, sequence, output, batch):
+    Construct its ordinary class on meta to avoid duplicating stored weights;
+    install only the same official submodules, never a project generation loop.
+    No reference forward/generate implementation is replaced.
+    """
     from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
         Qwen3OmniMoeForConditionalGeneration as HFComposite,
     )
 
-    config = model.config
-    embed, hidden = (
-        output.hidden_states[0],
-        output.hidden_states[config.talker_config.accept_hidden_layer],
-    )
-    specials = sequence.new_tensor(
-        [[config.tts_bos_token_id, config.tts_eos_token_id, config.tts_pad_token_id]]
-    )
-    bos, eos, pad = model.talker.text_projection(
-        model.thinker.get_input_embeddings()(specials)
-    ).chunk(3, 1)
-    multimodal = sum(
-        (sequence == getattr(config.thinker_config, name)).int()
-        for name in ("image_token_id", "video_token_id", "audio_token_id")
-    ).bool()
-    start = batch["prompt_lengths"][0] - 3
-    user = HFComposite._get_talker_user_parts(model, 0, start, multimodal, hidden, embed)
-    assistant, assistant_ids, tail = HFComposite._get_talker_assistant_parts(
-        model,
-        start,
-        sequence.shape[1],
-        config.talker_config.speaker_id["ethan"],
-        embed,
-        pad,
-        bos,
-        eos,
-    )
-    ids = torch.cat((sequence[:, :start], assistant_ids), 1)
-    return dict(
-        inputs_embeds=torch.cat((user, assistant), 1),
-        talker_input_ids=ids,
-        attention_mask=torch.ones_like(ids),
-        trailing_text_hidden=tail,
-        tts_pad_embed=pad,
-    )
+    with torch.random.fork_rng(devices=[]), torch.device("meta"):
+        result = HFComposite(copy.deepcopy(reference.config))
+    for name in ("thinker", "talker", "code2wav"):
+        if type(getattr(result, name)) is not type(getattr(reference, name)):
+            raise chain.PreconditionError("Composite reference requires official HF components")
+        setattr(result, name, getattr(reference, name))
+    if not result.has_talker or state_hash(result) != state_hash(reference):
+        raise chain.PreconditionError("Composite reference did not retain the paired full state")
+    return result
+
+
+@contextmanager
+def observe_method(owner, name, observer):
+    """Observe an original result without replacing its value or its algorithm."""
+    original = getattr(owner, name)
+    existed, previous = name in owner.__dict__, owner.__dict__.get(name)
+
+    def observed(*args, **kwargs):
+        result = original(*args, **kwargs)
+        observer(args, kwargs, result)
+        return result
+
+    setattr(owner, name, observed)
+    try:
+        yield
+    finally:
+        if existed:
+            setattr(owner, name, previous)
+        else:
+            delattr(owner, name)
 
 
 def position_kwargs(batch):
@@ -219,36 +207,111 @@ def hf_codec(model, condition, batch, *, max_frames=CODEC_FRAMES, logits_process
     return SimpleNamespace(codes=codes, code_lengths=lengths, reached_eos=reached, waveforms=waves)
 
 
-def hf_generate(model, batch, *, eos_id=None):
+def hf_generate(model, batch, *, eos_id=None, text_tokens=TEXT_TOKENS, codec_frames=CODEC_FRAMES):
+    """Invoke the unmodified official composite, including its conditioning state machine."""
+    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+        Qwen3OmniMoeForConditionalGeneration as HFComposite,
+    )
+
+    from tests.acceptance.omni_reference_attention import reference_attention_kwargs
+
+    if type(model) is not HFComposite:
+        raise TypeError("Generation reference must be the actual official HF composite class")
     eos_id = model.config.im_end_token_id if eos_id is None else eos_id
-    sequence = batch["input_ids"].clone()
-    prompt_length, reached, logits = sequence.shape[1], False, []
-    for _ in range(TEXT_TOKENS):
-        output = hf_features(model, sequence, batch["model_context"])
-        logits.append(output.logits[:, -1].float().clone())
-        token = output.logits[:, -1].argmax(-1)
-        if int(token[0]) == eos_id:
-            reached = True
-            break
-        sequence = torch.cat((sequence, token[:, None]), 1)
-    speech, condition = None, None
-    if sequence.shape[1] > prompt_length:
-        output = hf_features(model, sequence, batch["model_context"])
-        logits.append(output.logits[:, -1].float().clone())
-        condition = hf_condition(model, sequence, output, batch)
-        speech = hf_codec(model, condition, batch)
-    if reached:
-        sequence = torch.cat((sequence, token[:, None]), 1)
+    capture = {}
+
+    def thinker(args, kwargs, output):
+        capture["thinker"] = output
+
+    def talker(args, kwargs, output):
+        capture["talker"] = output
+        capture["condition"] = {
+            key: kwargs[key].detach().clone()
+            for key in (
+                "inputs_embeds",
+                "talker_input_ids",
+                "attention_mask",
+                "trailing_text_hidden",
+                "tts_pad_embed",
+            )
+        }
+
+    def decoder(args, kwargs, output):
+        capture["codes"] = args[0].detach().clone()
+        capture["waveform"] = output.detach().clone()
+
+    context = dict(batch["model_context"])
+    context.pop("input_ids", None)
+    context.pop("position_ids", None)
+    options = dict(
+        context,
+        thinker_max_new_tokens=text_tokens,
+        thinker_eos_token_id=eos_id,
+        thinker_do_sample=False,
+        thinker_pad_token_id=model.config.im_end_token_id,
+        thinker_output_logits=True,
+        talker_max_new_tokens=codec_frames + 1,
+        talker_do_sample=False,
+        talker_temperature=1.0,
+        talker_pad_token_id=model.config.talker_config.codec_pad_id,
+        # Public override for the tiny RVQ vocabulary. The released default
+        # suppresses the final1024 tokens and cannot index a41-token fixture.
+        talker_suppress_tokens=[
+            i
+            for i in range(
+                model.config.talker_config.code_predictor_config.vocab_size,
+                model.config.talker_config.text_config.vocab_size,
+            )
+            if i != model.config.talker_config.codec_eos_token_id
+        ],
+        return_audio=True,
+    )
+    options.update(
+        {
+            f"thinker_{key}": value
+            for key, value in reference_attention_kwargs(model.thinker).items()
+        }
+    )
+    with (
+        observe_method(model.thinker, "generate", thinker),
+        observe_method(model.talker, "generate", talker),
+        observe_method(model.code2wav, "chunked_decode", decoder),
+    ):
+        sequences, waveform = model.generate(input_ids=batch["input_ids"], **options)
+    if set(capture) != {"thinker", "talker", "condition", "codes", "waveform"}:
+        raise AssertionError("Official composite did not execute every component")
+    codes = capture["codes"].transpose(1, 2)
+    if (
+        codes.ndim != 3
+        or codes.shape[0] != 1
+        or codes.shape[-1] != 16
+        or codes.shape[1] > codec_frames
+    ):
+        raise AssertionError("Official composite codec output exceeds the reviewed B1/16-group cap")
+    chain.exact(waveform, capture["waveform"].float(), "official-returned-waveform")
+    generated = sequences[:, batch["input_ids"].shape[1] :]
+    reached = bool((generated == eos_id).any())
+    first = capture["talker"].sequences[:, :codec_frames]
+    codec_eos = (first == model.config.talker_config.codec_eos_token_id).any(-1)
+    speech = SimpleNamespace(
+        codes=codes,
+        code_lengths=codes.new_tensor([codes.shape[1]]),
+        reached_eos=codec_eos,
+        waveforms=[waveform[0].float()],
+    )
     return SimpleNamespace(
-        sequences=sequence,
+        sequences=sequences,
         text_reached_eos=reached,
         speech=speech,
-        logits=logits,
-        condition=condition,
+        logits=[value.float().clone() for value in capture["thinker"].logits],
+        condition=capture["condition"],
+        reference_entrypoint="transformers.Qwen3OmniMoeForConditionalGeneration.generate",
     )
 
 
-def native_generate(model, batch, *, eos_id=None):
+def native_generate(
+    model, batch, *, eos_id=None, text_tokens=TEXT_TOKENS, codec_frames=CODEC_FRAMES
+):
     rows, original = [], model.thinker.forward_epilog
     had_override = "forward_epilog" in model.thinker.__dict__
     prior_override = model.thinker.__dict__.get("forward_epilog")
@@ -264,8 +327,8 @@ def native_generate(model, batch, *, eos_id=None):
         output = model.generate(
             batch["input_ids"],
             batch["model_context"],
-            max_text_tokens=TEXT_TOKENS,
-            max_codec_frames=CODEC_FRAMES,
+            max_text_tokens=text_tokens,
+            max_codec_frames=codec_frames,
             text_eos_token_id=eos_id,
             do_sample=False,
             position_kwargs=batch["position_kwargs"],
@@ -332,9 +395,18 @@ def compare_speech(actual, expected):
 
 def compare_generation(actual, rows, expected, prompt_length):
     chain.exact(actual.sequences, expected.sequences, "generated-text")
-    if actual.text_reached_eos != expected.text_reached_eos or len(rows) != len(expected.logits):
-        raise AssertionError("Text EOS or forward observation count differs")
-    errors = [chain.nse(left, right) for left, right in zip(rows, expected.logits, strict=True)]
+    expected_steps = expected.sequences.shape[1] - prompt_length
+    if (
+        actual.text_reached_eos != expected.text_reached_eos
+        or len(expected.logits) != expected_steps
+        or len(rows) != expected_steps
+    ):
+        raise AssertionError("Text EOS or generation/conditioning forward count differs")
+    # Both state machines expose one actual decode forward per sampled token.
+    errors = [
+        chain.nse(left, right)
+        for left, right in zip(rows[:expected_steps], expected.logits, strict=True)
+    ]
     if not errors or any(error >= OUTPUT_NSE for error in errors):
         raise AssertionError("Native/HF Thinker generation logits differ")
     return dict(
@@ -347,6 +419,7 @@ def compare_generation(actual, rows, expected, prompt_length):
         hf_generated_tokens=expected.sequences[:, prompt_length:].tolist(),
         text_reached_eos=actual.text_reached_eos,
         thinker_logits_nse=errors,
+        native_conditioning_forwards=0,
         **compare_speech(actual.speech, expected.speech),
     )
 
@@ -438,11 +511,87 @@ def hf_position_metadata(hf, config):
             del owner.audio_config
 
 
+def multi_turn(batch, config):
+    # Earlier user/assistant turns, with the original media-bearing user turn
+    # and its exact grids/features retained. These are explicit prompt tokens.
+    ids = batch["input_ids"]
+    prefix = ids.new_tensor(
+        [
+            [
+                config.im_start_token_id,
+                config.user_token_id,
+                198,
+                40,
+                config.im_end_token_id,
+                198,
+                config.im_start_token_id,
+                config.assistant_token_id,
+                198,
+                41,
+                config.im_end_token_id,
+                198,
+            ]
+        ]
+    )
+    sequence = torch.cat((prefix, ids), 1)
+    return dict(
+        batch,
+        input_ids=sequence,
+        model_context=dict(
+            batch["model_context"], input_ids=sequence, attention_mask=torch.ones_like(sequence)
+        ),
+        prompt_lengths=[sequence.shape[1]],
+    )
+
+
+def require_nonempty_case(report, name):
+    if not report["waveforms"] or any(w["samples"] <= 0 for w in report["waveforms"]):
+        raise AssertionError(f"{name}: every natural media case must produce nonempty speech")
+
+
+def chunk_boundary(native, hf, speech):
+    """Decoder-only301-frame boundary, explicitly not a natural generation claim."""
+    length = int(speech.code_lengths[0])
+    if length < 1:
+        raise AssertionError("Chunk control requires a real unforced codec prefix")
+    source = speech.codes[:, :length].transpose(1, 2)
+    frames, chunk, context = 301, 300, 25
+    codes = source.repeat(1, 1, (frames + length - 1) // length)[..., :frames]
+    actual = compute(
+        native,
+        lambda model: model.code2wav.chunked_decode(
+            codes, chunk_size=chunk, left_context_size=context
+        ),
+    )
+    expected = compute(
+        hf,
+        lambda model: model.code2wav.chunked_decode(
+            codes, chunk_size=chunk, left_context_size=context
+        ),
+    )
+    error = chain.nse(actual.float(), expected.float())
+    if actual.shape != expected.shape or error >= OUTPUT_NSE or actual.shape[-1] <= 0:
+        raise AssertionError("Code2Wav300/301 chunk-boundary parity failed")
+    return dict(
+        status="PASS",
+        scope="decoder_component_chunk_boundary",
+        source="repeated_unforced_codec_prefix_not_natural_301_frame_generation",
+        source_frames=length,
+        code_groups=16,
+        frames=frames,
+        chunk_size=chunk,
+        left_context_size=context,
+        chunks=2,
+        codes_sha256=chain.tensor_tree(codes)["sha256"],
+        shape=list(actual.shape),
+        finite=True,
+        nse=error,
+    )
+
+
 @torch.no_grad()
 def validate(args, config, samples, native, hf):
-    native, hf = native.model, hf.model
-    # Official HF Talker position helper requires this official Thinker metadata.
-    # No model expression, weight, logit or native result is substituted.
+    native, hf = native.model, official_composite(hf.model)
     cases, boundaries, text_context = {}, {}, None
     with preserve_generation_state(native, hf) as preservation, hf_position_metadata(hf, config):
         for sample in samples:
@@ -450,51 +599,71 @@ def validate(args, config, samples, native, hf):
             actual, rows = compute(native, native_generate, batch)
             expected = compute(hf, hf_generate, batch)
             report = compare_generation(actual, rows, expected, batch["input_ids"].shape[1])
+            require_nonempty_case(report, sample["media_kind"])
             report["media_kind"] = sample["media_kind"]
             cases[sample["media_kind"]] = report
             chain.write_json(args.output / f"generation-{sample['media_kind']}.json", report)
             if sample["media_kind"] == "text":
-                text_context = batch, expected
-        if set(cases) != set(MEDIA) or not any(
-            w["samples"] > 0 for c in cases.values() for w in c["waveforms"]
-        ):
-            raise AssertionError(
-                "All media and at least one actual nonempty end-to-end waveform are required"
+                text_context = batch, expected, actual
+        if set(cases) != set(MEDIA):
+            raise AssertionError("All five unforced media cases are mandatory")
+        batch, previous, actual_text = text_context
+        variants = {
+            "multiturn": (multi_turn(batch, config), {}),
+            "cap": (batch, dict(text_tokens=2, codec_frames=1)),
+        }
+        for name, (prompt, options) in variants.items():
+            actual, rows = compute(native, native_generate, prompt, **options)
+            expected = compute(hf, hf_generate, prompt, **options)
+            report = compare_generation(actual, rows, expected, prompt["input_ids"].shape[1])
+            require_nonempty_case(report, name)
+            report.update(
+                scope=f"unforced_{name}_generation",
+                limits=options or dict(text_tokens=TEXT_TOKENS, codec_frames=CODEC_FRAMES),
             )
-        batch, previous = text_context
-        # Use the independent HF result dynamically, never a hard-coded seed token.
-        eos_id = int(previous.logits[0].argmax(-1)[0])
+            if name == "cap" and (
+                actual.text_reached_eos
+                or actual.speech.reached_eos.any()
+                or actual.sequences.shape[1] != prompt["input_ids"].shape[1] + 2
+                or actual.speech.code_lengths.tolist() != [1]
+            ):
+                raise AssertionError("Natural cap control did not reach both original caps")
+            boundaries[name] = report
+            chain.write_json(args.output / f"generation-{name}.json", report)
+        generated = previous.sequences[0, batch["input_ids"].shape[1] :]
+        if generated.numel() < 2 or generated[0] == generated[1]:
+            raise AssertionError("Unforced fixture cannot supply a distinct delayed-EOS control")
+        eos_id = int(generated[1])
         actual, rows = compute(native, native_generate, batch, eos_id=eos_id)
         expected = compute(hf, hf_generate, batch, eos_id=eos_id)
         boundary = compare_generation(actual, rows, expected, batch["input_ids"].shape[1])
         if (
             not actual.text_reached_eos
-            or actual.speech is not None
-            or actual.sequences.shape[1] != batch["input_ids"].shape[1] + 1
+            or actual.sequences.shape[1] != batch["input_ids"].shape[1] + 2
         ):
-            raise AssertionError("Immediate Thinker EOS must produce no speech")
+            raise AssertionError("Explicit delayed EOS did not stop after exactly two tokens")
+        require_nonempty_case(boundary, "delayed_eos")
         boundary.update(
-            scope="explicit_text_eos_boundary", eos_id=eos_id, immediate_eos_no_speech=True
+            scope="explicit_delayed_text_eos_control", eos_id=eos_id, eos_generated_index=1
         )
         boundaries["eos"] = boundary
         chain.write_json(args.output / "generation-eos.json", boundary)
-        if previous.condition is None:
-            raise AssertionError(
-                "Text fixture produced no condition for the separate ragged control"
-            )
         boundaries["ragged"] = ragged_control(native, hf, previous.condition, batch)
         chain.write_json(args.output / "generation-ragged.json", boundaries["ragged"])
+        boundaries["chunk"] = chunk_boundary(native, hf, actual_text.speech)
+        chain.write_json(args.output / "generation-chunk.json", boundaries["chunk"])
     return dict(
         status="PASS",
         cases=cases,
         boundaries=boundaries,
         **preservation,
         native_parameter_count=len(list(native.named_parameters())),
-        reference="official HF 5.17 forwards/conditioning helpers/cached Talker.generate/Code2Wav",
+        reference="official Transformers5.17 full Qwen3OmniMoeForConditionalGeneration.generate",
+        reference_entrypoint="transformers.Qwen3OmniMoeForConditionalGeneration.generate",
         precision="FP32 model leaves/rotary buffers; functional BF16 compute parameters",
-        nonempty_waveform_cases=sum(
-            any(w["samples"] > 0 for w in c["waveforms"]) for c in cases.values()
-        ),
+        nonempty_waveform_cases=len(cases),
+        immediate_text_eos="NATIVE_CPU_CONTROL_ONLY; official_composite_audio_parity_NOT_ESTABLISHED",
+        independent_attention_math="NOT_ESTABLISHED; separate original FP64 math gates required",
     )
 
 
@@ -512,6 +681,7 @@ def main():
         status="NOT_RUN",
         gpu_acceptance="NOT_RUN",
         seed=chain.SEED,
+        released_config_revision=chain.REVISION,
         limits=dict(text_tokens=TEXT_TOKENS, codec_frames=CODEC_FRAMES),
         thresholds=dict(output_nse=OUTPUT_NSE),
         full_size="NOT_RUN",

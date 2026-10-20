@@ -370,3 +370,59 @@ def test_gpu_combined_mesh_can_be_prepared_without_cuda(tmp_path):
     )
     assert args.world_size == 4 and args.pp == args.ep == 2
     assert not torch.cuda.is_initialized()
+
+
+def _native_lr_factory(factor):
+    return lambda step: 1.0 if step < 2 else factor
+
+
+def scheduler_contract_worker(rank, directory):
+    root = Path(directory)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{root / 'lambda-rendezvous'}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        torch.set_num_threads(1)
+        meshes = initialize_mesh("fsdp-layout", rank)
+
+        def make_parts():
+            model, optimizer, _, data = build(*meshes)
+            scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _native_lr_factory(0.5))
+            training.schedulers = (scheduler,)
+            return model, optimizer, scheduler, data
+
+        parts = make_parts()
+        contract = dict(test="strict-lambda-v1", training=dict(global_batch_size=2))
+        advance(parts)
+        save_checkpoint(
+            root / "lambda", 1, data_state=parts[3], strict=True, resume_config=contract
+        )
+        advance(parts)
+        expected = snapshot(parts)
+        restored = make_parts()
+        if rank == 1:
+            restored[2].lr_lambdas = [_native_lr_factory(0.1)]
+        before = snapshot(restored)
+        with pytest.raises(DistributedCheckpointError, match="configuration"):
+            load_checkpoint(
+                root / "lambda", 1, data_state=restored[3], strict=True, resume_config=contract
+            )
+        equal(snapshot(restored), before)
+        restored[2].lr_lambdas = [_native_lr_factory(0.5)]
+        load_checkpoint(
+            root / "lambda", 1, data_state=restored[3], strict=True, resume_config=contract
+        )
+        advance(restored)
+        equal(snapshot(restored), expected)
+        assert restored[2].last_epoch == 2
+        assert all(value["step"].item() == 2 for value in restored[1].state.values())
+    finally:
+        dist.destroy_process_group()
+
+
+def test_native_lambda_semantics_collective_rejection_and_exact_next_update(tmp_path):
+    mp.spawn(scheduler_contract_worker, args=(str(tmp_path),), nprocs=2, join=True)

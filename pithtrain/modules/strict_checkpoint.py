@@ -19,6 +19,7 @@ from torch.distributed.tensor import DTensor
 
 from pithtrain.contexts import distributed
 from pithtrain.modules.checkpoint import CheckpointState
+from pithtrain.modules.resume_semantics import scheduler_contract
 
 
 class StrictResumeError(ValueError):
@@ -146,6 +147,7 @@ class StrictResumeState:
             "global_batch_size": self.global_batch_size,
             "optimizer_types": [_type_name(opt) for opt in self.base.optimizers],
             "scheduler_types": [_type_name(sch) for sch in self.base.schedulers],
+            "scheduler_contracts": [scheduler_contract(sch) for sch in self.base.schedulers],
             "rng": _rng_state(self.device),
         }
         return result
@@ -168,7 +170,14 @@ class StrictResumeState:
 
     def _validate(self, loaded, expected):
         _check_schema(loaded, expected)
-        for field in ("version", "step", "global_batch_size", "optimizer_types", "scheduler_types"):
+        for field in (
+            "version",
+            "step",
+            "global_batch_size",
+            "optimizer_types",
+            "scheduler_types",
+            "scheduler_contracts",
+        ):
             if loaded["resume"][field] != expected["resume"][field]:
                 raise StrictResumeError(f"resume.{field}: incompatible training continuation")
         self._check_data_position(loaded["data"])

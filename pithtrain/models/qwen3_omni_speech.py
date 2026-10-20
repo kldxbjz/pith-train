@@ -393,13 +393,14 @@ def prepare_talker_condition(
 
 def codec_embeddings(talker, codes):
     """Sum the first and all residual codebook embeddings, as the Talker does."""
-    result = talker.get_input_embeddings()(codes[..., 0])
     embeddings = talker.code_predictor.get_input_embeddings()
     if codes.shape[-1] != len(embeddings) + 1:
         raise ValueError("Codec group count differs from the residual predictor")
-    for index, embedding in enumerate(embeddings):
-        result = result + embedding(codes[..., index + 1])
-    return result
+    values = [talker.get_input_embeddings()(codes[..., 0])]
+    values.extend(embedding(codes[..., index + 1]) for index, embedding in enumerate(embeddings))
+    # Match HF's single reduction over all codebooks. Sequential BF16 additions
+    # round after every group and change the next frame's autoregressive input.
+    return torch.stack(values, dim=-2).sum(dim=-2)
 
 
 def _append_positions(condition, count):
@@ -607,20 +608,22 @@ class Qwen3OmniMoeSpeechModel(nn.Module):
                     break
                 sequence = torch.cat((sequence, token[:, None]), dim=1)
             speech = None
-            # Immediate text EOS produces empty audio rather than a fabricated codec frame.
-            if return_audio and sequence.shape[1] > prompt_length:
-                context.update(input_ids=sequence, attention_mask=torch.ones_like(sequence))
-                features = thinker_speech_forward(
-                    self.thinker,
-                    sequence,
-                    context,
-                    self.config.talker_config.accept_hidden_layer,
-                )
+            # HF composite generation conditions on actual decode forwards:
+            # the last sampled token has no hidden state until a later forward.
+            # Reuse the final decode features instead of forwarding that token
+            # once more and silently extending Talker's trailing text sequence.
+            condition_length = features.embeddings.shape[1]
+            if (
+                return_audio
+                and sequence.shape[1] > prompt_length
+                and condition_length > assistant_header_end
+            ):
+                conditioning_ids = sequence[:, :condition_length]
                 condition = prepare_talker_condition(
                     self.talker,
                     features.embeddings,
                     features.hidden_states,
-                    sequence,
+                    conditioning_ids,
                     config=self.config,
                     text_embedding=self.thinker.embed_tokens,
                     prompt_lengths=[assistant_header_end],

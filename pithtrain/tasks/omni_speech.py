@@ -9,8 +9,6 @@ and native GPU parity need independent validation for the chosen model size.
 
 import copy
 import hashlib
-import inspect
-import json
 import math
 import os
 import random
@@ -19,7 +17,6 @@ import uuid
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -28,6 +25,8 @@ from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
 from torch.nn.parallel import DistributedDataParallel
 
+from pithtrain.modules.resume_semantics import model_contract as _model_contract
+from pithtrain.modules.resume_semantics import scheduler_contract
 from pithtrain.tasks.omni_objectives import (
     TargetLoss,
     global_target_counts,
@@ -339,173 +338,6 @@ def _topology(group):
     )
 
 
-_NUMERICAL_ATTRIBUTES = (
-    "base",
-    "theta",
-    "rope_theta",
-    "rope_type",
-    "head_dim",
-    "dim",
-    "sections",
-    "mrope_section",
-    "interleaved",
-    "variance_epsilon",
-    "eps",
-    "scaling",
-    "scale",
-    "attention_scaling",
-    "attention_dropout",
-    "dropout",
-    "p",
-    "sliding_window",
-    "activation",
-    "hidden_act",
-    "attn_implementation",
-    "num_heads",
-    "num_kv_heads",
-    "num_key_value_groups",
-    "top_k",
-    "num_experts_per_tok",
-    "norm_topk_prob",
-    "num_experts",
-    "num_code_groups",
-    "num_quantizers",
-    "patch_size",
-    "temporal_patch_size",
-    "spatial_merge_size",
-    "deepstack_visual_indexes",
-    "use_postshuffle_norm",
-    "n_window",
-    "n_window_infer",
-    "upsample_factor",
-    "upsample_rates",
-    "upsampling_ratios",
-    "stride",
-    "padding",
-    "dilation",
-    "groups",
-    "padding_mode",
-    "ceil_mode",
-    "count_include_pad",
-    "normalized_shape",
-)
-
-
-def _canonical_model_value(value):
-    """Stable JSON values only: no object repr, addresses, tensors or runtime caches."""
-    if value is None or type(value) in (bool, int, str):
-        return value
-    if type(value) is float:
-        if not math.isfinite(value):
-            raise ValueError("Nonfinite speech model configuration")
-        return value
-    if isinstance(value, torch.dtype):
-        return str(value)
-    if isinstance(value, (tuple, list)):
-        return [_canonical_model_value(item) for item in value]
-    if isinstance(value, dict):
-        if any(type(key) not in (str, int) for key in value):
-            raise ValueError("Speech config mapping keys must be strings or integers")
-        # HF id2label uses integer keys. Type tags avoid int/string collisions.
-        tagged = {
-            ("s:" if type(key) is str else "i:") + str(key): item for key, item in value.items()
-        }
-        return {key: _canonical_model_value(tagged[key]) for key in sorted(tagged)}
-    if hasattr(value, "to_dict"):
-        return _canonical_model_value(value.to_dict())
-    if isinstance(value, SimpleNamespace):
-        return _canonical_model_value(vars(value))
-    raise ValueError(f"Unsupported speech model contract value type: {type(value).__name__}")
-
-
-def _model_contract(model):
-    """Bind configuration AND actual non-tensor model semantics before any restore.
-
-    FSDP's generated wrapper class is normalized to its original module class.
-    No parameters/buffers are read or gathered. Dynamic caches and training mode
-    are excluded; the checkpoint separately owns mutable tensor/mode/RNG state.
-    """
-    base = _base(model)
-    config = base.config
-    composite = _canonical_model_value(config)
-    for name in ("thinker", "talker", "code2wav"):
-        expected = getattr(config, name + "_config", None)
-        actual = getattr(getattr(base, name), "config", None)
-        if expected is not None and actual is not None:
-            if _canonical_model_value(expected) != _canonical_model_value(actual):
-                raise ValueError(f"Speech component config differs from composite: {name}")
-
-    def semantic_config(name):
-        component = name.split(".", 1)[0]
-        cfg = getattr(config, component + "_config", None)
-        if cfg is None:
-            return None
-        if component == "thinker":
-            field = (
-                "vision_config"
-                if name.startswith("thinker.visual")
-                else "audio_config"
-                if name.startswith("thinker.audio_tower")
-                else "text_config"
-            )
-            return getattr(cfg, field, cfg)
-        if component == "talker":
-            field = (
-                "code_predictor_config"
-                if name.startswith("talker.code_predictor")
-                else "text_config"
-            )
-            return getattr(cfg, field, cfg)
-        return cfg
-
-    files, modules = {}, {}
-    for name, module in base.named_modules():
-        cls = type(module)
-        if isinstance(module, FSDPModule):
-            cls = next(
-                candidate
-                for candidate in cls.__mro__[1:]
-                if issubclass(candidate, torch.nn.Module) and not issubclass(candidate, FSDPModule)
-            )
-        identifier = cls.__module__ + "." + cls.__qualname__
-        source = inspect.getsourcefile(cls)
-        if source is None:
-            raise ValueError(f"Speech model implementation source unavailable: {identifier}")
-        if source not in files:
-            files[source] = hashlib.sha256(Path(source).read_bytes()).hexdigest()
-        attributes = {
-            key: _canonical_model_value(getattr(module, key))
-            for key in _NUMERICAL_ATTRIBUTES
-            if hasattr(module, key)
-            # Child modules have their own entry; tensor state is checkpointed separately.
-            and not isinstance(getattr(module, key), (torch.nn.Module, torch.Tensor))
-        }
-        cfg = semantic_config(name)
-        if cfg is not None and cls.__module__.startswith("pithtrain.models.qwen3_omni"):
-            if hasattr(module, "variance_epsilon") and hasattr(cfg, "rms_norm_eps"):
-                if module.variance_epsilon != cfg.rms_norm_eps:
-                    raise ValueError(f"Runtime RMS epsilon differs from config: {name}")
-            if "RotaryEmbedding" in cls.__name__ or (
-                cls.__name__ == "Qwen3OmniMoeCode2WavTransformerModel"
-            ):
-                rope = getattr(cfg, "rope_parameters", None) or {}
-                expected_theta = rope.get("rope_theta", getattr(cfg, "rope_theta", 10000.0))
-                actual_theta = getattr(module, "theta", getattr(module, "base", None))
-                if actual_theta != expected_theta:
-                    raise ValueError(f"Runtime RoPE theta differs from config: {name}")
-        modules[name] = dict(
-            implementation=identifier,
-            implementation_sha256=files[source],
-            numerical_attributes=attributes,
-            config=_canonical_model_value(module.config) if hasattr(module, "config") else None,
-        )
-    identity = dict(
-        schema=2, kind="qwen3_omni_speech_config_and_runtime", config=composite, modules=modules
-    )
-    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
-    return dict(identity=identity, sha256=hashlib.sha256(encoded).hexdigest())
-
-
 def _manifest(cfg, model, optimizer, scheduler, group, reduction):
     base = _base(model)
     names = {id(p): name for name, p in base.named_parameters()}
@@ -525,9 +357,7 @@ def _manifest(cfg, model, optimizer, scheduler, group, reduction):
         trainable=[(n, p.requires_grad) for n, p in base.named_parameters()],
         optimizer=type(optimizer).__module__ + "." + type(optimizer).__qualname__,
         param_groups=[[names[id(p)] for p in g["params"]] for g in optimizer.param_groups],
-        scheduler=None
-        if scheduler is None
-        else type(scheduler).__module__ + "." + type(scheduler).__qualname__,
+        scheduler=scheduler_contract(scheduler),
     )
 
 

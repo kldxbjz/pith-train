@@ -144,14 +144,34 @@ def make_wsd_scheduler(
             case "linear":
                 return 1.0 + (final_factor - 1.0) * t
 
-    return tuple(LambdaLR(opt, lr_lambda) for opt in training.optimizers)
+    from pithtrain.modules.resume_semantics import bind_scheduler_factory
+
+    return bind_scheduler_factory(
+        tuple(LambdaLR(opt, lr_lambda) for opt in training.optimizers),
+        make_wsd_scheduler,
+        dict(
+            lr=cfg.lr,
+            max_steps=cfg.max_steps,
+            start_lr=start_lr,
+            warmup_ratio=warmup_ratio,
+            final_lr=final_lr,
+            decay_ratio=decay_ratio,
+            decay_shape=decay_shape,
+        ),
+    )
 
 
 def make_constant_scheduler(cfg: TrainingCfg) -> tuple[LRScheduler, ...]:
     """
     Hold lr constant for the whole run: no warmup, no decay.
     """
-    return tuple(LambdaLR(opt, lambda _: 1.0) for opt in training.optimizers)
+    from pithtrain.modules.resume_semantics import bind_scheduler_factory
+
+    return bind_scheduler_factory(
+        tuple(LambdaLR(opt, lambda _: 1.0) for opt in training.optimizers),
+        make_constant_scheduler,
+        dict(lr=cfg.lr, max_steps=cfg.max_steps),
+    )
 
 
 @dataclass(init=False, slots=True)

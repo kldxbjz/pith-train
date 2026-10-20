@@ -18,6 +18,7 @@ from torch.distributed.tensor import DTensor
 
 from pithtrain.contexts import distributed, training
 from pithtrain.modules.checkpoint import to_canonical_model, to_localized_model
+from pithtrain.modules.resume_semantics import scheduler_contract
 from pithtrain.modules.strict_checkpoint import (
     _check_schema,
     _restore_rng,
@@ -529,6 +530,7 @@ def save(root, step, *, data_state, config):
             membership=_membership(model, opts),
             optimizer_types=[type(opt).__qualname__ for opt in opts],
             scheduler_types=[type(sch).__qualname__ for sch in scheds],
+            scheduler_contracts=[scheduler_contract(sch) for sch in scheds],
             layout=layout,
         ),
     )
@@ -638,6 +640,7 @@ def load(root, step, *, data_state, config):
             membership=_membership(model, opts),
             optimizer_types=[type(opt).__qualname__ for opt in opts],
             scheduler_types=[type(sch).__qualname__ for sch in scheds],
+            scheduler_contracts=[scheduler_contract(sch) for sch in scheds],
             layout=layout,
         ),
     )
