@@ -1,5 +1,7 @@
 """Explicit native visual attention backends must follow the HF configuration."""
 
+import copy
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -11,6 +13,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 )
 
 from pithtrain.models.qwen3_omni_vision import (
+    Qwen3OmniMoeVideoEncoder,
     Qwen3OmniMoeVisionAttention,
     Qwen3OmniMoeVisionEncoder,
     Qwen3OmniMoeVisionRotaryEmbedding,
@@ -72,7 +75,10 @@ def test_default_and_explicit_sdpa_preserve_native_sdpa_path(monkeypatch, backen
     )
     assert result.shape == (28, config.hidden_size)
     assert len(calls) == 2
-    assert [shape[1] for shape, _ in calls] == [4, 24]
+    assert all(
+        len(shape) == 4 and shape[0] == 1 and shape[1] == config.num_heads for shape, _ in calls
+    )
+    assert [shape[2] for shape, _ in calls] == [4, 24]
     assert all(options == {"dropout_p": 0.0, "is_causal": False} for _, options in calls)
 
 
@@ -108,3 +114,57 @@ def test_original_silu_non_square_encoder_case_matches_every_gradient_exactly():
         torch.testing.assert_close(
             parameter.grad, reference.get_parameter(name).grad, rtol=0, atol=0, msg=name
         )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("native_backend", [None, "sdpa"])
+@pytest.mark.parametrize(
+    "grids",
+    [
+        [[1, 8, 10]],
+        [[1, 2, 2], [1, 4, 6]],
+        [[2, 4, 6], [3, 2, 2]],
+    ],
+)
+def test_sdpa_full_encoder_matches_official_hf_every_output_and_gradient(
+    dtype, native_backend, grids
+):
+    """Independent official encoder verifies image/frame segmentation and all VJPs."""
+    torch.manual_seed(91)
+    config = vision_config()
+    config._attn_implementation = "sdpa"
+    # Match the production BF16 reference construction: casting the whole
+    # module would also round HF's non-persistent FP32 RoPE buffers to BF16.
+    previous_dtype = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(dtype)
+        reference = HFVision(config)
+    finally:
+        torch.set_default_dtype(previous_dtype)
+    assert reference.rotary_pos_emb.inv_freq.dtype == torch.float32
+    native_config = copy.deepcopy(config)
+    native_config._attn_implementation = native_backend
+    model_type = (
+        Qwen3OmniMoeVideoEncoder if any(t > 1 for t, _, _ in grids) else Qwen3OmniMoeVisionEncoder
+    )
+    native = model_type(native_config).to(dtype)
+    native.load_state_dict(reference.state_dict(), strict=True)
+    assert dict(native.named_parameters()).keys() == dict(reference.named_parameters()).keys()
+    grid = torch.tensor(grids)
+    pixels = torch.randn(sum(t * h * w for t, h, w in grids), 24, dtype=dtype, requires_grad=True)
+    ref_pixels = pixels.detach().clone().requires_grad_()
+    actual, expected = native(pixels, grid), reference(ref_pixels, grid)
+    left = (actual.last_hidden_state, actual.pooler_output, *actual.deepstack_features)
+    right = (expected.last_hidden_state, expected.pooler_output, *expected.deepstack_features)
+    for a, b in zip(left, right, strict=True):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+    cotangents = [torch.randn_like(value) for value in left]
+    torch.autograd.backward(left, cotangents)
+    torch.autograd.backward(right, cotangents)
+    assert pixels.grad is not None and ref_pixels.grad is not None
+    torch.testing.assert_close(pixels.grad, ref_pixels.grad, rtol=0, atol=0)
+    for name, parameter in native.named_parameters():
+        expected_gradient = reference.get_parameter(name).grad
+        assert parameter.grad is not None and expected_gradient is not None, name
+        assert torch.isfinite(parameter.grad).all(), name
+        torch.testing.assert_close(parameter.grad, expected_gradient, rtol=0, atol=0, msg=name)

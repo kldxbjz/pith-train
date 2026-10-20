@@ -155,12 +155,16 @@ class Qwen3OmniMoeVisionAttention(nn.Module):
                 continue
             outputs.append(
                 F.scaled_dot_product_attention(
-                    queries.transpose(0, 1),
-                    keys.transpose(0, 1),
-                    values.transpose(0, 1),
+                    # Match HF's [batch=1, heads, tokens, dim] SDPA layout.
+                    # A rank-3 input can select a different SDPA implementation.
+                    queries.transpose(0, 1).unsqueeze(0),
+                    keys.transpose(0, 1).unsqueeze(0),
+                    values.transpose(0, 1).unsqueeze(0),
                     dropout_p=0.0,
                     is_causal=False,
-                ).transpose(0, 1)
+                )
+                .squeeze(0)
+                .transpose(0, 1)
             )
         return self.proj(torch.cat(outputs).reshape(hidden_states.shape))
 

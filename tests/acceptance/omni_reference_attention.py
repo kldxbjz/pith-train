@@ -209,7 +209,7 @@ def configure_reference_attention(reference, native_config, contract=LEGACY):
     if "vision" in components:
         result["vision_alignment"] = {
             "scope": "API_AND_CONFIG_MATCH" if contract == MATCHED else "LEGACY_CROSS_BACKEND",
-            "native_qkv_rank": 3,
+            "native_qkv_rank": 4,
             "hf_qkv_rank": 4,
             "identical_cuda_sdpa_kernel": "NOT_ESTABLISHED",
             "actual_cuda_sdpa_kernel": "NOT_OBSERVED",
