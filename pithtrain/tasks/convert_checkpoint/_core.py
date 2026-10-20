@@ -63,6 +63,15 @@ class ConvertCheckpointCfg(SlottedDefault):
     omni_text_only: bool = False
     """Explicitly exclude known media/Talker weights on Omni import; report every key."""
 
+    omni_multimodal: bool = False
+    """Explicitly select the complete Thinker text/vision/audio contract."""
+
+    omni_thinker_config: Path | None = None
+    """Complete Thinker config for native DCP export without a sidecar."""
+
+    omni_thinker_only: bool = False
+    """Explicitly exclude and report Talker/code2wav on complete Thinker import."""
+
     omni_restore_resume: bool = False
     """Rebuild original strict shards from an HF export with resume companion."""
 
@@ -73,6 +82,17 @@ class ConvertCheckpointCfg(SlottedDefault):
 def hf2dcp(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
     """Convert HuggingFace checkpoint to DCP format."""
     load_path, save_path = Path(cfg.load_path), Path(cfg.save_path)
+    if cfg.omni_multimodal:
+        from . import qwen3_omni_thinker
+
+        if cfg.omni_text_only or cfg.omni_text_config:
+            raise ConversionError("Text-only options cannot be used in multimodal mode")
+        qwen3_omni_thinker.hf2dcp(cfg, stdout)
+        return
+    if cfg.omni_thinker_config or cfg.omni_thinker_only:
+        raise ConversionError("Complete Thinker options require omni_multimodal=True")
+    if (load_path / "qwen3_omni_thinker.json").exists():
+        raise ConversionError("Complete Thinker checkpoint requires omni_multimodal=True")
 
     if cfg.omni_restore_resume:
         from .qwen3_omni_moe import hf_to_canonical, read_hf_text, text_config
@@ -134,6 +154,17 @@ def hf2dcp(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
 def dcp2hf(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
     """Convert DCP checkpoint to HuggingFace format."""
     load_path, save_path = Path(cfg.load_path), Path(cfg.save_path)
+    if cfg.omni_multimodal:
+        from . import qwen3_omni_thinker
+
+        if cfg.omni_text_only or cfg.omni_text_config:
+            raise ConversionError("Text-only options cannot be used in multimodal mode")
+        qwen3_omni_thinker.dcp2hf(cfg, stdout)
+        return
+    if cfg.omni_thinker_config or cfg.omni_thinker_only:
+        raise ConversionError("Complete Thinker options require omni_multimodal=True")
+    if (load_path / "qwen3_omni_thinker.json").exists():
+        raise ConversionError("Complete Thinker checkpoint requires omni_multimodal=True")
     if cfg.max_shard_size <= 0:
         raise ValueError("max_shard_size must be positive")
     from .strict_omni import MANIFEST, assemble, read_payloads, same_config, write_companion
