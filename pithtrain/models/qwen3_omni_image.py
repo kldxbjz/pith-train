@@ -59,6 +59,7 @@ class Qwen3OmniMoeThinkerImageModel(Qwen3OmniMoeThinkerTextModel):
     # Paired image+text records only. Mixed image/text DP batches need an
     # explicit unused-encoder collective contract before enabling that mixture.
     input_modalities = ("image",)
+    vision_encoder_class = Qwen3OmniMoeVisionEncoder
 
     def __init__(self, config, phase):
         if distributed.cp_size != 1:
@@ -81,7 +82,7 @@ class Qwen3OmniMoeThinkerImageModel(Qwen3OmniMoeThinkerTextModel):
             }
         )
         self.visual = (
-            Qwen3OmniMoeVisionEncoder(config.vision_config) if self.stage_index == 0 else None
+            self.vision_encoder_class(config.vision_config) if self.stage_index == 0 else None
         )
 
     @staticmethod

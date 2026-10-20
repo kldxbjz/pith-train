@@ -39,7 +39,7 @@ def setup_entry(cp_size):
         FP8GroupedLinear=object(),
         GroupedLinear=object(),
         AutoConfig=SimpleNamespace(from_pretrained=lambda _: model_config),
-        model_class_for_config=lambda _, native_vision=False: construct,
+        model_class_for_config=lambda _, native_vision=False, native_video=False: construct,
         resolve_text_model_config=resolve_text_model_config,
     )
     exec("from __future__ import annotations\n" + ast.unparse(function), namespace)
@@ -53,7 +53,11 @@ def setup_entry(cp_size):
 def test_model_entry_accepts_unsharded_and_valid_sharded_lengths(cp_size, length):
     setup_model, calls = setup_entry(cp_size)
     cfg = SimpleNamespace(
-        fp8=False, native_vision=False, model="fixture-config", sequence_length=length
+        fp8=False,
+        native_vision=False,
+        native_video=False,
+        model="fixture-config",
+        sequence_length=length,
     )
     with pytest.raises(ModelConstructionReached):
         setup_model(cfg, SimpleNamespace())
@@ -78,7 +82,11 @@ def test_model_entry_accepts_unsharded_and_valid_sharded_lengths(cp_size, length
 def test_model_entry_rejects_uneven_multi_rank_cp_before_allocation(cp_size, length):
     setup_model, calls = setup_entry(cp_size)
     cfg = SimpleNamespace(
-        fp8=False, native_vision=False, model="fixture-config", sequence_length=length
+        fp8=False,
+        native_vision=False,
+        native_video=False,
+        model="fixture-config",
+        sequence_length=length,
     )
     with pytest.raises(ValueError, match="must be divisible"):
         setup_model(cfg, SimpleNamespace())
