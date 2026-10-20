@@ -1,8 +1,8 @@
 """Reviewed final-commit binding for the unchanged 32-update noise experiment.
 
-The historical a0b14f7 -> d237e4c entry remains intact. This adapter explicitly
+The historical a0b14f7 -> d237e4c entry retains its default policy. This adapter explicitly
 binds a current-main baseline and a reviewed final feature commit, fingerprints
-the old workload engine, and retains all its runtime/data/restore/comparison
+the workload engine with an explicit common deterministic opt-in, and retains all its runtime/data/restore/comparison
 checks. It is a text-path strict-resume/ordinary-training regression, not proof
 of whole-PR100/101 or image/audio/video numerical correctness.
 
@@ -25,11 +25,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 ENGINE_PATH = ROOT / "tests/acceptance/omni_noise_regression.py"
 BASE_SHA = "0efe0ee6f49e37186b0b60a7142fe4b710d328bf"
-ENGINE_SHA256 = "4c26430e8b89c5dd45f1450e37469dbe686a74152ef9beb8085ae7f60e9cf1d6"
-SCHEMA = "omni_final_text_noise_binding_v1"
+ENGINE_SHA256 = "2b1a8f231c4d1c6543697073f4961edf134aada924be90ffa271c49e080259ff"
+SCHEMA = "omni_final_text_noise_binding_v2"
 BINDING_ENV = "PITHTRAIN_OMNI_FINAL_NOISE_BINDING"
 SHA = re.compile(r"[0-9a-f]{40}")
 UNCHANGED_FILES = (
+    "pithtrain/contexts/training.py",
+    "pithtrain/modules/reproducibility.py",
     "pithtrain/models/qwen3_omni_moe.py",
     "pithtrain/modules/dataset.py",
     "pithtrain/modules/data_config.py",
@@ -119,6 +121,30 @@ def common_audit(base, feature):
                 a == b, f"Numerical function changed; explicit re-review required: {name}:{symbol}"
             )
             functions[f"{name}:{symbol}"] = hashlib.sha256(a.encode()).hexdigest()
+    # The public numerical opt-in exists independently of checkpoint features.
+    for repo in (base, feature):
+        cfg_tree = ast.parse((repo / "pithtrain/modules/training.py").read_text())
+        config = next(
+            n for n in cfg_tree.body if isinstance(n, ast.ClassDef) and n.name == "TrainingCfg"
+        )
+        field = next(
+            (
+                n
+                for n in config.body
+                if isinstance(n, ast.AnnAssign)
+                and isinstance(n.target, ast.Name)
+                and n.target.id == "deterministic"
+            ),
+            None,
+        )
+        require(
+            field is not None
+            and isinstance(field.annotation, ast.Name)
+            and field.annotation.id == "bool"
+            and isinstance(field.value, ast.Constant)
+            and field.value.value is False,
+            "Common deterministic config must be bool and default False",
+        )
     # Media-only extensions occur after the unmodified text early return.
     prefixes = []
     for repo in (base, feature):
@@ -148,6 +174,8 @@ def common_audit(base, feature):
         "Media selector enabled in text experiment",
     )
     return {
+        "common_numerical_policy": "common-deterministic-v2",
+        "common_deterministic_default": False,
         "identical_files": files,
         "identical_functions": functions,
         "text_get_batch_prefix_sha256": hashlib.sha256(prefixes[0].encode()).hexdigest(),
@@ -156,10 +184,11 @@ def common_audit(base, feature):
 
 
 def engine_module():
-    require(digest(ENGINE_PATH) == ENGINE_SHA256, "Historical workload engine changed")
+    require(digest(ENGINE_PATH) == ENGINE_SHA256, "Reviewed workload engine changed")
     spec = importlib.util.spec_from_file_location("omni_fixed_noise_engine", ENGINE_PATH)
     engine = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(engine)
+    engine.configure_numerical_policy(engine.COMMON_NUMERICAL_POLICY)
     return engine
 
 
@@ -198,7 +227,8 @@ def create_binding(args):
         profiles=[list(p) for p in engine.PROFILES],
         bridge=engine.BRIDGE,
         arms=list(engine.ARMS),
-        scope="Current-main text ordinary training plus strict/HF/strict fresh-process continuation",
+        scope="Text training plus strict/HF/strict continuation under common-deterministic-v2",
+        scope_changed_declared="Both baseline arms and feature explicitly enable the same public deterministic policy; legacy results are not inherited",
         does_not_cover=EXCLUSIONS,
         created_utc=dt.datetime.now(dt.timezone.utc).isoformat(),
         numerical_execution="NOT_RUN",
@@ -241,7 +271,7 @@ def load_binding(path):
 
 
 def configured_engine(binding_path):
-    """Bind the untouched engine for this separate, explicit experiment only."""
+    """Bind the reviewed engine and explicit common numerical policy."""
     b = load_binding(binding_path)
     engine = engine_module()
     engine.BASE_SHA, engine.FEATURE_SHA = b["base"]["commit"], b["feature"]["commit"]

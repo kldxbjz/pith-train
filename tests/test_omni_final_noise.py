@@ -55,6 +55,7 @@ def binding(tmp_path, monkeypatch):
     training = base / "pithtrain/modules/training.py"
     training.write_text(
         training.read_text() + "class TrainingCfg:\n    native_vision: bool = False\n"
+        "    deterministic: bool = False\n"
     )
     base_sha = commit(base, "baseline")
     subprocess.run(["git", "clone", "-q", str(base), str(feature)], check=True)
@@ -108,6 +109,8 @@ def test_binding_tampering_rejected(binding, field, value):
     [
         ("pithtrain/models/qwen3_omni_moe.py", "VALUE = 2\n", "Numerical file changed"),
         ("pithtrain/modules/optimizer.py", "VALUE = 2\n", "Numerical file changed"),
+        ("pithtrain/modules/reproducibility.py", "VALUE = 2\n", "Numerical file changed"),
+        ("pithtrain/contexts/training.py", "VALUE = 2\n", "Numerical file changed"),
         ("pithtrain/operators/new_kernel.py", "VALUE = 2\n", "Numerical tree file set changed"),
         ("pithtrain/pipeline/new_schedule.py", "VALUE = 2\n", "Numerical tree file set changed"),
     ],
@@ -333,3 +336,15 @@ def test_gpu_opt_in_required_before_running_arm(fake_arm, monkeypatch):
     with pytest.raises(ValueError, match="GPU opt-in"):
         new.run_one(args)
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    ["deterministic: bool = True", "deterministic: int = False", "other_field: bool = False"],
+)
+def test_common_numerical_optin_cannot_change(binding, replacement):
+    args, _ = binding
+    p = args.base_repo / "pithtrain/modules/training.py"
+    p.write_text(p.read_text().replace("deterministic: bool = False", replacement))
+    with pytest.raises(ValueError, match="Common deterministic config"):
+        new.common_audit(args.base_repo, args.feature_repo)

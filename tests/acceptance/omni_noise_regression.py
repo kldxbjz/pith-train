@@ -44,6 +44,20 @@ SETTINGS = dict(
     cp=1,
     hsdp_replica=1,
 )
+LEGACY_NUMERICAL_POLICY = "legacy-v1"
+COMMON_NUMERICAL_POLICY = "common-deterministic-v2"
+NUMERICAL_POLICY = LEGACY_NUMERICAL_POLICY
+RUNTIME_KEYS = {
+    "deterministic_algorithms",
+    "deterministic_warn_only",
+    "cudnn_benchmark",
+    "cudnn_deterministic",
+    "cudnn_allow_tf32",
+    "cuda_matmul_allow_tf32",
+    "float32_matmul_precision",
+    "cublas_workspace_config",
+    "fa4_deterministic",
+}
 METRICS = ("cross-entropy-loss", "load-balance-loss")
 STEP = re.compile(r"\bstep (\d+)/(\d+)\b")
 NUMBER = r"([-+\w.]+)"
@@ -52,6 +66,66 @@ NUMBER = r"([-+\w.]+)"
 def require(condition, message):
     if not condition:
         raise ValueError(message)
+
+
+def configure_numerical_policy(policy=LEGACY_NUMERICAL_POLICY):
+    """Explicit adapter opt-in; the historical entry keeps its original policy."""
+    global NUMERICAL_POLICY
+    require(
+        policy in (LEGACY_NUMERICAL_POLICY, COMMON_NUMERICAL_POLICY), "Unknown numerical policy"
+    )
+    NUMERICAL_POLICY = policy
+    SETTINGS.pop("numerical_policy", None)
+    if policy == COMMON_NUMERICAL_POLICY:
+        SETTINGS["numerical_policy"] = policy
+
+
+def validate_runtime_policy(report):
+    """Require actual rank settings, not inferred settings from source/config."""
+    if NUMERICAL_POLICY == LEGACY_NUMERICAL_POLICY:
+        return
+    require(report.get("numerical_policy") == COMMON_NUMERICAL_POLICY, "Missing numerical policy")
+    runtime = report.get("runtime_determinism", {})
+    require(set(runtime) == RUNTIME_KEYS, "Missing/unexpected runtime policy fields")
+    require(
+        runtime["deterministic_algorithms"] is True
+        and runtime["deterministic_warn_only"] is False
+        and runtime["cudnn_benchmark"] is False
+        and runtime["cudnn_deterministic"] is True
+        and runtime["fa4_deterministic"] is True
+        and runtime["cublas_workspace_config"] in (":4096:8", ":16:8"),
+        "Actual deterministic policy was not enabled",
+    )
+    require(
+        type(runtime["cudnn_allow_tf32"]) is bool
+        and type(runtime["cuda_matmul_allow_tf32"]) is bool
+        and runtime["float32_matmul_precision"] in ("highest", "high", "medium"),
+        "Malformed actual precision policy",
+    )
+
+
+def runtime_policy_metadata():
+    if NUMERICAL_POLICY == LEGACY_NUMERICAL_POLICY:
+        return {}
+    from pithtrain.modules.reproducibility import runtime_determinism_snapshot
+
+    metadata = dict(
+        numerical_policy=NUMERICAL_POLICY,
+        runtime_determinism=runtime_determinism_snapshot(),
+    )
+    validate_runtime_policy(metadata)
+    return metadata
+
+
+def require_same_runtime_policy(reports):
+    if NUMERICAL_POLICY == LEGACY_NUMERICAL_POLICY:
+        return
+    for report in reports:
+        validate_runtime_policy(report)
+    require(
+        all(r["runtime_determinism"] == reports[0]["runtime_determinism"] for r in reports),
+        "Actual numerical policies differ across arms/ranks/processes",
+    )
 
 
 def sha(path):
@@ -124,6 +198,9 @@ def configure_cfg(
     training.seed, training.lr = 1234, 1e-5
     training.moe_load_balance_type, training.moe_load_balance_coef = "global-batch", 1e-3
     training.benchmark = training.fp8 = False
+    if NUMERICAL_POLICY == COMMON_NUMERICAL_POLICY:
+        require(hasattr(training, "deterministic"), "Common deterministic config is missing")
+        training.deterministic = True
     training.save_interval = training.save_location = None
     if hasattr(training, "strict_resume"):
         training.strict_resume = False
@@ -579,6 +656,7 @@ def arm(args):
     try:
         data = ObservedData(pretrain_lm.setup_dataset(cfg))
         setup_training(cfg)
+        policy = runtime_policy_metadata()
         initial = tensor_digest(dict(training.model.named_parameters()))
         first, last = (
             (16, 32)
@@ -595,6 +673,7 @@ def arm(args):
             from pithtrain.modules.distributed_checkpoint import resume_contract
 
             boundary = json.loads(boundary_path.read_text())
+            require_same_runtime_policy([policy, boundary])
             require(boundary["pid"] != os.getpid(), "Restore must run in a fresh process")
             require(
                 boundary["source"] == source
@@ -631,11 +710,13 @@ def arm(args):
                 restored_sha256=restored,
                 exact_boundary=True,
                 strict_hf_strict=True,
+                **policy,
             )
         gc.disable()
         for step in range(first, last):
             pretrain_lm.train_step(cfg, data, step)
         gc.enable()
+        require_same_runtime_policy([policy, runtime_policy_metadata()])
         require(
             data.consumed_samples == last * 8 and list(data.batches) == list(range(first, last)),
             "Incomplete real-data consumption",
@@ -676,6 +757,7 @@ def arm(args):
                     initial_weights_sha256=initial,
                     records=records,
                     batches=data.batches,
+                    **policy,
                 ),
             )
             dist.barrier()
@@ -708,6 +790,7 @@ def arm(args):
                 torch=torch.__version__,
                 max_allocated_bytes=torch.cuda.max_memory_allocated(),
                 native_fa4=True,
+                **policy,
             ),
         )
     finally:
@@ -724,6 +807,7 @@ def validate_arm(plan, folder, profile, arm_name):
         "Missing/unexpected rank report",
     )
     reports = [json.loads(p.read_text()) for p in paths]
+    require_same_runtime_policy(reports)
     for rank, report in enumerate(reports):
         require(
             report["status"] == "COMPLETED_32_NATIVE_UPDATES"
@@ -754,6 +838,7 @@ def validate_arm(plan, folder, profile, arm_name):
                 and bridge["before_sha256"] == bridge["restored_sha256"],
                 "Missing or failed strict/HF boundary",
             )
+            require_same_runtime_policy([report, bridge])
         else:
             require(bridge is None, "Baseline must remain a continuous native run")
     records = parse_training_log((folder / "training.log").read_text())
@@ -776,6 +861,7 @@ def compare_profile(plan, folder, profile):
             "Arms started from different weights",
         )
         require(all(r["torch"] == reports[0]["torch"] for r in reports), "Arm runtime mismatch")
+    require_same_runtime_policy([report for reports, _ in arms for report in reports])
     return compare_records([item[1] for item in arms])
 
 
