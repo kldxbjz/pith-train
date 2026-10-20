@@ -234,6 +234,59 @@ def hf_name(name):
     return name if name.startswith(("visual.", "lm_head.")) else "model." + name
 
 
+class FP32MasterAdamW:
+    """Reference-only FP32 optimizer storage with BF16 compute materialization.
+
+    Production setup_model constructs FP32 parameters before FSDP, whose policy
+    materializes BF16 compute parameters and reduces gradients in FP32. Direct
+    AdamW on the standalone BF16 reference instead rounds away small updates,
+    including norm=1 at lr=1e-4. Keep the existing forward/gradient comparison
+    intact, then promote its gradients for the same FP32 AdamW update semantics.
+    This does not emulate FSDP collectives or change gradient accumulation.
+    """
+
+    def __init__(self, parameters, **kwargs):
+        assert parameters and all(p.dtype == torch.bfloat16 for p in parameters.values())
+        self.compute_parameters = dict(parameters)
+        self.master_parameters = {
+            name: nn.Parameter(p.detach().float().clone(), requires_grad=p.requires_grad)
+            for name, p in parameters.items()
+        }
+        self.optimizer = torch.optim.AdamW(self.master_parameters.values(), **kwargs)
+
+    @torch.no_grad()
+    def step(self):
+        for name, parameter in self.compute_parameters.items():
+            master = self.master_parameters[name]
+            master.grad = None if parameter.grad is None else parameter.grad.detach().float()
+        self.optimizer.step()
+        for name, parameter in self.compute_parameters.items():
+            parameter.copy_(self.master_parameters[name])
+
+    def zero_grad(self, set_to_none=True):
+        self.optimizer.zero_grad(set_to_none=set_to_none)
+        for parameter in self.compute_parameters.values():
+            if parameter.grad is not None:
+                if set_to_none:
+                    parameter.grad = None
+                else:
+                    parameter.grad.detach_()
+                    parameter.grad.zero_()
+
+    def update_evidence(self, before, compute_before, groups):
+        """Require real master updates; separately disclose rounded compute changes."""
+        evidence = module_update_evidence(self.master_parameters, before, groups)
+        for prefix, row in evidence.items():
+            row["master_parameter_dtype"] = "torch.float32"
+            row["compute_parameter_dtype"] = "torch.bfloat16"
+            row["compute_update_squared_sum"] = sum(
+                (parameter.detach().double() - compute_before[name].double()).square().sum().item()
+                for name, parameter in self.compute_parameters.items()
+                if name.startswith(prefix)
+            )
+        return evidence
+
+
 def gpu_reference(
     args, *, source_inputs_fn=source_inputs, reference_class=HFReference, native_class=None
 ):
@@ -259,8 +312,8 @@ def gpu_reference(
     with torch.no_grad():
         for name, p in actual.items():
             p.copy_(expected[name])
-    opt = torch.optim.AdamW(native.parameters(), lr=1e-4, weight_decay=0)
-    ref_opt = torch.optim.AdamW(reference.parameters(), lr=1e-4, weight_decay=0)
+    opt = FP32MasterAdamW(actual, lr=1e-4, weight_decay=0)
+    ref_opt = FP32MasterAdamW(expected, lr=1e-4, weight_decay=0)
     groups = training_groups(config)
     reports = []
     for step in range(4):
@@ -296,11 +349,13 @@ def gpu_reference(
                 p.grad.abs().max().item(),
                 expected[name].grad.abs().max().item(),
             )
-        before = {n: p.detach().clone() for n, p in actual.items()}
+        before = {n: p.detach().clone() for n, p in opt.master_parameters.items()}
+        compute_before = {n: p.detach().clone() for n, p in actual.items()}
         opt.step()
         ref_opt.step()
-        updates = [n for n, p in actual.items() if not torch.equal(before[n], p)]
-        modules = module_update_evidence(actual, before, groups)
+        updates = [n for n, p in opt.master_parameters.items() if not torch.equal(before[n], p)]
+        compute_updates = [n for n, p in actual.items() if not torch.equal(compute_before[n], p)]
+        modules = opt.update_evidence(before, compute_before, groups)
         reports.append(
             dict(
                 step=step,
@@ -309,6 +364,9 @@ def gpu_reference(
                 logits_errors=logits_errors,
                 gradient_errors=errors,
                 updated_parameters=updates,
+                updated_parameter_dtype="torch.float32",
+                updated_compute_parameters=compute_updates,
+                compute_parameter_dtype="torch.bfloat16",
                 training_modules=modules,
             )
         )

@@ -35,6 +35,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 )
 
 from pithtrain.models.qwen3_omni_audio import Qwen3OmniMoeAudioEncoder
+from tests.acceptance.omni_image_training import FP32MasterAdamW
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -229,6 +230,7 @@ def text_gate(config, batches, device):
     from pithtrain.contexts import distributed, training
     from pithtrain.models.qwen3_omni_audio_model import Qwen3OmniMoeThinkerAudioModel
     from pithtrain.operators.grouped_linear import GroupedLinear
+    from tests.acceptance.omni_audio_training import training_groups
 
     distributed.device = device
     distributed.pp_size = distributed.cp_size = distributed.ep_size = 1
@@ -247,8 +249,9 @@ def text_gate(config, batches, device):
     with torch.no_grad():
         for name, parameter in actual.items():
             parameter.copy_(expected[name])
-    optimizer = torch.optim.AdamW(native.parameters(), lr=1e-4, weight_decay=0)
-    expected_optimizer = torch.optim.AdamW(reference.parameters(), lr=1e-4, weight_decay=0)
+    optimizer = FP32MasterAdamW(actual, lr=1e-4, weight_decay=0)
+    expected_optimizer = FP32MasterAdamW(expected, lr=1e-4, weight_decay=0)
+    groups = training_groups(config)
     reports = []
     for step in range(4):
         losses, expected_losses, logits_errors, feature_pairs = [], [], [], []
@@ -289,20 +292,19 @@ def text_gate(config, batches, device):
         )
         feature_errors = [error_ratio(a.grad, b.grad) for a, b in feature_pairs]
         assert max(feature_errors) < 1e-2, feature_errors
-        before = {name: parameter.detach().clone() for name, parameter in actual.items()}
+        before = {name: p.detach().clone() for name, p in optimizer.master_parameters.items()}
+        compute_before = {name: p.detach().clone() for name, p in actual.items()}
         optimizer.step()
         expected_optimizer.step()
         updated = [
-            name for name, parameter in actual.items() if not torch.equal(before[name], parameter)
+            name
+            for name, parameter in optimizer.master_parameters.items()
+            if not torch.equal(before[name], parameter)
         ]
-        for prefix in (
-            "audio_tower.conv2d",
-            "audio_tower.layers.",
-            "audio_tower.proj",
-            "model.layers.",
-            "lm_head.",
-        ):
-            assert any(name.startswith(prefix) for name in updated), prefix
+        compute_updated = [
+            name for name, p in actual.items() if not torch.equal(compute_before[name], p)
+        ]
+        modules = optimizer.update_evidence(before, compute_before, groups)
         reports.append(
             dict(
                 step=step,
@@ -313,6 +315,10 @@ def text_gate(config, batches, device):
                 gradient_errors=gradients,
                 input_gradient_errors=feature_errors,
                 updated_parameters=updated,
+                updated_parameter_dtype="torch.float32",
+                updated_compute_parameters=compute_updated,
+                compute_parameter_dtype="torch.bfloat16",
+                training_modules=modules,
             )
         )
         optimizer.zero_grad(set_to_none=True)
