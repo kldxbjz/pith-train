@@ -238,8 +238,8 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
             config.hidden_size, config.rms_norm_eps
         )
 
-    # Preserve explicit BF16 rounding at residual, routing and DeepStack boundaries.
-    @torch.compile(fullgraph=True, options={"emulate_precision_casts": True})
+    # Preserve eager text forward/backward arithmetic. Compiled reductions can
+    # perturb gradients returned to the audio encoder despite retained BF16 casts.
     def forward_stage1_compute(
         self, hidden_states, rotary_posemb, cu_seqlens=None, replay_idx=None
     ):
@@ -300,8 +300,7 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
         result.scatter_add_(0, token_indices[:, None].expand_as(weighted), weighted)
         return residual + result.view_as(residual)
 
-    # Preserve explicit BF16 rounding at residual, routing and DeepStack boundaries.
-    @torch.compile(fullgraph=True, options={"emulate_precision_casts": True})
+    # Keep the expert/residual boundary under the same eager precision policy.
     def forward_stage5(self, moe_outs, moe_local_idxs, topk_weight, residual):
         return self._forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
 

@@ -1,7 +1,7 @@
-"""Production fullgraph stages preserve explicit BF16 rounding boundaries on CPU.
+"""Production text eager and image compiled stages preserve BF16 arithmetic.
 
 Stage5 executes its complete original body. Stage1 fixes the attention output
-to isolate residual and norm arithmetic; it is not FA4 or router acceptance.
+to isolate residual, norm and routing arithmetic; it is not FA4 acceptance.
 """
 
 import ast
@@ -28,9 +28,18 @@ def value_and_grads(call, layer, sources, indices, cotangent):
     return result, gradients
 
 
+def reference_text_stage5(layer, outputs, _indices, weights, residual):
+    """Independent dense/top-2 arithmetic with each BF16 product rounded first."""
+    if weights is None:
+        return residual + outputs
+    contributions = outputs.reshape(*weights.shape, -1) * weights.unsqueeze(-1)
+    combined = contributions[:, 0] + contributions[:, 1]
+    return residual + combined.reshape_as(residual)
+
+
 @pytest.mark.parametrize("kind", ["text", "image"])
 @pytest.mark.parametrize("is_moe,ep", [(False, 1), (True, 1), (True, 2)])
-def test_compiled_stage5_preserves_bf16_output_and_every_input_gradient(kind, is_moe, ep):
+def test_stage5_preserves_bf16_output_and_every_input_gradient(kind, is_moe, ep):
     torch.manual_seed(19)
     image = layer_type(ep)
     layer = (image if kind == "image" else image.__bases__[0])()
@@ -41,13 +50,21 @@ def test_compiled_stage5_preserves_bf16_output_and_every_input_gradient(kind, is
     cotangent = torch.randn_like(residual)
     sources = (outputs, weights, residual)
     indexes = torch.arange(138) if is_moe else None
-    compiled = type(layer).forward_stage5
-    eager = compiled.__wrapped__
-    actual, gradients = value_and_grads(compiled, layer, sources, indexes, cotangent)
-    expected, target_gradients = value_and_grads(eager, layer, sources, indexes, cotangent)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    for gradient, target in zip(gradients, target_gradients, strict=True):
-        torch.testing.assert_close(gradient, target, rtol=0, atol=0)
+    production = type(layer).forward_stage5
+    reference = production.__wrapped__ if kind == "image" else reference_text_stage5
+    calls = [production]
+    if kind == "text":
+        # Retain the previous CPU compiled-operator coverage as a separate
+        # control; the production text entry itself now executes eagerly.
+        calls.append(
+            torch.compile(production, fullgraph=True, options={"emulate_precision_casts": True})
+        )
+    expected, target_gradients = value_and_grads(reference, layer, sources, indexes, cotangent)
+    for call in calls:
+        actual, gradients = value_and_grads(call, layer, sources, indexes, cotangent)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for gradient, target in zip(gradients, target_gradients, strict=True):
+            torch.testing.assert_close(gradient, target, rtol=0, atol=0)
 
 
 def controlled_stage1_type():
@@ -100,20 +117,37 @@ def controlled_stage1_type():
     return ControlledLayer
 
 
+def reference_stage1(layer, hidden):
+    """HF eager residual, RMSNorm and top-k expressions, independently composed."""
+    residual = hidden + layer.self_attn.value
+    value = residual.to(torch.float32)
+    variance = value.pow(2).mean(-1, keepdim=True)
+    value = value * torch.rsqrt(variance + layer.post_attention_layernorm.variance_epsilon)
+    hidden = layer.post_attention_layernorm.weight * value.to(residual.dtype)
+    if not layer.is_moe:
+        return hidden, residual, None, None, None
+    router = layer.mlp.gate
+    logits = F.linear(hidden.reshape(-1, hidden.shape[-1]), router.weight)
+    probabilities = F.softmax(logits, dtype=torch.float32, dim=-1)
+    weights, indices = torch.topk(probabilities, router.top_k, dim=-1)
+    if router.norm_topk_prob:
+        weights = weights / weights.sum(dim=-1, keepdim=True)
+    return hidden, residual, indices, weights.to(logits.dtype), None
+
+
 @pytest.mark.parametrize("is_moe", [False, True])
-def test_compiled_stage1_preserves_bf16_residual_norm_boundaries(is_moe):
+def test_stage1_preserves_bf16_residual_norm_boundaries(is_moe):
     torch.manual_seed(739)
     layer = controlled_stage1_type()()
     layer.is_moe = is_moe
     source = torch.randn(1, 69, 128, dtype=torch.bfloat16) * 0.02
     probes = (torch.randn_like(source), torch.randn_like(source))
-    # Only residual/norm outputs enter this controlled objective. Softmax's
-    # FP32 reductions can differ between eager and compiled backends even when
-    # explicit BF16 casts are retained; the full GPU parameter gate covers them.
+    # Preserve the existing independent residual/norm objective. The additional
+    # regression below also covers router outputs and every parameter gradient.
     parameters = (layer.self_attn.value, layer.post_attention_layernorm.weight)
     actual_input, expected_input = [source.detach().clone().requires_grad_() for _ in range(2)]
     actual = layer.forward_stage1_compute(actual_input, None)
-    expected = layer.forward_stage1_compute.__wrapped__(layer, expected_input, None)
+    expected = reference_stage1(layer, expected_input)
     for value, target in zip(actual[:2], expected[:2], strict=True):
         torch.testing.assert_close(value, target, rtol=0, atol=0)
     objectives = [
@@ -126,4 +160,53 @@ def test_compiled_stage1_preserves_bf16_residual_norm_boundaries(is_moe):
     grads = torch.autograd.grad(objectives[0], (actual_input, *parameters))
     targets = torch.autograd.grad(objectives[1], (expected_input, *parameters))
     for gradient, target in zip(grads, targets, strict=True):
+        torch.testing.assert_close(gradient, target, rtol=0, atol=0)
+
+    # Keep the old compiled residual/norm contract in addition to production.
+    compiled = torch.compile(
+        type(layer).forward_stage1_compute,
+        fullgraph=True,
+        options={"emulate_precision_casts": True},
+    )
+    compiled_input = source.detach().clone().requires_grad_()
+    controlled = compiled(layer, compiled_input, None)
+    for value, target in zip(controlled[:2], expected[:2], strict=True):
+        torch.testing.assert_close(value, target, rtol=0, atol=0)
+    objective = sum(
+        (value.float() * probe.float()).sum()
+        for value, probe in zip(controlled[:2], probes, strict=True)
+    )
+    compiled_grads = torch.autograd.grad(objective, (compiled_input, *parameters))
+    for gradient, target in zip(compiled_grads, targets, strict=True):
+        torch.testing.assert_close(gradient, target, rtol=0, atol=0)
+
+
+def test_stage1_preserves_router_probabilities_and_full_vjp():
+    # This retained seed/geometry had one router probability differ under the
+    # previous compiled entry, including its emulate_precision_casts policy.
+    torch.manual_seed(739)
+    layer = controlled_stage1_type()()
+    source = torch.randn(1, 69, 128, dtype=torch.bfloat16) * 0.02
+    probes = (
+        torch.randn_like(source),
+        torch.randn_like(source),
+        torch.randn(69, 2, dtype=torch.bfloat16),
+    )
+    actual_input, expected_input = [source.detach().clone().requires_grad_() for _ in range(2)]
+    actual = layer.forward_stage1_compute(actual_input, None)
+    expected = reference_stage1(layer, expected_input)
+    for value, target in zip(actual[:4], expected[:4], strict=True):
+        torch.testing.assert_close(value, target, rtol=0, atol=0)
+    assert actual[4] is expected[4] is None
+    objectives = [
+        sum(
+            (value.float() * probe.float()).sum()
+            for value, probe in zip((result[0], result[1], result[3]), probes, strict=True)
+        )
+        for result in (actual, expected)
+    ]
+    parameters = tuple(layer.parameters())
+    gradients = torch.autograd.grad(objectives[0], (actual_input, *parameters))
+    targets = torch.autograd.grad(objectives[1], (expected_input, *parameters))
+    for gradient, target in zip(gradients, targets, strict=True):
         torch.testing.assert_close(gradient, target, rtol=0, atol=0)
