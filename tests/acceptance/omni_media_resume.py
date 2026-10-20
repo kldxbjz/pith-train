@@ -434,7 +434,8 @@ def run_gpu(args, spec):
 
     try:
         if args.mode == "negative":
-            negative_case(args, cfg, data)
+            report["rejection"] = negative_case(args, cfg, data)
+            report["negative_case"] = args.negative_case
             report["all_ranks_rejected"] = True
         elif args.mode == "produce":
             for step in range(2):

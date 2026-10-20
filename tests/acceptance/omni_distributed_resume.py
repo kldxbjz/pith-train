@@ -8,6 +8,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from datetime import timedelta
@@ -143,6 +144,63 @@ def snapshot(data):
     return _pack(values)
 
 
+def verify_corruption_rejection(error, *, fault, world_size, model_key=None):
+    """Accept only the injected fault's precise collective pre-mutation error."""
+    from pithtrain.modules.distributed_checkpoint import DistributedCheckpointError
+
+    expected_phase = "validate every rank before mutation"
+    expected_type = "DistributedCheckpointError"
+    expected_ranks = [world_size - 1]
+    if fault == "missing-rank":
+        expected_phase = "read and verify files"
+        expected_message = "Missing/unexpected rank files"
+        expected_ranks = list(range(world_size))
+    elif fault == "missing-cuda-rng":
+        expected_type = "StrictResumeError"
+        expected_message = "app.resume.rng: missing=['cuda'], unexpected=[]"
+    elif fault == "shape":
+        assert isinstance(model_key, str) and model_key, "Missing injected model key"
+        expected_message = f"state.model.{model_key}: local shard shape/dtype mismatch"
+    elif fault == "topology":
+        expected_message = "Rank topology, configuration, membership or model layout differs"
+    elif fault == "optimizer-order":
+        expected_message = "Optimizer group configuration/membership differs"
+    else:
+        raise AssertionError(f"Unknown corruption fault: {fault}")
+    assert type(error) is DistributedCheckpointError, (
+        f"Expected a collective rejection for {fault}, got {error!r}"
+    )
+    message = str(error)
+    prefix = expected_phase + ": "
+    assert message.startswith(prefix), f"Wrong rejection phase for {fault}: {message}"
+    errors = []
+    for item in message.removeprefix(prefix).split("; "):
+        match = re.fullmatch(r"rank (\d+): (\w+): (.+)", item)
+        assert match is not None, f"Malformed collective rejection: {message}"
+        rank, error_type, reason = match.groups()
+        assert error_type == expected_type and reason == expected_message, (
+            f"Wrong rejection reason for {fault}: {item}"
+        )
+        errors.append(dict(rank=int(rank), error_type=error_type, message=reason))
+    assert [item["rank"] for item in errors] == expected_ranks, (
+        f"Wrong rejecting ranks for {fault}: {errors}"
+    )
+    return dict(
+        fault=fault,
+        reason_verified=True,
+        error_type=type(error).__name__,
+        phase=expected_phase,
+        message=message,
+        rank_errors=errors,
+        expected=dict(
+            phase=expected_phase,
+            error_type=expected_type,
+            message=expected_message,
+            ranks=expected_ranks,
+        ),
+    )
+
+
 def negative_case(args, cfg, data):
     from pithtrain.modules.checkpoint import load_checkpoint
     from pithtrain.modules.distributed_checkpoint import (
@@ -163,26 +221,40 @@ def negative_case(args, cfg, data):
         )
         location = target / "torch-dcp/00000002"
         path = location / f"rank-{args.world_size - 1:05d}.pt"
+        mutation = dict(target_rank=args.world_size - 1)
         if args.negative_case == "missing-rank":
             path.unlink()
-            return
+            return mutation
         payload = torch.load(path, weights_only=True)
         if args.negative_case == "missing-cuda-rng":
             del payload["rng"]["cuda"]
         elif args.negative_case == "shape":
             key = next(iter(payload["state"]["model"]))
-            payload["state"]["model"][key]["value"] = torch.zeros(1)
+            original = payload["state"]["model"][key]["value"]
+            assert original.shape != (1,), "Shape corruption must change the tensor shape"
+            payload["state"]["model"][key]["value"] = original.new_zeros(1)
+            mutation["model_key"] = key
         elif args.negative_case == "topology":
+            assert payload["header"]["topology"]["ep_size"] != 999
             payload["header"]["topology"]["ep_size"] = 999
+        elif args.negative_case == "optimizer-order":
+            order = payload["state"]["optimizer"][0]["param_groups"][0]["params"]
+            assert len(order) > 1 and order != list(reversed(order)), (
+                "Optimizer-order corruption must change parameter order"
+            )
+            order.reverse()
         else:
-            payload["state"]["optimizer"][0]["param_groups"][0]["params"].reverse()
+            raise AssertionError(f"Unknown corruption fault: {args.negative_case}")
         torch.save(payload, path)
         manifest = json.loads((location / MANIFEST).read_text())
         manifest["files"][path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
         (location / MANIFEST).write_text(json.dumps(manifest))
+        return mutation
 
-    _phase("construct one-rank corruption", corrupt_one_rank)
+    mutation = [_phase("construct one-rank corruption", corrupt_one_rank)]
+    dist.broadcast_object_list(mutation, src=0)
     before = snapshot(data)
+    rejection = None
     try:
         load_checkpoint(
             target,
@@ -191,11 +263,23 @@ def negative_case(args, cfg, data):
             strict=True,
             resume_config=resume_contract(cfg),
         )
-    except DistributedCheckpointError:
-        pass
-    else:
-        raise AssertionError(f"Accepted corrupt rank state: {args.negative_case}")
-    equal(snapshot(data), before, "all-rank-failure-atomicity")
+    except DistributedCheckpointError as error:
+        rejection = error
+    evidence = _phase(
+        "verify corruption rejection reason",
+        lambda: verify_corruption_rejection(
+            rejection,
+            fault=args.negative_case,
+            world_size=args.world_size,
+            model_key=mutation[0].get("model_key"),
+        ),
+    )
+    _phase(
+        "verify corruption failure atomicity",
+        lambda: equal(snapshot(data), before, "all-rank-failure-atomicity"),
+    )
+    evidence.update(atomicity_verified=True, corruption=mutation[0])
+    return evidence
 
 
 def run_gpu(args):
@@ -248,8 +332,9 @@ def run_gpu(args):
     report = args.output / f"{label}-rank-{rank:05d}.json"
     assert not report.exists(), "Retain previous evidence; choose a new output"
     expected_path = args.output / f"continuous-rank-{rank:05d}.pt"
+    rejection = None
     if args.mode == "negative":
-        negative_case(args, cfg, data)
+        rejection = negative_case(args, cfg, data)
     elif args.mode == "produce":
         for step in range(2):
             pretrain_lm.train_step(cfg, data, step)
@@ -291,6 +376,7 @@ def run_gpu(args):
                 cp=1,
                 native_updates=args.mode != "negative",
                 negative_case=args.negative_case,
+                rejection=rejection,
                 all_ranks_rejected=args.mode == "negative",
                 real_loader=True,
                 fsdp=True,
