@@ -1,5 +1,12 @@
 # Week3 strict checkpoint ↔ HF integration
 
+> Historical implementation/evidence snapshot. See
+> [current Omni acceptance entry points and status](OMNI_ACCEPTANCE_STATUS.md)
+> for the integrated implementation and Modal CLI workflow. Old Flame/Slurm
+> package, authorization and queue statements below describe their original
+> snapshot, not the current execution. Historical NOT_RUN/PASS results are
+> not automatically inherited by a newer commit.
+
 Local follow-up to frozen `0b35cb755f9e8ade910c3863e6a053fe7cd77464`.
 Worktree `/home/kldxbjz/code/pith-train-week3-strict-converter`, branch
 `feat/omni-strict-converter-integration`. Earlier worktrees, PR100's

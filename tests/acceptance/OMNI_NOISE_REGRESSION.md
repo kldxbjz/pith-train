@@ -1,5 +1,12 @@
 # Locked Week3 strict/HF bridge noise regression
 
+> Historical implementation/evidence snapshot. See
+> [current Omni acceptance entry points and status](OMNI_ACCEPTANCE_STATUS.md)
+> for the integrated implementation and Modal CLI workflow. Old Flame/Slurm
+> package, authorization and queue statements below describe their original
+> snapshot, not the current execution. Historical NOT_RUN/PASS results are
+> not automatically inherited by a newer commit.
+
 This supersedes the normal-training-only harness at 1e21492. That version set
 save_interval=None and strict_resume=False, so it did not execute the strict or
 converter increment. Its 45 CPU tests were valid structural tests, not evidence

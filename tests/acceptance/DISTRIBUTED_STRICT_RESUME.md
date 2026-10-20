@@ -1,5 +1,12 @@
 # Production fixed-topology strict resume: implementation and validation boundary
 
+> Historical implementation/evidence snapshot. See
+> [current Omni acceptance entry points and status](OMNI_ACCEPTANCE_STATUS.md)
+> for the integrated implementation and Modal CLI workflow. Old Flame/Slurm
+> package, authorization and queue statements below describe their original
+> snapshot, not the current execution. Historical NOT_RUN/PASS results are
+> not automatically inherited by a newer commit.
+
 This branch extends frozen `86475821dc59e6d2f6c9f5f3d23ebb8056a8fd7f` in
 `/home/kldxbjz/code/pith-train-week3-distributed-resume`, branch
 `feat/omni-distributed-strict-resume`. It does not modify that frozen branch,
@@ -98,7 +105,7 @@ CUDA_VISIBLE_DEVICES= HF_HUB_OFFLINE=1 PYTHONPATH=. python \
   --dataset /real/omni-training-small --output /new/evidence \
   --world-size 4 --pp 2 --ep 2
 
-# Later, only by the sole coordinated Flame owner inside its allocation:
+# Only by the coordinator inside its existing bounded allocation (e.g. Modal):
 PITHTRAIN_RUN_OMNI_GPU_TESTS=1 HF_HUB_OFFLINE=1 PYTHONPATH=. \
   timeout --signal=TERM --kill-after=15s 180s python -m torch.distributed.run \
   --standalone --nnodes=1 --nproc-per-node=4 \
@@ -138,5 +145,7 @@ tolerance change. The original native/HF logit/CE/gradient gates are unchanged.
 - Three-step continuation is not the repository's 32-step base0/base1/feature
   noise-envelope regression. That full training regression remains outstanding.
 
-Publication stays paused. This work does not upload, submit GPU jobs, push,
-comment, or merge any remote branch.
+This document's original publication pause was part of its historical handoff.
+The current integrated change is prepared for a separate Draft under the
+coordinator; publication does not imply GPU acceptance. These CLI examples
+do not allocate resources or merge any branch.

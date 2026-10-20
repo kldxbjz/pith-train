@@ -1,10 +1,19 @@
 # Native Omni update and fresh-process strict resume
 
-This is a **new, unsharded native-model acceptance entrance**, prepared on CPU.
-Its GPU numerical gates have not been executed. It does not establish
-DualPipeV, PP/EP/FSDP updates, distributed strict resume, or 32-step regression.
-Do not add it to the already frozen first Flame package without its owner
-explicitly scheduling a later revision. No upload or submission is performed here.
+> Historical implementation/evidence snapshot. See
+> [current Omni acceptance entry points and status](OMNI_ACCEPTANCE_STATUS.md)
+> for the integrated implementation and Modal CLI workflow. Old Flame/Slurm
+> package, authorization and queue statements below describe their original
+> snapshot, not the current execution. Historical NOT_RUN/PASS results are
+> not automatically inherited by a newer commit.
+
+This is an **unsharded native-model acceptance entrance**. Its original
+delivery was prepared on CPU. This entrance alone does not establish DualPipeV,
+PP/EP/FSDP updates, distributed strict resume or 32-step regression. Those now
+have separate implemented drivers described in OMNI_ACCEPTANCE_STATUS.md.
+The frozen first Flame package is historical; current Modal execution uses the
+Python CLI in a clean checked checkout and the coordinator's bounded allocation.
+No complete native restart acceptance is claimed by this document.
 
 ## Source integration
 
@@ -112,11 +121,14 @@ the explicit distributed limitation, key/shape/dtype/nonfinite rejection,
 optimizer-delta sensitivity and exact detached snapshot comparison. They do
 not execute native kernels or mock a loader to claim native acceptance.
 
-Production `setup_training` still builds DualPipeV/FSDP; this entrance builds
-the actual full native model with phase=-1 so it can use the implemented
-single-process strict checkpoint contract. Production task strict-resume
-wiring and true distributed strict resume remain **unimplemented**. Required
-future work includes collective metadata preflight, rank-local RNG/shard
-validation, synchronized failure atomicity and actual PP/EP/FSDP optimizer
-update/restart comparisons. Existing guards are retained; removing a guard
-alone is not an implementation.
+Production `setup_training` builds DualPipeV/FSDP; this entrance builds
+the actual full native model with phase=-1 for the single-process strict
+checkpoint contract. Production task strict-resume wiring and fixed-topology
+distributed strict save/load are now implemented separately; see
+[DISTRIBUTED_STRICT_RESUME.md](DISTRIBUTED_STRICT_RESUME.md).
+The native distributed driver covers metadata preflight, rank-local RNG/shards,
+synchronized failure atomicity and actual PP/EP/FSDP update/restart comparisons.
+Those required GPU gates still need commit-matched successful execution;
+implementation or CPU contracts do not establish that acceptance.
+Existing guards remain intact. Current direct CLI entry points are documented
+in [OMNI_ACCEPTANCE_STATUS.md](OMNI_ACCEPTANCE_STATUS.md).

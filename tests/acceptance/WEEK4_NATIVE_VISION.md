@@ -1,5 +1,12 @@
 # Week4 native image training
 
+> Historical implementation/evidence snapshot. See
+> [current Omni acceptance entry points and status](OMNI_ACCEPTANCE_STATUS.md)
+> for the integrated implementation and Modal CLI workflow. Old Flame/Slurm
+> package, authorization and queue statements below describe their original
+> snapshot, not the current execution. Historical NOT_RUN/PASS results are
+> not automatically inherited by a newer commit.
+
 Local branch `feat/omni-native-vision`, based on frozen Week3
 `d237e4c3d5ce9e38cf80e16a38dbd8f2210d0e53`, which contains PR101
 `e6d1889c6df5679749a057fd1952360c378f5cd6` and PR100
@@ -34,10 +41,15 @@ all visual parameters go to its AdamW partition, including Conv3d weights.
 Supported first boundary: image+paired-text records, one unpadded sample per
 microbatch, CP=1, trainable native vision/projections/decoder. Mixed text-only
 and image DP batches are rejected by the image modality declaration: their
-unused-encoder FSDP collective contract is not yet implemented. Text-only
+unused-encoder FSDP collective contract was not implemented in this image-only
+milestone. The current unified multimodal selector implements a separate
+collective contract and must pass its own native GPU gates. Text-only
 training keeps its existing default model. Audio/video, packed/padded image
 batches, FP8, full released weights and image HF checkpoint conversion are
-outside this milestone. These are explicit limits, not passed gates.
+outside this historical milestone. Audio/video and complete-Thinker conversion
+now have separate implementations; their evidence is not inherited from the
+image-only tests. See OMNI_ACCEPTANCE_STATUS.md for current limits and the
+recorded production image/audio numerical failures.
 
 Reader failures and consumer validation failures propagate through each PP
 group and then across the world before model/EP collectives. A CPU 4-rank Gloo

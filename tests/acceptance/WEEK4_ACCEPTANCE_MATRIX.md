@@ -1,5 +1,12 @@
 # Week4 acceptance matrix — executed evidence versus prepared GPU gates
 
+> Historical implementation/evidence snapshot. See
+> [current Omni acceptance entry points and status](OMNI_ACCEPTANCE_STATUS.md)
+> for the integrated implementation and Modal CLI workflow. Old Flame/Slurm
+> package, authorization and queue statements below describe their original
+> snapshot, not the current execution. Historical NOT_RUN/PASS results are
+> not automatically inherited by a newer commit.
+
 This supplement corrects any ambiguity in the initial summary. **No native
 Thinker image logits, image CE loss, decoder gradients, GPU optimizer step,
 DualPipeV image execution, FSDP image execution or PP+EP DeepStack execution has

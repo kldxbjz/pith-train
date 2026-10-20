@@ -1,5 +1,12 @@
 # Focused strict-resume review and next-round resources
 
+> Historical implementation/evidence snapshot. See
+> [current Omni acceptance entry points and status](OMNI_ACCEPTANCE_STATUS.md)
+> for the integrated implementation and Modal CLI workflow. Old Flame/Slurm
+> package, authorization and queue statements below describe their original
+> snapshot, not the current execution. Historical NOT_RUN/PASS results are
+> not automatically inherited by a newer commit.
+
 This is a local follow-up to frozen `38674d1f1af6d2e2bc96ba70dc6eb2e33784d51f`.
 Branch `fix/omni-strict-review`, worktree
 `/home/kldxbjz/code/pith-train-week3-strict-review`. No upload or job submission.
