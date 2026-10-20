@@ -33,6 +33,7 @@ def setup_entry(cp_size):
         distributed=SimpleNamespace(cp_size=cp_size, cp_group=None),
         nn=SimpleNamespace(Linear=object()),
         FP8Linear=object(),
+        BF16Linear=object(),
         FP8GroupedLinear=object(),
         GroupedLinear=object(),
         AutoConfig=SimpleNamespace(from_pretrained=lambda _: model_config),
