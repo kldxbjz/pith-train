@@ -23,12 +23,23 @@ from pithtrain.modules.strict_checkpoint import _numpy_state
 
 from .qwen3_omni_moe import (
     ConversionError,
-    parameter_shapes,
     read_json,
     require_empty_destination,
     text_config,
     validate_tensors,
 )
+from .qwen3_omni_moe import (
+    parameter_shapes as text_parameter_shapes,
+)
+
+
+def parameter_shapes(config):
+    if config.model_type == "qwen3_omni_moe_thinker":
+        from .qwen3_omni_thinker import parameter_shapes as thinker_shapes
+
+        return thinker_shapes(config)
+    return text_parameter_shapes(config)
+
 
 RESUME_DIR = "pithtrain-resume"
 RESUME_MANIFEST = "resume-manifest.json"
@@ -204,13 +215,18 @@ def _topology(topology, rank, world):
 def _model_plan(header, config):
     topology, layout = header["topology"], header["layout"]
     rank, ep = topology["rank"], topology["ep_size"]
+    text_cfg = getattr(config, "text_config", config)
     expected, plan, names = parameter_shapes(config), {}, {}
-    require(config.num_experts % ep == 0, "Expert count must divide EP")
-    per_ep = config.num_experts // ep
+    require(text_cfg.num_experts % ep == 0, "Expert count must divide EP")
+    per_ep = text_cfg.num_experts // ep
     require(isinstance(layout, dict) and layout, "Missing runtime model layout")
     for name, desc in layout.items():
         require(isinstance(name, str), "Invalid model name")
         key = strip_prefix(name)
+        if config.model_type == "qwen3_omni_moe_thinker" and key.startswith(
+            ("visual.", "audio_tower.")
+        ):
+            require(topology["pp_rank"] == 0, "Media encoders must belong to the first PP rank")
         require(key not in names, "Duplicate canonical parameter across local pipeline chunks")
         names[key] = name
         shape, _, begin, end = _descriptor(desc, rank)
@@ -458,7 +474,7 @@ def _training(payload):
     _rng(payload["rng"], header["topology"]["attn_mesh"]["device"])
 
 
-def validate_payloads(payloads, step, *, skeleton=False):
+def validate_payloads(payloads, step, *, skeleton=False, multimodal=False):
     require(
         type(step) is int and step > 0 and isinstance(payloads, list) and payloads,
         "Invalid strict step/ranks",
@@ -503,7 +519,12 @@ def validate_payloads(payloads, step, *, skeleton=False):
             and header["config"].get("hsdp_replica", 1) == 1,
             "HSDP>1 remains unsupported",
         )
-        current = text_config(header["config"]["model"])
+        if multimodal:
+            from .qwen3_omni_thinker import thinker_config
+
+            current = thinker_config(header["config"]["model"])
+        else:
+            current = text_config(header["config"]["model"])
         if config is None:
             config, common, geometry = current, header["config"], pp_ep
         else:
@@ -573,7 +594,7 @@ def validate_payloads(payloads, step, *, skeleton=False):
     return config, pieces
 
 
-def read_payloads(directory, *, companion=False):
+def read_payloads(directory, *, companion=False, multimodal=False):
     directory = Path(directory)
     manifest_name = RESUME_MANIFEST if companion else MANIFEST
     manifest = read_json(directory / manifest_name)
@@ -605,7 +626,9 @@ def read_payloads(directory, *, companion=False):
         payloads = [
             torch.load(directory / name, map_location="cpu", weights_only=True) for name in names
         ]
-        config, pieces = validate_payloads(payloads, manifest["step"], skeleton=companion)
+        config, pieces = validate_payloads(
+            payloads, manifest["step"], skeleton=companion, multimodal=multimodal
+        )
     except (KeyError, IndexError, TypeError, ValueError, RuntimeError) as error:
         raise ConversionError(f"{directory}: invalid strict state: {error}") from error
     return manifest, payloads, config, pieces
@@ -651,9 +674,11 @@ def write_companion(hf_path, payloads, step):
     _write_payloads(Path(hf_path) / RESUME_DIR, skeletons, step, companion=True)
 
 
-def restore_from_hf(hf_path, destination, config, canonical):
+def restore_from_hf(hf_path, destination, config, canonical, *, multimodal=False):
     require_empty_destination(destination)
-    manifest, skeletons, saved_config, _ = read_payloads(Path(hf_path) / RESUME_DIR, companion=True)
+    manifest, skeletons, saved_config, _ = read_payloads(
+        Path(hf_path) / RESUME_DIR, companion=True, multimodal=multimodal
+    )
     same_config(config, saved_config)
     validate_tensors(canonical, parameter_shapes(config), "HF resume weights")
     restored = []
@@ -670,5 +695,5 @@ def restore_from_hf(hf_path, destination, config, canonical):
             entry["value"] = value
             del entry["sha256"]
         restored.append(payload)
-    validate_payloads(restored, manifest["step"])
+    validate_payloads(restored, manifest["step"], multimodal=multimodal)
     _write_payloads(destination, restored, manifest["step"])
