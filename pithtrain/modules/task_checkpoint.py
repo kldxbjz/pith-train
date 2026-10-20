@@ -13,6 +13,7 @@ import re
 import torch
 
 TASK_STATE_VERSION = 2
+CONDITIONAL_OPTIMIZER_POLICY = "conditional_adamw_v1"
 RNG_METADATA = {
     "version": 1,
     "global": "rank-shard-python-numpy-torch-v1",
@@ -63,6 +64,8 @@ class TaskCheckpointState:
         update_key,
         data_key,
         policy_version_key=None,
+        optimizer_policy=None,
+        bounded_load=False,
     ):
         if not isinstance(task_kind, str) or not re.fullmatch(r"[a-z][a-z0-9_]*", task_kind):
             raise ValueError("A named task kind is required")
@@ -80,6 +83,14 @@ class TaskCheckpointState:
             for name in ("state_dict", "validate_state_dict", "load_state_dict")
         ):
             raise TypeError("Concrete task must expose state, pure validation and restore")
+        if optimizer_policy not in (None, CONDITIONAL_OPTIMIZER_POLICY):
+            raise ValueError("Unsupported task optimizer checkpoint policy")
+        if type(bounded_load) is not bool or (
+            bounded_load and optimizer_policy != CONDITIONAL_OPTIMIZER_POLICY
+        ):
+            raise ValueError("Bounded task load requires the explicit conditional Adam policy")
+        self.bounded_load = bounded_load
+        self.optimizer_policy = optimizer_policy
         identity = dict(
             task_kind=task_kind,
             task_schema=task_schema,
@@ -89,6 +100,10 @@ class TaskCheckpointState:
             data_key=data_key,
             policy_version_key=policy_version_key,
         )
+        if optimizer_policy is not None:
+            identity["optimizer_policy"] = optimizer_policy
+        if bounded_load:
+            identity["load_policy"] = "local_shard_inplace_v1"
         encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"), allow_nan=False)
         self.task, self.task_kind, self.task_schema = task, task_kind, task_schema
         self.fingerprint = hashlib.sha256(encoded.encode()).hexdigest()
@@ -121,6 +136,10 @@ class TaskCheckpointState:
             rng_metadata=dict(RNG_METADATA),
             state=state,
         )
+        if self.optimizer_policy is not None:
+            value["optimizer_policy"] = self.optimizer_policy
+        if self.bounded_load:
+            value["load_policy"] = "local_shard_inplace_v1"
         self.validate_state_dict(value)
         return value
 
@@ -135,6 +154,10 @@ class TaskCheckpointState:
             "rng_metadata",
             "state",
         }
+        if self.optimizer_policy is not None:
+            fields.add("optimizer_policy")
+        if self.bounded_load:
+            fields.add("load_policy")
         if type(value) is not dict or set(value) != fields:
             raise ValueError("Incomplete version-2 task checkpoint envelope")
         if (
@@ -148,6 +171,10 @@ class TaskCheckpointState:
             or type(value["rng_metadata"].get("version")) is not int
         ):
             raise ValueError("Task schema/contract/fingerprint/RNG metadata mismatch")
+        if value.get("optimizer_policy") != self.optimizer_policy:
+            raise ValueError("Task optimizer checkpoint policy mismatch")
+        if value.get("load_policy") != ("local_shard_inplace_v1" if self.bounded_load else None):
+            raise ValueError("Task load policy mismatch")
         state = _portable(value["state"])
         cursors = self._cursors(state)
         if (
@@ -181,6 +208,10 @@ class TaskCheckpointState:
             key: value[key]
             for key in ("version", "task_kind", "task_schema", "fingerprint", "rng_metadata")
         }
+        if self.optimizer_policy is not None:
+            identity["optimizer_policy"] = self.optimizer_policy
+        if self.bounded_load:
+            identity["load_policy"] = "local_shard_inplace_v1"
         if include_cursors:
             identity.update(
                 transaction=value["cursors"]["transaction"],

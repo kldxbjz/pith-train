@@ -307,3 +307,183 @@ def test_envelope_rejects_schema_before_provider_mutation(field, value):
     with pytest.raises(ValueError):
         state.load_state_dict(bad)
     equal(task.state_dict(), before)
+
+
+def conditional_commit(parts, task, selected):
+    model, optimizer, scheduler, _ = parts
+    if selected:
+        parameters = list(model.parameters())
+        loss = sum(parameters[i].square().sum().full_tensor() for i in selected)
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad(set_to_none=True)
+        task.updates += 1
+    commit(parts, task, False)
+
+
+def corrupt_conditional(root, case):
+    folder = root / "torch-dcp/00000003"
+    path = folder / "rank-00001.pt"
+    value = torch.load(path, weights_only=True)
+    rows = value["optimizer_schema"]["optimizers"][0]
+    state = value["state"]["optimizer"][0]["state"]
+    if case == "schema-absent":
+        del value["optimizer_schema"]
+    elif case == "row-absent":
+        rows.pop()
+    elif case == "presence-flip":
+        rows[0].update(present=False, step=None)
+    elif case == "metadata-step-rollback":
+        rows[0]["step"] -= 1
+    elif case == "payload-step-rollback":
+        state[0]["step"]["value"].sub_(1)
+    elif case == "payload-state-absent":
+        del state[0]
+    elif case == "absent-counter":
+        rows[2]["step"] = 0
+    elif case == "metadata-step-bool":
+        rows[0]["step"] = True
+    elif case == "counter-exceeds-updates":
+        rows[0]["step"] = 3
+    elif case == "wrong-policy":
+        value["task"]["optimizer_policy"] = "other"
+    else:
+        raise AssertionError(case)
+    torch.save(value, path)
+    manifest = json.loads((folder / native.MANIFEST).read_text())
+    manifest["files"][path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    (folder / native.MANIFEST).write_text(json.dumps(manifest))
+
+
+def conditional_worker(rank, root):
+    root = Path(root)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{root / 'conditional-rendezvous'}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        torch.set_num_threads(1)
+        meshes = initialize_mesh("fsdp-layout", rank)
+        parts = build(*meshes)
+        task = StatefulTask(rank)
+        adapter = envelope(task, optimizer_policy="conditional_adamw_v1", bounded_load=True)
+        config = {"protocol": "conditional-task-v2", "hsdp_replica": 1}
+        original_unpack = native._unpack
+        original_localize = native.to_localized_model
+
+        def only_one_missing_tensor(saved, live, path="state"):
+            assert isinstance(live, torch.Tensor), "bounded load allocated a whole shadow state"
+            return original_unpack(saved, live, path)
+
+        def no_full_expert_restack(*args):
+            raise AssertionError("bounded load restacked the full model")
+
+        native._unpack = only_one_missing_tensor
+        native.to_localized_model = no_full_expert_restack
+        conditional_commit(parts, task, [0])
+        conditional_commit(parts, task, [0, 1])
+        conditional_commit(parts, task, [])
+        parameters = list(parts[0].parameters())
+        assert parts[1].state[parameters[0]]["step"].item() == 2
+        assert parts[1].state[parameters[1]]["step"].item() == 1
+        assert parameters[2] not in parts[1].state
+        save_checkpoint(root / "good", 3, data_state=adapter, strict=True, resume_config=config)
+        boundary = snapshot(parts, adapter)
+        conditional_commit(parts, task, [0, 2])
+        continued = snapshot(parts, adapter)
+        # Warm restore preserves exact per-parameter counters and absent state.
+        load_checkpoint(root / "good", 3, data_state=adapter, strict=True, resume_config=config)
+        equal(snapshot(parts, adapter), boundary)
+        conditional_commit(parts, task, [0, 2])
+        equal(snapshot(parts, adapter), continued)
+        # Cold restore must not first initialize missing Adam entries.
+        parts = build(*meshes)
+        task = StatefulTask(rank)
+        adapter = envelope(task, optimizer_policy="conditional_adamw_v1", bounded_load=True)
+        assert not parts[1].state
+        load_checkpoint(root / "good", 3, data_state=adapter, strict=True, resume_config=config)
+        equal(snapshot(parts, adapter), boundary)
+        for case in (
+            "schema-absent",
+            "row-absent",
+            "presence-flip",
+            "metadata-step-rollback",
+            "payload-step-rollback",
+            "payload-state-absent",
+            "absent-counter",
+            "metadata-step-bool",
+            "counter-exceeds-updates",
+            "wrong-policy",
+        ):
+            target = root / case
+            if rank == 0:
+                shutil.copytree(root / "good", target)
+                corrupt_conditional(target, case)
+            dist.barrier()
+            before = snapshot(parts, adapter)
+            with pytest.raises(native.DistributedCheckpointError):
+                load_checkpoint(target, 3, data_state=adapter, strict=True, resume_config=config)
+            equal(snapshot(parts, adapter), before)
+        conditional_commit(parts, task, [0, 2])
+        before = snapshot(parts, adapter)
+        task.fail_apply = rank == 1
+        with pytest.raises(native.DistributedCheckpointError, match="apply strict checkpoint"):
+            load_checkpoint(root / "good", 3, data_state=adapter, strict=True, resume_config=config)
+        equal(snapshot(parts, adapter), before)
+        # A rank may fail after copying some model shards. CPU rollback must
+        # restore every rank without allocating a third full-device state.
+        original_copy = native._restore_packed_inplace
+        copies = 0
+        failed = False
+
+        def fail_mid_copy(saved, template, live=None):
+            nonlocal copies, failed
+            if isinstance(template, torch.Tensor):
+                copies += 1
+                if rank == 1 and copies == 2 and not failed:
+                    failed = True
+                    raise RuntimeError("injected partial local tensor copy")
+            return original_copy(saved, template, live)
+
+        native._restore_packed_inplace = fail_mid_copy
+        before = snapshot(parts, adapter)
+        with pytest.raises(native.DistributedCheckpointError, match="apply strict checkpoint"):
+            load_checkpoint(root / "good", 3, data_state=adapter, strict=True, resume_config=config)
+        equal(snapshot(parts, adapter), before)
+        native._restore_packed_inplace = original_copy
+        native._unpack = original_unpack
+        native.to_localized_model = original_localize
+        # Default task-v2 and legacy strict policies remain complete-step only.
+        default_adapter = envelope(task)
+        with pytest.raises(native.DistributedCheckpointError, match="optimizer"):
+            save_checkpoint(
+                root / "default-must-reject",
+                4,
+                data_state=default_adapter,
+                strict=True,
+                resume_config=config,
+            )
+        assert not (root / "default-must-reject").exists()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_conditional_task_native_two_rank_cold_warm_and_atomicity(tmp_path):
+    mp.spawn(conditional_worker, args=(str(tmp_path),), nprocs=2, join=True)
+
+
+def test_conditional_policy_is_explicit_and_default_envelope_unchanged():
+    task = StatefulTask(0)
+    default = envelope(task)
+    explicit = envelope(task, optimizer_policy="conditional_adamw_v1", bounded_load=True)
+    assert "optimizer_policy" not in default.state_dict()
+    assert explicit.state_dict()["optimizer_policy"] == "conditional_adamw_v1"
+    assert default.fingerprint != explicit.fingerprint
+    with pytest.raises(ValueError):
+        default.validate_state_dict(explicit.state_dict())
+    with pytest.raises(ValueError):
+        envelope(task, optimizer_policy="unknown")

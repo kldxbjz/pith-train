@@ -24,7 +24,11 @@ from pithtrain.modules.strict_checkpoint import (
     _rng_state,
     _validate_rng,
 )
-from pithtrain.modules.task_checkpoint import TASK_STATE_VERSION, TaskCheckpointState
+from pithtrain.modules.task_checkpoint import (
+    CONDITIONAL_OPTIMIZER_POLICY,
+    TASK_STATE_VERSION,
+    TaskCheckpointState,
+)
 
 MANIFEST = "strict-manifest.json"
 VERSION = 1
@@ -168,6 +172,72 @@ def _unpack(saved, live, path="state"):
     return saved
 
 
+def _validate_packed(saved, live, path="state"):
+    """Pure CPU payload validation: no full-device restored state is allocated."""
+    if isinstance(live, torch.Tensor):
+        if (
+            type(saved) is not dict
+            or set(saved) != {"tensor", "value"}
+            or saved["tensor"] != _describe(live)
+        ):
+            raise DistributedCheckpointError(f"{path}: tensor layout/shape/dtype mismatch")
+        value = saved["value"]
+        local = live.to_local() if isinstance(live, DTensor) else live
+        if (
+            type(value) is not torch.Tensor
+            or value.device.type != "cpu"
+            or value.shape != local.shape
+            or value.dtype != local.dtype
+        ):
+            raise DistributedCheckpointError(f"{path}: local shard shape/dtype mismatch")
+        if value.is_floating_point() and not torch.isfinite(value).all():
+            raise DistributedCheckpointError(f"{path}: nonfinite payload")
+        return
+    if isinstance(live, dict):
+        if type(saved) is not dict or saved.keys() != live.keys():
+            raise DistributedCheckpointError(f"{path}: missing/unexpected keys")
+        for key, value in live.items():
+            _validate_packed(saved[key], value, f"{path}.{key}")
+        return
+    if isinstance(live, (list, tuple)):
+        if type(saved) is not type(live) or len(saved) != len(live):
+            raise DistributedCheckpointError(f"{path}: sequence type/count mismatch")
+        for index, (value, reference) in enumerate(zip(saved, live, strict=True)):
+            _validate_packed(value, reference, f"{path}.{index}")
+        return
+    if type(saved) is not type(live) or (isinstance(saved, float) and not math.isfinite(saved)):
+        raise DistributedCheckpointError(f"{path}: scalar type/value mismatch")
+
+
+def _restore_packed_inplace(saved, template, live=None):
+    """Reuse existing local storage; allocate only actually missing Adam tensors.
+
+    Called only after every rank passed _validate_packed and a CPU rollback
+    snapshot exists. The template may alias parameter storage, so it is NEVER
+    used as a destination for a missing optimizer moment.
+    """
+    if isinstance(template, torch.Tensor):
+        if isinstance(live, torch.Tensor) and _describe(live) == _describe(template):
+            local = live.to_local() if isinstance(live, DTensor) else live
+            with torch.no_grad():
+                local.copy_(saved["value"])
+            return live
+        return _unpack(saved, template)  # One missing tensor, not an entire state.
+    if isinstance(template, dict):
+        actual = live if isinstance(live, dict) else {}
+        return {
+            key: _restore_packed_inplace(saved[key], item, actual.get(key))
+            for key, item in template.items()
+        }
+    if isinstance(template, (list, tuple)):
+        actual = live if isinstance(live, (list, tuple)) else [None] * len(template)
+        return type(template)(
+            _restore_packed_inplace(value, item, old)
+            for value, item, old in zip(saved, template, actual, strict=True)
+        )
+    return copy.deepcopy(saved)
+
+
 def _membership(model, optimizers):
     names = {parameter: name for name, parameter in model.named_parameters()}
     return [
@@ -193,6 +263,76 @@ def _optimizer_template(optimizer, *, empty=False):
             if group["amsgrad"]:
                 state[index]["max_exp_avg_sq"] = parameter.detach()
     return dict(state=state, param_groups=template["param_groups"])
+
+
+def _conditional_optimizer_schema(values, optimizers, updates):
+    """Capture actual local Adam presence/counters, protected by the rank checksum."""
+    groups = []
+    for value, optimizer in zip(values, optimizers, strict=True):
+        full = _optimizer_template(optimizer)
+        if not value["state"].keys() <= full["state"].keys():
+            raise DistributedCheckpointError("Unexpected conditional optimizer parameter")
+        parameters = []
+        for key in full["state"]:
+            present = key in value["state"]
+            step = None
+            if present:
+                counter = value["state"][key].get("step")
+                if not isinstance(counter, torch.Tensor) or counter.numel() != 1:
+                    raise DistributedCheckpointError("Invalid conditional Adam step tensor")
+                number = counter.item()
+                if not math.isfinite(number) or int(number) != number or not 0 <= number <= updates:
+                    raise DistributedCheckpointError(
+                        "Conditional Adam step exceeds committed updates"
+                    )
+                step = int(number)
+            parameters.append(dict(id=key, present=present, step=step))
+        groups.append(parameters)
+    return dict(version=1, policy=CONDITIONAL_OPTIMIZER_POLICY, optimizers=groups)
+
+
+def _conditional_optimizer_templates(optimizers, schema, updates):
+    """Validate every explicit presence row before constructing payload templates."""
+    if (
+        type(schema) is not dict
+        or set(schema) != {"version", "policy", "optimizers"}
+        or type(schema["version"]) is not int
+        or schema["version"] != 1
+        or schema["policy"] != CONDITIONAL_OPTIMIZER_POLICY
+        or type(schema["optimizers"]) is not list
+        or len(schema["optimizers"]) != len(optimizers)
+    ):
+        raise DistributedCheckpointError("Invalid conditional optimizer schema")
+    templates, counters = [], []
+    for optimizer, rows in zip(optimizers, schema["optimizers"], strict=True):
+        full = _optimizer_template(optimizer)
+        expected = list(full["state"])
+        if type(rows) is not list or len(rows) != len(expected):
+            raise DistributedCheckpointError("Incomplete conditional optimizer membership")
+        present = {}
+        for row, key in zip(rows, expected, strict=True):
+            if (
+                type(row) is not dict
+                or set(row) != {"id", "present", "step"}
+                or type(row["id"]) is not int
+                or row["id"] != key
+                or type(row["present"]) is not bool
+            ):
+                raise DistributedCheckpointError("Conditional optimizer identity/presence differs")
+            if row["present"]:
+                if type(row["step"]) is not int or not 0 <= row["step"] <= updates:
+                    raise DistributedCheckpointError("Conditional optimizer counter out of range")
+                present[key] = row["step"]
+            elif row["step"] is not None:
+                raise DistributedCheckpointError("Absent optimizer parameter has a counter")
+        templates.append(
+            dict(
+                state={key: full["state"][key] for key in present},
+                param_groups=full["param_groups"],
+            )
+        )
+        counters.append(present)
+    return templates, counters
 
 
 def _validate_data(value, *, step, global_batch_size, fingerprint, data_state=None):
@@ -278,15 +418,19 @@ def _apply(values, model, optimizers, schedulers, data_state, device):
     _restore_rng(values["rng"], device)
 
 
-def _check_training_state(values, templates, step):
-    for value, template in zip(values["optimizer"], templates, strict=True):
+def _check_training_state(values, templates, step, *, optimizer_steps=None, packed=False):
+    for opt_index, (value, template) in enumerate(zip(values["optimizer"], templates, strict=True)):
         if value["state"].keys() != template["state"].keys():
             raise DistributedCheckpointError("Missing/unexpected optimizer parameter state")
         for key, expected in template["state"].items():
             actual = value["state"][key]
             if actual.keys() != expected.keys() or any(
-                not isinstance(actual[name], torch.Tensor)
-                or _describe(actual[name]) != _describe(tensor)
+                (actual[name]["tensor"] != _describe(tensor))
+                if packed
+                else (
+                    not isinstance(actual[name], torch.Tensor)
+                    or _describe(actual[name]) != _describe(tensor)
+                )
                 for name, tensor in expected.items()
             ):
                 raise DistributedCheckpointError("Optimizer state tensor schema differs")
@@ -295,7 +439,15 @@ def _check_training_state(values, templates, step):
                 k: v for k, v in live.items() if k != "lr"
             }:
                 raise DistributedCheckpointError("Optimizer group configuration/membership differs")
-        if any(item["step"].item() != step for item in value["state"].values()):
+        expected_steps = (
+            {key: step for key in value["state"]}
+            if optimizer_steps is None
+            else optimizer_steps[opt_index]
+        )
+        if any(
+            (item["step"]["value"] if packed else item["step"]).item() != expected_steps[key]
+            for key, item in value["state"].items()
+        ):
             raise DistributedCheckpointError("Incomplete optimizer update counters")
     for scheduler, optimizer in zip(values["scheduler"], values["optimizer"], strict=True):
         if scheduler["last_epoch"] != step or scheduler["_last_lr"] != [
@@ -319,6 +471,7 @@ def save(root, step, *, data_state, config):
     objects = _phase("save arguments", lambda: _objects(data_state, step, config))
     model, opts, scheds, device, batch, data = objects
     task_mode = isinstance(data_state, TaskCheckpointState)
+    conditional = task_mode and data_state.optimizer_policy == CONDITIONAL_OPTIMIZER_POLICY
     version = TASK_STATE_VERSION if task_mode else VERSION
     updates = _phase(
         "committed cursor",
@@ -343,12 +496,27 @@ def save(root, step, *, data_state, config):
     values, layout = _phase(
         "capture shards", lambda: _runtime(model, opts, scheds, data_state, device)
     )
+    optimizer_schema = None
+    optimizer_steps = None
+    expected_optimizers = [
+        _optimizer_template(opt, empty=task_mode and updates == 0) for opt in opts
+    ]
+    if conditional:
+        optimizer_schema = _phase(
+            "capture conditional optimizer",
+            lambda: _conditional_optimizer_schema(values["optimizer"], opts, updates),
+        )
+        expected_optimizers, optimizer_steps = _phase(
+            "conditional optimizer templates",
+            lambda: _conditional_optimizer_templates(opts, optimizer_schema, updates),
+        )
     _phase(
         "complete optimizer",
         lambda: _check_training_state(
             values,
-            [_optimizer_template(opt, empty=task_mode and updates == 0) for opt in opts],
+            expected_optimizers,
             updates,
+            optimizer_steps=optimizer_steps,
         ),
     )
     header = _phase(
@@ -373,6 +541,7 @@ def save(root, step, *, data_state, config):
             ),
             rng=values["rng"],
             **({"task": values["data"]} if task_mode else {}),
+            **({"optimizer_schema": optimizer_schema} if conditional else {}),
         ),
     )
     location = Path(root, "torch-dcp", f"{step:08d}")
@@ -413,7 +582,9 @@ def load(root, step, *, data_state, config):
         "load arguments", lambda: _objects(data_state, step, config)
     )
     task_mode = isinstance(data_state, TaskCheckpointState)
+    conditional = task_mode and data_state.optimizer_policy == CONDITIONAL_OPTIMIZER_POLICY
     version = TASK_STATE_VERSION if task_mode else VERSION
+    bounded = task_mode and data_state.bounded_load
     contract = _phase(
         "load contract arguments",
         lambda: dict(
@@ -471,17 +642,23 @@ def load(root, step, *, data_state, config):
         ),
     )
 
+    bounded_template = None
+
     def validate():
+        nonlocal bounded_template
         if not isinstance(payload, dict) or "header" not in payload:
             raise DistributedCheckpointError("Invalid rank payload")
         _check_schema(payload["header"], header, path="header")
         fields = {"header", "state", "rng"} | ({"task"} if task_mode else set())
+        if conditional:
+            fields.add("optimizer_schema")
         if set(payload) != fields or payload["header"] != header:
             raise DistributedCheckpointError(
                 "Rank topology, configuration, membership or model layout differs"
             )
         updates = step
         expected_optimizers = templates
+        optimizer_steps = None
         if task_mode:
             updates = _validate_data(
                 payload["task"],
@@ -492,11 +669,20 @@ def load(root, step, *, data_state, config):
             )
             if updates == 0:
                 expected_optimizers = [_optimizer_template(opt, empty=True) for opt in opts]
+        if conditional:
+            expected_optimizers, optimizer_steps = _conditional_optimizer_templates(
+                opts, payload["optimizer_schema"], updates
+            )
         template = dict(before, optimizer=expected_optimizers)
         del template["rng"]
         if task_mode:
             del template["data"]
-        restored = _unpack(payload["state"], template)
+        if bounded:
+            _validate_packed(payload["state"], template)
+            bounded_template = template
+            restored = dict(payload["state"])
+        else:
+            restored = _unpack(payload["state"], template)
         if task_mode:
             restored["data"] = copy.deepcopy(payload["task"])
         else:
@@ -506,7 +692,9 @@ def load(root, step, *, data_state, config):
                 global_batch_size=batch,
                 fingerprint=data["fingerprint"],
             )
-        _check_training_state(restored, expected_optimizers, updates)
+        _check_training_state(
+            restored, expected_optimizers, updates, optimizer_steps=optimizer_steps, packed=bounded
+        )
         _check_schema(payload["rng"], before["rng"], path="app.resume.rng")
         _validate_rng(payload["rng"], device)
         restored["rng"] = payload["rng"]
@@ -522,17 +710,42 @@ def load(root, step, *, data_state, config):
     rollback = _phase(
         "stage rollback", lambda: _pack({k: v for k, v in before.items() if k != "rng"})
     )
+
+    def apply_bounded(values):
+        # Canonical model tensors are local views of the actual live shards.
+        # _restore_packed_inplace already copied them. Do not restack all MoE
+        # experts through to_localized_model and allocate another model copy.
+        for optimizer, saved in zip(opts, values["optimizer"], strict=True):
+            optimizer.load_state_dict(saved)
+        for scheduler, saved in zip(scheds, values["scheduler"], strict=True):
+            scheduler.load_state_dict(saved)
+        data_state.load_state_dict(values["data"])
+        _restore_rng(values["rng"], device)
+
+    def apply_restored():
+        if not bounded:
+            return _apply(restored, model, opts, scheds, data_state, device)
+        values = _restore_packed_inplace(payload["state"], bounded_template, before)
+        values["data"] = restored["data"]
+        values["rng"] = restored["rng"]
+        return apply_bounded(values)
+
     try:
-        _phase(
-            "apply strict checkpoint",
-            lambda: _apply(restored, model, opts, scheds, data_state, device),
-        )
+        _phase("apply strict checkpoint", apply_restored)
     except DistributedCheckpointError:
 
         def undo():
-            old = _unpack(rollback, {k: v for k, v in before.items() if k != "rng"})
+            original = {k: v for k, v in before.items() if k != "rng"}
+            old = (
+                _restore_packed_inplace(rollback, original, original)
+                if bounded
+                else _unpack(rollback, original)
+            )
             old["rng"] = before["rng"]
-            _apply(old, model, opts, scheds, data_state, device)
+            if bounded:
+                apply_bounded(old)
+            else:
+                _apply(old, model, opts, scheds, data_state, device)
 
         _phase("rollback all ranks", undo)
         raise
