@@ -10,8 +10,11 @@ other Omni families. An implemented interface is not end-to-end acceptance.
 The preserved a8a1302d25140e5f75e9f9fb83d46fdcd891fb59 CPU receipt has
 1813 PASS / 0 FAIL / 0 SKIP and eight passing hooks. It predates the scheduler,
 RL model/forward contract and official full-generation-entry corrections.
-Those corrections need a new source freeze; old CPU/GPU results are not
-transferred to the successor. No native GPU pass is claimed for a8a1302.
+The first corrected source, 548f6a811efe09bb3fc97aba27d28c707b977c8e,
+completed 1836 CPU tests: 1805 PASS, 31 FAIL, 0 SKIP. Its failures expose the
+strict-conversion scheduler-contract integration and an uninitialized official
+CPU generation fixture. That failed receipt is retained; the repairs require a
+new source freeze. Old CPU/GPU results are not transferred to the successor. No native GPU pass is claimed for a8a1302.
 
 | Component or path | Implementation | Acceptance still required |
 | --- | --- | --- |
@@ -19,7 +22,7 @@ transferred to the successor. No native GPU pass is claimed for a8a1302.
 | Audio encoder, vision/DeepStack, image/audio/video/AV insertion | Native trainable components and preprocessing | Each media, gradients and integration |
 | Talker and 16-codebook residual predictor | Native differentiable model | Final-source output/gradient/update and generation |
 | Code2Wav | Native differentiable decoder, batch/chunk decode | Payload conversion, waveform gradients and cross-chunk parity |
-| Full conversion | qwen3_omni.py, including Talker/Code2Wav | Actual released payload; 28010-key header checks are not payload validation |
+| Full conversion | qwen3_omni_full.py, including Talker/Code2Wav | Actual released payload; 28010-key header checks are not payload validation |
 | Speech codec/text/waveform training | omni_speech, local replicas and FSDP2 | Native numerical and next-update checkpoint gates |
 | SFT | Task/data/objective and native training entry | Final-source integration and resume |
 | GRPO text policy | Real optimizer loop, explicit rollout/reward/publisher protocol | Concrete external provider integration and native execution |

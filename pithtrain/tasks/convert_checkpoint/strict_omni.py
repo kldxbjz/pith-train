@@ -19,6 +19,7 @@ from torch.distributed.tensor import Replicate, Shard
 
 from pithtrain.modules.checkpoint import strip_prefix
 from pithtrain.modules.distributed_checkpoint import MANIFEST, VERSION, _write_tensor_file
+from pithtrain.modules.resume_semantics import _canonical_model_value, seal
 from pithtrain.modules.strict_checkpoint import _numpy_state
 
 from .qwen3_omni_moe import (
@@ -333,14 +334,21 @@ def _training(payload):
     require(
         header["optimizer_types"] == ["AdamW"] * len(optimizers)
         and len(header["scheduler_types"]) == len(schedulers)
+        and isinstance(header["scheduler_contracts"], list)
+        and len(header["scheduler_contracts"]) == len(schedulers)
         and all(name in {"StepLR", "LambdaLR"} for name in header["scheduler_types"]),
         "Unsupported optimizer/scheduler class",
     )
     flat_names = []
     probe = torch.optim.AdamW([torch.nn.Parameter(torch.zeros(1))])
     group_fields = set(probe.param_groups[0]) | {"initial_lr"}
-    for groups, optimizer, scheduler, scheduler_type in zip(
-        membership, optimizers, schedulers, header["scheduler_types"], strict=True
+    for groups, optimizer, scheduler, scheduler_type, policy in zip(
+        membership,
+        optimizers,
+        schedulers,
+        header["scheduler_types"],
+        header["scheduler_contracts"],
+        strict=True,
     ):
         require(
             isinstance(optimizer, dict) and set(optimizer) == {"state", "param_groups"},
@@ -429,9 +437,11 @@ def _training(payload):
             else torch.optim.lr_scheduler.LambdaLR(probe, lambda _: 1)
         ).state_dict()
         require(
-            isinstance(scheduler, dict) and set(scheduler) == set(template),
+            isinstance(scheduler, dict)
+            and set(scheduler) - {"_pith_factory_contract"} == set(template),
             "Missing/unexpected scheduler fields",
         )
+        _scheduler_policy(policy, scheduler, scheduler_type, groups)
         require(
             all(type(scheduler[k]) is bool for k in ("_is_initial", "_get_lr_called_within_step")),
             "Invalid scheduler flags",
@@ -474,6 +484,97 @@ def _training(payload):
     _rng(payload["rng"], header["topology"]["attn_mesh"]["device"])
 
 
+def _sealed_identity(contract, label):
+    require(
+        isinstance(contract, dict) and set(contract) == {"identity", "sha256"},
+        f"Missing/invalid {label} contract",
+    )
+    try:
+        expected = seal(contract["identity"])
+    except (TypeError, ValueError) as error:
+        raise ConversionError(f"Invalid {label} contract encoding") from error
+    require(contract == expected, f"{label} contract digest differs")
+    require(isinstance(contract["identity"], dict), f"Invalid {label} identity")
+    return contract["identity"]
+
+
+def _scheduler_policy(contract, state, name, groups):
+    """Validate and retain opaque callable semantics without executing checkpoint code.
+
+    Conversion can run on a different CPU/CUDA build. Runtime compatibility and
+    the actual callable equality remain mandatory at strict restore admission.
+    """
+    identity = _sealed_identity(contract, "scheduler")
+    require(
+        set(identity)
+        == {"schema", "kind", "torch", "implementation", "configuration", "callables", "factory"}
+        and type(identity["schema"]) is int
+        and identity["schema"] == 1
+        and identity["kind"] == "scheduler_policy"
+        and isinstance(identity["torch"], str)
+        and bool(identity["torch"]),
+        "Invalid scheduler policy identity",
+    )
+    implementation = identity["implementation"]
+    require(
+        isinstance(implementation, dict)
+        and set(implementation) == {"name", "source_sha256"}
+        and implementation["name"] == f"torch.optim.lr_scheduler.{name}"
+        and isinstance(implementation["source_sha256"], str)
+        and re.fullmatch("[0-9a-f]{64}", implementation["source_sha256"]) is not None,
+        "Invalid scheduler implementation identity",
+    )
+    mutable = {"last_epoch", "_step_count", "_last_lr", "_get_lr_called_within_step"}
+    configuration = {
+        key: value
+        for key, value in state.items()
+        if key not in mutable | {"lr_lambdas", "_pith_factory_contract"}
+    }
+    try:
+        canonical = _canonical_model_value(configuration)
+    except (TypeError, ValueError) as error:
+        raise ConversionError("Invalid scheduler configuration") from error
+    require(identity["configuration"] == canonical, "Scheduler policy/state configuration differs")
+    factory = identity["factory"]
+    require(factory == state.get("_pith_factory_contract"), "Scheduler factory/state differs")
+    if factory is not None:
+        factory_identity = _sealed_identity(factory, "scheduler factory")
+        require(
+            set(factory_identity) == {"schema", "implementation", "arguments"}
+            and type(factory_identity["schema"]) is int
+            and factory_identity["schema"] == 1
+            and isinstance(factory_identity["implementation"], dict)
+            and set(factory_identity["implementation"]) == {"name", "source_sha256"}
+            and isinstance(factory_identity["implementation"]["name"], str)
+            and isinstance(factory_identity["implementation"]["source_sha256"], str)
+            and re.fullmatch("[0-9a-f]{64}", factory_identity["implementation"]["source_sha256"])
+            is not None,
+            "Invalid scheduler factory identity",
+        )
+    callables = identity["callables"]
+    if name == "StepLR":
+        require(callables is None, "Unexpected StepLR callable policy")
+    else:
+        require(
+            isinstance(callables, list) and len(callables) == len(groups),
+            "Missing LambdaLR callable policies",
+        )
+        for contract in callables:
+            callable_identity = _sealed_identity(contract, "scheduler callable")
+            require(
+                set(callable_identity) == {"schema", "kind", "python", "callable"}
+                and type(callable_identity["schema"]) is int
+                and callable_identity["schema"] == 1
+                and callable_identity["kind"] == "python_callable"
+                and isinstance(callable_identity["python"], list)
+                and len(callable_identity["python"]) == 2
+                and all(type(v) is int for v in callable_identity["python"])
+                and isinstance(callable_identity["callable"], dict)
+                and bool(callable_identity["callable"]),
+                "Invalid scheduler callable identity",
+            )
+
+
 def validate_payloads(payloads, step, *, skeleton=False, multimodal=False):
     require(
         type(step) is int and step > 0 and isinstance(payloads, list) and payloads,
@@ -498,6 +599,7 @@ def validate_payloads(payloads, step, *, skeleton=False, multimodal=False):
                 "membership",
                 "optimizer_types",
                 "scheduler_types",
+                "scheduler_contracts",
                 "layout",
             }
             and type(header["version"]) is int

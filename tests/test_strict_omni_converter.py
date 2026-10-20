@@ -23,6 +23,7 @@ from torch.distributed.tensor import Shard, distribute_tensor
 from pithtrain.contexts import distributed, training
 from pithtrain.modules.checkpoint import load_checkpoint, save_checkpoint
 from pithtrain.modules.distributed_checkpoint import _pack, _runtime
+from pithtrain.modules.resume_semantics import bind_scheduler_factory, seal
 from pithtrain.tasks.convert_checkpoint import dcp2hf, hf2dcp
 from pithtrain.tasks.convert_checkpoint.qwen3_omni_moe import (
     ConversionError,
@@ -113,6 +114,7 @@ def make_runtime(profile, rank):
         if profile == "pp-ep"
         else torch.optim.lr_scheduler.StepLR(opt, step_size=1, gamma=0.8)
     )
+    bind_scheduler_factory((sch,), make_runtime, {"profile": profile})
     training.model, training.optimizers, training.schedulers = model, (opt,), (sch,)
     contract = dict(
         model=config.to_dict(),
@@ -239,6 +241,10 @@ FAULTS = (
     "extra-optimizer-state",
     "missing-group-field",
     "scheduler-field",
+    "scheduler-policy-missing",
+    "scheduler-policy-digest",
+    "scheduler-policy-config",
+    "scheduler-factory",
     "scheduler-step",
     "scheduler-nonfinite",
     "cursor",
@@ -296,6 +302,16 @@ def corrupt(folder, fault, companion=False):
         del opt["param_groups"][0]["betas"]
     elif fault == "scheduler-field":
         del state["scheduler"][0]["base_lrs"]
+    elif fault == "scheduler-policy-missing":
+        del payload["header"]["scheduler_contracts"]
+    elif fault == "scheduler-policy-digest":
+        payload["header"]["scheduler_contracts"][0]["sha256"] = "0" * 64
+    elif fault == "scheduler-policy-config":
+        policy = payload["header"]["scheduler_contracts"][0]
+        policy["identity"]["configuration"]["s:gamma"] = 0.5
+        payload["header"]["scheduler_contracts"][0] = seal(policy["identity"])
+    elif fault == "scheduler-factory":
+        state["scheduler"][0]["_pith_factory_contract"]["identity"]["arguments"] = {}
     elif fault == "scheduler-step":
         state["scheduler"][0]["last_epoch"] = 2
     elif fault == "scheduler-nonfinite":
@@ -334,6 +350,10 @@ def test_export_rejects_corruption_before_writing(saved, tmp_path, fault):
     [
         "weights-changed",
         "companion-missing",
+        "scheduler-policy-missing",
+        "scheduler-policy-digest",
+        "scheduler-policy-config",
+        "scheduler-factory",
         "missing-moment",
         "cursor",
         "missing-rng",
@@ -453,3 +473,26 @@ def test_changed_weights_cannot_restore_optimizer(saved, tmp_path, layout, compo
     metadata = dcp.FileSystemReader(output).read_metadata()
     assert all(k.startswith("app.model.") for k in metadata.state_dict_metadata)
     assert not (output / MANIFEST).exists()
+
+
+@pytest.mark.parametrize("fault", ["missing", "callable-digest", "callable-schema"])
+def test_lambda_policy_corruption_rejected_without_evaluating_callable(fault):
+    from pithtrain.modules.resume_semantics import scheduler_contract
+    from pithtrain.tasks.convert_checkpoint.strict_omni import _scheduler_policy
+
+    optimizer = torch.optim.AdamW([nn.Parameter(torch.ones(1))], lr=0.01)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 0.8**step)
+    policy = scheduler_contract(scheduler)
+    original = copy.deepcopy(scheduler.state_dict())
+    if fault == "missing":
+        policy["identity"]["callables"] = None
+    elif fault == "callable-digest":
+        policy["identity"]["callables"][0]["sha256"] = "0" * 64
+    else:
+        callable_policy = policy["identity"]["callables"][0]
+        callable_policy["identity"]["schema"] = 999
+        policy["identity"]["callables"][0] = seal(callable_policy["identity"])
+    policy = seal(policy["identity"])
+    with pytest.raises(ConversionError, match="callable"):
+        _scheduler_policy(policy, scheduler.state_dict(), "LambdaLR", [[]])
+    assert_tree_equal(scheduler.state_dict(), original)

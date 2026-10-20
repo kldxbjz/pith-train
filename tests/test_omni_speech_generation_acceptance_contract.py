@@ -250,9 +250,6 @@ def official_full_cpu():
     from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
         Qwen3OmniMoeTextConfig,
     )
-    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-        Qwen3OmniMoeForConditionalGeneration,
-    )
 
     torch.set_num_threads(1)
     top = AutoConfig.from_pretrained(
@@ -278,7 +275,11 @@ def official_full_cpu():
         cfg._attn_implementation = "eager"
         cfg._experts_implementation = "eager"
     torch.manual_seed(gate.chain.SEED)
-    model = Qwen3OmniMoeForConditionalGeneration(config).float().eval()
+    # Use the same fully initialized official components as the GPU fixture.
+    # TF5.17 composite.post_init leaves raw Talker expert storage uninitialized;
+    # allocator contents can otherwise make isolated runs pass and full suites NaN.
+    model = gate.official_composite(gate.chain.HFChain(config).float()).eval()
+    assert all(torch.isfinite(parameter).all() for parameter in model.parameters())
     ids = torch.tensor(
         [
             [
@@ -509,3 +510,39 @@ def test_bf16_teacher_force_recurrence_matches_hf_all_logits_and_gradients():
         assert parameter.grad is not None and reference.grad is not None, name
         assert torch.isfinite(parameter.grad).all() and torch.isfinite(reference.grad).all(), name
         assert gate.chain.nse(parameter.grad, reference.grad) < 1e-2, name
+
+
+def test_official_full_cpu_fixture_initializes_poisoned_expert_storage():
+    policy = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+        torch.utils.deterministic.fill_uninitialized_memory,
+    )
+    rng = torch.get_rng_state()
+    threads = torch.get_num_threads()
+    try:
+        # Allocator-independent negative control: torch.empty returns NaN until
+        # explicitly initialized, exposing the original four raw expert tensors.
+        torch.use_deterministic_algorithms(True)
+        torch.utils.deterministic.fill_uninitialized_memory = True
+        model, _ = official_full_cpu.__wrapped__()
+        experts = {
+            name: parameter
+            for name, parameter in model.named_parameters()
+            if name.startswith("talker.") and ".mlp.experts." in name
+        }
+        assert len(experts) == 4
+        assert all(
+            torch.isfinite(value).all() and value.abs().sum() > 0 for value in experts.values()
+        )
+        assert all(torch.isfinite(value).all() for value in model.parameters())
+        # Repeat the same fixture builder with the allocator's poison disabled;
+        # raw uninitialized memory contents must not affect any saved state.
+        torch.utils.deterministic.fill_uninitialized_memory = False
+        independently_initialized, _ = official_full_cpu.__wrapped__()
+        assert gate.state_hash(model) == gate.state_hash(independently_initialized)
+    finally:
+        torch.use_deterministic_algorithms(policy[0], warn_only=policy[1])
+        torch.utils.deterministic.fill_uninitialized_memory = policy[2]
+        torch.set_rng_state(rng)
+        torch.set_num_threads(threads)
