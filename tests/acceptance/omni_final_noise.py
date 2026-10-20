@@ -24,7 +24,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 ENGINE_PATH = ROOT / "tests/acceptance/omni_noise_regression.py"
-BASE_SHA = "8f75d464faf95899c45cb2c1a378918759c2541c"
+BASE_SHA = "1611d085a7c244bb01a34caf8b58d19aef9eeeff"
 ENGINE_SHA256 = "2b1a8f231c4d1c6543697073f4961edf134aada924be90ffa271c49e080259ff"
 SCHEMA = "omni_final_text_noise_binding_v2"
 BINDING_ENV = "PITHTRAIN_OMNI_FINAL_NOISE_BINDING"
