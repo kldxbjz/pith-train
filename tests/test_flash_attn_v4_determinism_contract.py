@@ -148,6 +148,7 @@ def test_setup_training_sets_policy_before_model_construction(strict):
             manual_seed=lambda _: None, cuda=SimpleNamespace(manual_seed_all=lambda _: None)
         ),
         setup_model=lambda *_: observed.append(runtime.deterministic_attention),
+        configure_deterministic_training=lambda _: None,
     )
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
     namespace["setup_training"](cfg)

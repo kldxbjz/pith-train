@@ -30,6 +30,7 @@ from pithtrain.models.qwen3_omni_moe import Qwen3OmniMoeThinkerTextModel
 from pithtrain.models.qwen35_moe import Qwen35MoeModel
 from pithtrain.modules.load_balance import force_balance, make_load_balance_loss_fn
 from pithtrain.modules.optimizer import Muon
+from pithtrain.modules.reproducibility import configure_deterministic_training
 from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
 from pithtrain.operators.linear import BF16Linear, FP8Linear
 from pithtrain.operators.wgrad_accumulation import install_wgrad_accumulation
@@ -200,6 +201,14 @@ class TrainingCfg(SlottedDefault):
     examples/pretrain_lm/qwen3-30b-a3b. Only config.json is read: the architecture is built from
     it and the weights come from the checkpoint, so a directory holding config.json alone is
     enough to pretrain from scratch.
+    """
+
+    deterministic: bool = False
+    """Request PyTorch/cuDNN and FA4 deterministic policies without checkpoint features.
+
+    This independent numerical setting lets baseline and strict-resume runs use
+    identical compute policies. Strict resume also enables it implicitly.
+    CUDA launches require CUBLAS_WORKSPACE_CONFIG=:4096:8 or :16:8 before Python.
     """
 
     save_interval: Optional[int] = None
@@ -576,7 +585,11 @@ def setup_training(cfg: object) -> None:
     np.random.seed(cfg.training.seed)
     torch.manual_seed(cfg.training.seed)
     torch.cuda.manual_seed_all(cfg.training.seed)
-    training.deterministic_attention = bool(getattr(cfg.training, "strict_resume", False))
+    training.deterministic_attention = bool(
+        getattr(cfg.training, "deterministic", False)
+        or getattr(cfg.training, "strict_resume", False)
+    )
+    configure_deterministic_training(training.deterministic_attention)
     setup_model(cfg.training, cfg.distributed)
     training.optimizers = cfg.training.optimizer(cfg.training)
     training.schedulers = cfg.training.scheduler(cfg.training)
