@@ -41,7 +41,16 @@ def expected_shard(value, parameter, name, distributed):
     return value
 
 
-def run(args):
+def run(
+    args,
+    *,
+    source_inputs_fn=source_inputs,
+    reference_class=HFReference,
+    modality="image",
+    pixel_key="pixel_values",
+    training_flag="native_vision",
+    sequence_length=512,
+):
     from pithtrain.contexts import distributed, training
     from pithtrain.modules.distributed import setup_distributed
     from pithtrain.modules.logging import setup_logging
@@ -55,7 +64,7 @@ def run(args):
     world = int(os.environ["WORLD_SIZE"])
     assert world % args.pp == 0 and (world // args.pp) % args.ep == 0
     assert args.scenario != "rank-zero" or world // args.pp > 1
-    _, _, batches, config = source_inputs(args.dataset)
+    _, _, batches, config = source_inputs_fn(args.dataset)
     rank = int(os.environ["RANK"])
     # Before the first barrier every rank checks that evidence is fresh.
     assert not args.output.exists(), "Use a fresh shared output"
@@ -64,12 +73,17 @@ def run(args):
     cfg.distributed.timeout = timedelta(seconds=90)
     t = cfg.training
     t.model = args.output / "model"
-    t.native_vision, t.fp8, t.moe_load_balance_coef = True, False, 0.0
+    assert (modality, pixel_key, training_flag) in {
+        ("image", "pixel_values", "native_vision"),
+        ("video", "pixel_values_videos", "native_video"),
+    }
+    setattr(t, training_flag, True)
+    t.fp8, t.moe_load_balance_coef = False, 0.0
     t.optimizer, t.scheduler = make_adamw_optimizer, make_constant_scheduler
     t.lr, t.max_steps, t.sequence_length, t.global_batch_size, t.micro_batch_size = (
         1e-4,
         4,
-        512,
+        sequence_length,
         8,
         1,
     )
@@ -77,7 +91,7 @@ def run(args):
     cfg.data.dataset, cfg.data.format, cfg.data.modalities = (
         args.dataset,
         "prepared_bundle",
-        ("image",),
+        (modality,),
     )
     cfg.data.num_workers = 0
     setup_logging(cfg)
@@ -88,7 +102,7 @@ def run(args):
     dist.barrier()
     data = pretrain_lm.setup_dataset(cfg)
     setup_training(cfg)
-    reference = HFReference(config, torch.bfloat16).to(distributed.device)
+    reference = reference_class(config, torch.bfloat16).to(distributed.device)
     expected = dict(reference.named_parameters())
     actual = {}
     for module in training.model.module:
@@ -111,14 +125,14 @@ def run(args):
     microbatches = []
     for batch in local_batches:
         inputs = {k: v.to(distributed.device) for k, v in batch.model_inputs.items()}
-        pixels = inputs.pop("pixel_values")
+        pixels = inputs.pop(pixel_key)
         microbatches.append(
             Microbatch(
                 model_inputs=(inputs["input_ids"],),
                 cu_seqlens=None,
                 objective_inputs=(batch.labels.to(distributed.device),),
                 model_context=inputs,
-                media_inputs={"pixel_values": pixels} if distributed.pp_rank == 0 else None,
+                media_inputs={pixel_key: pixels} if distributed.pp_rank == 0 else None,
                 sample_ids=batch.sample_ids,
             )
         )
@@ -201,6 +215,7 @@ def run(args):
     assert data.consumed_samples == 32
     report = dict(
         status="PASSED",
+        modality=modality,
         commit=commit(),
         rank=rank,
         pp=args.pp,

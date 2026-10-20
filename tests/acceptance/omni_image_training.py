@@ -234,22 +234,25 @@ def hf_name(name):
     return name if name.startswith(("visual.", "lm_head.")) else "model." + name
 
 
-def gpu_reference(args):
+def gpu_reference(
+    args, *, source_inputs_fn=source_inputs, reference_class=HFReference, native_class=None
+):
     from pithtrain.contexts import distributed, training
     from pithtrain.models.qwen3_omni_image import Qwen3OmniMoeThinkerImageModel
     from pithtrain.operators.grouped_linear import GroupedLinear
 
     assert not args.output.exists()
-    _, _, batches, config = source_inputs(args.dataset)
+    _, _, batches, config = source_inputs_fn(args.dataset)
     device = torch.device("cuda", 0)
     distributed.device = device
     distributed.pp_size = distributed.cp_size = distributed.ep_size = 1
     distributed.pp_rank = distributed.cp_rank = distributed.ep_rank = 0
     distributed.pp_group = distributed.cp_group = distributed.ep_group = None
     training.fp8, training.Linear, training.GroupedLinear = False, nn.Linear, GroupedLinear
-    reference = HFReference(config, torch.bfloat16).to(device)
+    reference = reference_class(config, torch.bfloat16).to(device)
+    native_class = native_class or Qwen3OmniMoeThinkerImageModel
     with torch.device(device):
-        native = Qwen3OmniMoeThinkerImageModel(config, -1).to(torch.bfloat16)
+        native = native_class(config, -1).to(torch.bfloat16)
     expected = dict(reference.named_parameters())
     actual = {hf_name(n): p for n, p in native.named_parameters()}
     assert actual.keys() == expected.keys()
