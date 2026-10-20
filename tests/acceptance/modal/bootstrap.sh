@@ -10,7 +10,14 @@ test "$(git -C /work/repo rev-parse HEAD)" = "$OMNI_SOURCE_COMMIT"
 test -z "$(git -C /work/repo status --porcelain)"
 git -C /work/repo submodule status
 nvidia-smi --query-gpu=name,uuid,driver_version,memory.total --format=csv
-nvidia-smi topo -m
+# Some sandbox runtimes expose GPU compute but not the NVML topology matrix.
+# Record the unavailable inventory; actual distributed topology gates stay required.
+if nvidia-smi topo -m; then
+  echo "NVML topology inventory available"
+else
+  topology_status=$?
+  echo "NVML topology inventory unavailable (exit $topology_status); distributed validation remains required" >&2
+fi
 python - <<'PY'
 import importlib.metadata
 import json
