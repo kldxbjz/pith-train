@@ -6,9 +6,13 @@ identified encoder. Labels are shifted exactly once, after media expansion.
 """
 
 import hashlib
+import importlib.metadata
 import json
+import os
+import random
 import re
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Protocol
 
@@ -45,6 +49,90 @@ def _integer(value, name, minimum=0):
     return value
 
 
+def _identity_value(value):
+    if value is None or isinstance(value, (str, bool, int, float)):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _identity_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_identity_value(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return dict(
+            dtype=str(value.dtype),
+            shape=list(value.shape),
+            sha256=hashlib.sha256(value.tobytes()).hexdigest(),
+        )
+    if isinstance(value, np.generic):
+        return value.item()
+    if type(value).__name__ == "AddedToken":
+        return {
+            name: getattr(value, name)
+            for name in ("content", "single_word", "lstrip", "rstrip", "normalized", "special")
+        }
+    if hasattr(value, "to_dict"):
+        return _identity_value(value.to_dict())
+    raise ValueError(f"Unsupported identity value: {type(value).__name__}")
+
+
+def _fingerprint(value):
+    encoded = json.dumps(
+        _identity_value(value), sort_keys=True, separators=(",", ":"), allow_nan=False
+    )
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
+def _class_name(value):
+    return f"{type(value).__module__}.{type(value).__qualname__}"
+
+
+def _file_digest(path):
+    with path.open("rb") as stream:
+        before = os.fstat(stream.fileno())
+        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+        after = os.fstat(stream.fileno())
+    current = path.stat()
+    key = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    if key(before) != key(after) or key(after) != key(current):
+        raise ValueError("Input file changed while its identity was being read")
+    return after.st_size, digest
+
+
+def _sample_assets(row, root):
+    assets = []
+    for message in row["messages"]:
+        content = message["content"]
+        for item in content if isinstance(content, list) else ():
+            if item["type"] != "text":
+                assets.append(
+                    (item["type"], item["path"], *_file_digest(_local(root, item["path"])))
+                )
+    if "codec" in row:
+        name = row["codec"]["path"]
+        assets.append(("codec", name, *_file_digest(_local(root, name))))
+    return tuple(assets)
+
+
+def _validate_assets(root, assets):
+    for kind, name, size, digest in assets:
+        if _file_digest(_local(root, name)) != (size, digest):
+            raise ValueError(f"{kind} media identity changed: {name}")
+
+
+@contextmanager
+def _preserve_rng_on_failure():
+    state = random.getstate(), np.random.get_state(), torch.get_rng_state()
+    cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_initialized() else None
+    try:
+        yield
+    except BaseException:
+        random.setstate(state[0])
+        np.random.set_state(state[1])
+        torch.set_rng_state(state[2])
+        if cuda is not None:
+            torch.cuda.set_rng_state_all(cuda)
+        raise
+
+
 class Qwen3OmniSpeechDataset:
     """Indexed, local JSONL; media paths cannot escape the manifest directory.
 
@@ -58,6 +146,7 @@ class Qwen3OmniSpeechDataset:
         self.root = self.path.parent
         self.offsets = []
         self.row_hashes = []
+        self.asset_identities = []
         ids = set()
         digest = hashlib.sha256()
         with self.path.open("rb") as stream:
@@ -73,9 +162,23 @@ class Qwen3OmniSpeechDataset:
                 ids.add(row["id"])
                 self.offsets.append(offset)
                 self.row_hashes.append(hashlib.sha256(line).digest())
+                self.asset_identities.append(_sample_assets(row, self.root))
         if not self.offsets:
             raise ValueError("Empty speech dataset")
-        self.fingerprint = digest.hexdigest()
+        self.manifest_sha256 = digest.hexdigest()
+        self.asset_identities = tuple(self.asset_identities)
+        self.fingerprint = _fingerprint(
+            dict(schema=1, manifest=self.manifest_sha256, assets=self.asset_identities)
+        )
+        self.validate_identity()
+
+    def validate_identity(self, indices=None):
+        """Re-read bytes, not timestamps; restore checks every referenced asset."""
+        if _file_digest(self.path)[1] != self.manifest_sha256:
+            raise ValueError("Manifest changed after indexing")
+        indices = range(len(self)) if indices is None else indices
+        for index in indices:
+            _validate_assets(self.root, self.asset_identities[index])
 
     def _validate(self, row):
         if not isinstance(row, dict) or set(row) - {"id", "messages", "codec"}:
@@ -126,13 +229,14 @@ class Qwen3OmniSpeechDataset:
     def __getitem__(self, index):
         if type(index) is not int or not 0 <= index < len(self):
             raise IndexError(index)
+        self.validate_identity((index,))
         with self.path.open("rb") as stream:
             stream.seek(self.offsets[index])
             line = stream.readline()
         if hashlib.sha256(line).digest() != self.row_hashes[index]:
             raise ValueError("Manifest changed after indexing")
         row = self._validate(json.loads(line))
-        return dict(row, root=self.root)
+        return dict(row, root=self.root, _asset_identity=self.asset_identities[index])
 
 
 class ExternalRVQEncoder(Protocol):
@@ -270,6 +374,84 @@ class Qwen3OmniSpeechCollator:
         self.processor, self.config = processor, thinker_config
         self.media = Qwen3OmniCollator(processor, thinker_config, **media_limits)
 
+    def checkpoint_identity(self):
+        """Pure identity of preprocessing semantics, assets and public provenance."""
+        tokenizer = self.processor.tokenizer
+        if not hasattr(tokenizer, "backend_tokenizer"):
+            raise ValueError("Strict speech data requires a serializable tokenizer backend")
+        backend = json.loads(tokenizer.backend_tokenizer.to_str())
+        # These are mutable per-call caches. _process supplies both explicitly.
+        backend.pop("padding", None)
+        backend.pop("truncation", None)
+        tokenizer_options = {
+            key: value for key, value in tokenizer.init_kwargs.items() if key != "backend"
+        }
+        return dict(
+            schema=1,
+            collator=_class_name(self),
+            processor=_class_name(self.processor),
+            processor_config=self.processor.to_dict(),
+            processor_arrays={
+                name: {
+                    key: value
+                    for key, value in vars(getattr(self.processor, name)).items()
+                    if isinstance(value, np.ndarray)
+                }
+                for name in ("image_processor", "video_processor", "feature_extractor")
+            },
+            chat_template=self.processor.chat_template,
+            tokenizer=dict(
+                implementation=_class_name(tokenizer),
+                backend=backend,
+                options=tokenizer_options,
+                specials=tokenizer.special_tokens_map,
+                padding_side=tokenizer.padding_side,
+                truncation_side=tokenizer.truncation_side,
+                model_max_length=tokenizer.model_max_length,
+            ),
+            media_tokens={
+                name: getattr(self.processor, name)
+                for name in (
+                    "image_token",
+                    "audio_token",
+                    "video_token",
+                    "vision_bos_token",
+                    "vision_eos_token",
+                    "audio_bos_token",
+                    "audio_eos_token",
+                )
+            },
+            thinker_config=self.config.to_dict(),
+            config_revision=getattr(self.config, "_commit_hash", None),
+            media_limits={
+                name: getattr(self.media, name)
+                for name in (
+                    "max_length",
+                    "min_pixels",
+                    "max_pixels",
+                    "video_fps",
+                    "max_video_frames",
+                    "max_audio_seconds",
+                    "use_audio_in_video",
+                    "sampling_rate",
+                    "media_tokens",
+                    "media_token_ids",
+                )
+            },
+            versions={
+                name: importlib.metadata.version(name)
+                for name in (
+                    "transformers",
+                    "tokenizers",
+                    "numpy",
+                    "Pillow",
+                    "soundfile",
+                    "av",
+                    "librosa",
+                )
+            },
+        )
+
     def _load_media(self, messages, root):
         from PIL import Image
 
@@ -338,15 +520,25 @@ class Qwen3OmniSpeechCollator:
         return inputs
 
     def __call__(self, sample):
-        with torch.device("cpu"):
-            return self._collate(sample)
+        with _preserve_rng_on_failure(), torch.device("cpu"):
+            root = Path(sample["root"]).resolve()
+            assets = sample.get("_asset_identity")
+            if assets is None:
+                assets = _sample_assets(sample, root)
+            _validate_assets(root, assets)
+            result = self._collate(sample)
+            # Decoders reopen paths; reject any replacement spanning preparation.
+            _validate_assets(root, assets)
+            return result
 
     def _collate(self, sample):
         root = Path(sample["root"]).resolve()
         # Recheck prepared-tensor callers too, not only JSONL users.
         validator = object.__new__(Qwen3OmniSpeechDataset)
         validator.root = root
-        validator._validate({key: value for key, value in sample.items() if key != "root"})
+        validator._validate(
+            {key: value for key, value in sample.items() if key not in {"root", "_asset_identity"}}
+        )
         messages = sample["messages"]
         reserved = (
             set(self.processor.tokenizer.all_special_tokens)
@@ -460,18 +652,35 @@ class Qwen3OmniSpeechSFTData:
                 "Dataset length must be divisible by microbatches_per_scan; "
                 "an incomplete final scan is not padded or discarded"
             )
+        if not callable(collator) or not callable(getattr(collator, "checkpoint_identity", None)):
+            raise ValueError(
+                "Strict data requires a callable collator with a pure checkpoint_identity protocol"
+            )
+        self.collator_fingerprint = _fingerprint(collator.checkpoint_identity())
+        dataset.validate_identity()
         self.total_scans = len(dataset) // self.microbatches_per_scan
         self.scanned_batches = self.completed_updates = 0
         self.last_update_scan = -1
 
+    def _validate_pipeline(self, indices=None):
+        self.dataset.validate_identity(indices)
+        if _fingerprint(self.collator.checkpoint_identity()) != self.collator_fingerprint:
+            raise ValueError("Processor/template/collator identity changed")
+
     def get_batch(self, scan_index, device):
+        with _preserve_rng_on_failure():
+            return self._get_batch(scan_index, device)
+
+    def _get_batch(self, scan_index, device):
         if type(scan_index) is not int or scan_index != self.scanned_batches:
             raise ValueError("scan_index must match the next checkpointed scan")
         if scan_index >= self.total_scans:
             raise IndexError("Finite dataset exhausted; no repeated or fabricated microbatches")
         start = scan_index * self.microbatches_per_scan
+        indices = range(start, start + self.microbatches_per_scan)
+        self._validate_pipeline(indices)
         batches = []
-        for index in range(start, start + self.microbatches_per_scan):
+        for index in indices:
             prepared = self.collator(self.dataset[index])
             context = {key: value.to(device) for key, value in prepared["model_context"].items()}
             media = {key: value.to(device) for key, value in prepared["media_inputs"].items()}
@@ -485,7 +694,8 @@ class Qwen3OmniSpeechSFTData:
                     sample_ids=prepared["sample_ids"],
                 )
             )
-        # No cursor moves unless every sample and device transfer succeeded.
+        # No cursor moves unless preparation and post-read identity checks succeed.
+        self._validate_pipeline(indices)
         self.scanned_batches += 1
         return batches
 
@@ -504,6 +714,7 @@ class Qwen3OmniSpeechSFTData:
     def state_dict(self):
         return dict(
             fingerprint=self.dataset.fingerprint,
+            collator_fingerprint=self.collator_fingerprint,
             microbatches_per_scan=self.microbatches_per_scan,
             scanned_batches=self.scanned_batches,
             completed_updates=self.completed_updates,
@@ -512,16 +723,19 @@ class Qwen3OmniSpeechSFTData:
 
     def validate_state_dict(self, state):
         """Pure checkpoint preflight; no counters change on success or failure."""
+        self._validate_pipeline()
         if (
             set(state)
             != {
                 "fingerprint",
+                "collator_fingerprint",
                 "microbatches_per_scan",
                 "scanned_batches",
                 "completed_updates",
                 "last_update_scan",
             }
             or state["fingerprint"] != self.dataset.fingerprint
+            or state["collator_fingerprint"] != self.collator_fingerprint
             or type(state["microbatches_per_scan"]) is not int
             or state["microbatches_per_scan"] != self.microbatches_per_scan
         ):
@@ -556,9 +770,10 @@ class Qwen3OmniSpeechData(Qwen3OmniSpeechSFTData):
     def __init__(self, dataset, collator):
         super().__init__(dataset, collator, microbatches_per_scan=1)
 
-    def get_batch(self, scan_index, device):
+    def _get_batch(self, scan_index, device):
         if type(scan_index) is not int or scan_index != self.scanned_batches:
             raise ValueError("scan_index must match the next checkpointed scan")
+        self._validate_pipeline((scan_index,))
         prepared = self.collator(self.dataset[scan_index])
         if not {"codes", "code_lengths", "codebook_mask", "codec_provenance"} <= prepared.keys():
             raise ValueError("Speech training needs explicit external codec supervision")
@@ -585,5 +800,6 @@ class Qwen3OmniSpeechData(Qwen3OmniSpeechSFTData):
         }
         batch = move({key: value for key, value in prepared.items() if key in keys})
         batch["model_context"] = move(context)
+        self._validate_pipeline((scan_index,))
         self.scanned_batches += 1
         return [batch]

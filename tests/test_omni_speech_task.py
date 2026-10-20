@@ -1224,6 +1224,31 @@ def fsdp_native_task_worker(rank, root_string):
         run(zero, 0, 1, resume_scan=1, **native)
         assert zero[4].state_dict() == dict(scanned_batches=1, completed_updates=0)
         assert not zero[1].state and zero[2].last_epoch == 0
+        # The same model/config identity is carried by the native strict adapter.
+        # A single rank's same-layout config drift must reject every rank before apply.
+        if rank == 1:
+            zero[0].config.same_shape_semantics = "changed"
+        before = snapshot(zero)
+        from pithtrain.modules.distributed_checkpoint import DistributedCheckpointError
+
+        with pytest.raises(DistributedCheckpointError, match="^Ranks disagree on load contract$"):
+            _native_checkpoint(
+                "load",
+                root=root / "shards",
+                scan=2,
+                cfg=OmniSpeechCfg(mode="text_and_codec"),
+                model=zero[0],
+                optimizer=zero[1],
+                scheduler=zero[2],
+                data=zero[3],
+                state=zero[4],
+                contract=native["checkpoint_contract"],
+                token_group=mesh.get_group(),
+            )
+        assert_tree(snapshot(zero), before)
+        if rank == 1:
+            del zero[0].config.same_shape_semantics
+        dist.barrier()
         # One rank's pending gradient must be rejected before native collectives;
         # temporary global training bindings must be restored on healthy peers.
         prior_model = getattr(training, "model", None)
@@ -1259,3 +1284,155 @@ def fsdp_native_task_worker(rank, root_string):
 
 def test_real_fsdp_task_native_checkpoint_zero_and_step_two_resume_exact(tmp_path):
     mp.spawn(fsdp_native_task_worker, args=(str(tmp_path),), nprocs=2, join=True)
+
+
+def native_codec_checkpoint_parts():
+    """Actual tiny native Code2Wav semantics inside the existing task protocol fixture."""
+    from pithtrain.models.qwen3_omni_code2wav import Qwen3OmniMoeCode2Wav
+    from pithtrain.tasks.sft_lm import SFTState
+    from tests.test_qwen3_omni_code2wav import tiny_config
+
+    model = ToySpeech()
+    model.code2wav = Qwen3OmniMoeCode2Wav(tiny_config())
+    model.config.code2wav_config = model.code2wav.config
+    active = configure_trainable_components(model, "waveform")
+    optimizer = torch.optim.AdamW(active, lr=0.01)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1)
+    return model, optimizer, scheduler, Data([[sample()]]), SFTState()
+
+
+def checkpoint_complete_snapshot(parts):
+    from pithtrain.tasks.omni_speech import _rng_state
+
+    model, optimizer, scheduler, data, state = parts
+    return copy.deepcopy(
+        (
+            model.state_dict(),
+            optimizer.state_dict(),
+            scheduler.state_dict(),
+            data.state_dict(),
+            state.state_dict(),
+            _rng_state(),
+            [(name, module.training) for name, module in model.named_modules()],
+            [(name, parameter.grad) for name, parameter in model.named_parameters()],
+        )
+    )
+
+
+def checkpoint_call_options(parts):
+    model, optimizer, scheduler, data, state = parts
+    return dict(
+        cfg=OmniSpeechCfg(mode="waveform", waveform_objective_id="native-codec-contract-v1"),
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        data=data,
+        state=state,
+        token_group=None,
+        gradient_reduction="sum",
+    )
+
+
+@pytest.mark.parametrize(
+    "damage",
+    ["theta_config", "theta_runtime", "theta_both", "eps_config", "eps_runtime", "eps_both"],
+)
+def test_native_same_shape_config_and_runtime_drift_rejected_before_apply(damage, tmp_path):
+    from pithtrain.tasks.omni_speech import save_checkpoint
+
+    producer = native_codec_checkpoint_parts()
+    target = tmp_path / "native-codec.pt"
+    save_checkpoint(target, **checkpoint_call_options(producer))
+    resumed = native_codec_checkpoint_parts()
+    codec = resumed[0].code2wav
+    if damage.startswith("theta"):
+        if damage.endswith(("config", "both")):
+            codec.config.rope_parameters["rope_theta"] *= 2
+        if damage.endswith(("runtime", "both")):
+            codec.pre_transformer.theta *= 2
+    else:
+        if damage.endswith(("config", "both")):
+            codec.config.rms_norm_eps *= 2
+        if damage.endswith(("runtime", "both")):
+            for module in codec.modules():
+                if hasattr(module, "variance_epsilon"):
+                    module.variance_epsilon *= 2
+    assert [(n, tuple(v.shape)) for n, v in producer[0].state_dict().items()] == [
+        (n, tuple(v.shape)) for n, v in resumed[0].state_dict().items()
+    ]
+    before = checkpoint_complete_snapshot(resumed)
+    with pytest.raises(ValueError, match="preflight") as rejected:
+        load_checkpoint(target, **checkpoint_call_options(resumed))
+    expected_reason = (
+        "contract mismatch"
+        if damage.endswith("both")
+        else ("Runtime RoPE theta" if damage.startswith("theta") else "Runtime RMS epsilon")
+    )
+    assert expected_reason in str(rejected.value.__cause__)
+    assert_tree(checkpoint_complete_snapshot(resumed), before)
+
+
+@pytest.mark.parametrize("attribute", ["theta", "variance_epsilon"])
+def test_save_rejects_config_shell_disagreeing_with_actual_native_runtime(attribute, tmp_path):
+    from pithtrain.tasks.omni_speech import save_checkpoint
+
+    parts = native_codec_checkpoint_parts()
+    runtime = (
+        parts[0].code2wav.pre_transformer
+        if attribute == "theta"
+        else parts[0].code2wav.pre_transformer.norm
+    )
+    setattr(runtime, attribute, getattr(runtime, attribute) * 2)
+    before = checkpoint_complete_snapshot(parts)
+    target = tmp_path / "inconsistent.pt"
+    with pytest.raises(ValueError, match="save preflight") as rejected:
+        save_checkpoint(target, **checkpoint_call_options(parts))
+    expected_reason = "Runtime RoPE theta" if attribute == "theta" else "Runtime RMS epsilon"
+    assert expected_reason in str(rejected.value.__cause__)
+    assert not target.exists()
+    assert_tree(checkpoint_complete_snapshot(parts), before)
+
+
+def test_native_codec_contract_same_source_roundtrip_and_canonical_no_addresses(tmp_path):
+    from pithtrain.tasks.omni_speech import _model_contract, save_checkpoint
+
+    producer, resumed = native_codec_checkpoint_parts(), native_codec_checkpoint_parts()
+    left, right = _model_contract(producer[0]), _model_contract(resumed[0])
+    assert left == right
+    assert left["identity"]["schema"] == 2
+    assert left["identity"]["modules"]["code2wav.pre_transformer"]["numerical_attributes"]["theta"]
+    target = tmp_path / "same-source.pt"
+    save_checkpoint(target, **checkpoint_call_options(producer))
+    load_checkpoint(target, **checkpoint_call_options(resumed))
+    assert_tree(checkpoint_complete_snapshot(resumed), checkpoint_complete_snapshot(producer))
+
+
+def test_model_contract_rejects_detached_composite_config_and_binds_implementation():
+    from pithtrain.tasks.omni_speech import _model_contract
+
+    parts = native_codec_checkpoint_parts()
+    model = parts[0]
+    expected = _model_contract(model)
+    assert expected["identity"]["modules"]["code2wav"]["implementation"].endswith(
+        ".Qwen3OmniMoeCode2Wav"
+    )
+    model.config.code2wav_config = copy.deepcopy(model.config.code2wav_config)
+    model.config.code2wav_config.rms_norm_eps *= 2
+    with pytest.raises(ValueError, match="component config"):
+        _model_contract(model)
+
+
+def test_model_contract_rejects_legacy_checkpoint_without_semantic_identity(tmp_path):
+    from pithtrain.tasks.omni_speech import _read_verified_checkpoint, save_checkpoint
+
+    parts = native_codec_checkpoint_parts()
+    target = tmp_path / "legacy.pt"
+    save_checkpoint(target, **checkpoint_call_options(parts))
+    payload = _read_verified_checkpoint(target)
+    payload["manifest"].pop("model_contract")
+    payload["manifest"]["version"] = 1
+    _write_verified_checkpoint(target, payload)
+    before = checkpoint_complete_snapshot(parts)
+    with pytest.raises(ValueError, match="preflight"):
+        load_checkpoint(target, **checkpoint_call_options(parts))
+    assert_tree(checkpoint_complete_snapshot(parts), before)

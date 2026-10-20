@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import json
+import random
 
 import numpy as np
 import pytest
@@ -15,6 +16,21 @@ from pithtrain.modules.qwen3_omni_speech_data import (
     Qwen3OmniSpeechSFTData,
     load_codec_supervision,
 )
+
+
+class IdentityCollator:
+    """Explicit immutable test protocol; never a production identity fallback."""
+
+    def __init__(self, callback=None, *, identity="cursor-test-v1"):
+        self.callback, self.identity = callback, identity
+
+    def checkpoint_identity(self):
+        return {"test_protocol": self.identity}
+
+    def __call__(self, sample):
+        if self.callback is None:
+            raise AssertionError("This cursor-only fixture must not prepare data")
+        return self.callback(sample)
 
 
 @pytest.fixture(scope="module")
@@ -371,7 +387,7 @@ def test_failed_prepare_does_not_advance_scan(tmp_path):
     def fail(sample):
         raise ValueError("bad sample")
 
-    data = Qwen3OmniSpeechSFTData(dataset(tmp_path, [row()]), fail)
+    data = Qwen3OmniSpeechSFTData(dataset(tmp_path, [row()]), IdentityCollator(fail))
     with pytest.raises(ValueError, match="bad sample"):
         data.get_batch(0, "cpu")
     assert data.scanned_batches == data.completed_updates == 0
@@ -428,14 +444,14 @@ def test_manifest_cannot_change_after_indexing(tmp_path):
 )
 def test_cursor_rejects_invalid_checkpoint(tmp_path, state):
     source = dataset(tmp_path, [row()])
-    data = Qwen3OmniSpeechSFTData(source, None)
+    data = Qwen3OmniSpeechSFTData(source, IdentityCollator())
     with pytest.raises(ValueError):
         data.load_state_dict(state | dict(fingerprint=source.fingerprint))
 
 
 def test_checkpoint_preflight_is_pure_and_failed_load_atomic(tmp_path):
     source = dataset(tmp_path, [row(), row("second")])
-    data = Qwen3OmniSpeechSFTData(source, None)
+    data = Qwen3OmniSpeechSFTData(source, IdentityCollator())
     initial = data.state_dict()
     valid = initial | dict(scanned_batches=2, completed_updates=1, last_update_scan=1)
     data.validate_state_dict(valid)
@@ -622,7 +638,7 @@ def test_grouped_scan_failed_later_prepare_is_atomic(tmp_path, official):
             raise ValueError("second preparation failed")
         return collator(sample)
 
-    data = Qwen3OmniSpeechSFTData(source, prepare, microbatches_per_scan=2)
+    data = Qwen3OmniSpeechSFTData(source, IdentityCollator(prepare), microbatches_per_scan=2)
     original = data.state_dict()
     with pytest.raises(ValueError, match="second preparation failed"):
         data.get_batch(0, "cpu")
@@ -648,7 +664,7 @@ def test_invalid_group_size_rejected(tmp_path, group):
 
 def test_group_checkpoint_is_explicit_and_speech_stays_singleton(tmp_path):
     source = dataset(tmp_path, [row(), row("second")])
-    data = Qwen3OmniSpeechData(source, None)
+    data = Qwen3OmniSpeechData(source, IdentityCollator())
     assert data.microbatches_per_scan == 1 and data.total_scans == 2
     saved = data.state_dict()
     assert saved["microbatches_per_scan"] == 1
@@ -660,4 +676,182 @@ def test_group_checkpoint_is_explicit_and_speech_stays_singleton(tmp_path):
             data.load_state_dict(invalid)
         assert data.state_dict() == saved
     with pytest.raises(TypeError):
-        Qwen3OmniSpeechData(source, None, microbatches_per_scan=2)
+        Qwen3OmniSpeechData(source, IdentityCollator(), microbatches_per_scan=2)
+
+
+def _rng_snapshot():
+    return random.getstate(), np.random.get_state(), torch.get_rng_state().clone()
+
+
+def _assert_rng_same(before):
+    assert random.getstate() == before[0]
+    now = np.random.get_state()
+    assert now[0] == before[1][0] and np.array_equal(now[1], before[1][1])
+    assert now[2:] == before[1][2:]
+    assert torch.equal(torch.get_rng_state(), before[2])
+
+
+def _real_media(tmp_path, kind):
+    from PIL import Image
+
+    if kind == "image":
+        path = tmp_path / "identity.png"
+        Image.new("RGB", (64, 64), "red").save(path)
+    elif kind == "audio":
+        import soundfile as sf
+
+        path = tmp_path / "identity.wav"
+        sf.write(path, np.zeros(8000, np.float32), 8000)
+    else:
+        import av
+
+        path = tmp_path / "identity.mp4"
+        with av.open(str(path), "w") as container:
+            stream = container.add_stream("libx264", rate=2)
+            stream.width = stream.height = 64
+            stream.pix_fmt = "yuv420p"
+            for color in ("red", "blue"):
+                for packet in stream.encode(
+                    av.VideoFrame.from_image(Image.new("RGB", (64, 64), color))
+                ):
+                    container.mux(packet)
+            for packet in stream.encode():
+                container.mux(packet)
+    return path
+
+
+@pytest.mark.parametrize("kind", ["image", "audio", "video"])
+@pytest.mark.parametrize("operation", ["read", "restore"])
+def test_media_replacement_rejected_before_processing_or_cursor_rng_mutation(
+    tmp_path, official, kind, operation
+):
+    path = _real_media(tmp_path, kind)
+    item = row()
+    item["messages"][0]["content"] = [{"type": kind, "path": path.name}]
+    source = dataset(tmp_path, [item])
+    collator = Qwen3OmniSpeechCollator(*official)
+    data = Qwen3OmniSpeechSFTData(source, collator)
+    saved, rng = data.state_dict(), _rng_snapshot()
+    original = path.read_bytes()
+    path.write_bytes(original + b"changed-media-bytes")
+    assert dataset(tmp_path, [item]).fingerprint != source.fingerprint
+    with pytest.raises(ValueError, match="media identity changed"):
+        data.get_batch(0, "cpu") if operation == "read" else data.load_state_dict(saved)
+    assert data.state_dict() == saved
+    _assert_rng_same(rng)
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "template",
+        "processor",
+        "tokenizer",
+        "media_limit",
+        "model_config",
+        "revision",
+        "derived_filter",
+    ],
+)
+@pytest.mark.parametrize("operation", ["read", "restore", "fresh_restore"])
+def test_preprocessing_identity_changes_fail_closed(tmp_path, official, field, operation):
+    processor, config = copy.deepcopy(official)
+    collator = Qwen3OmniSpeechCollator(processor, config)
+    source = dataset(tmp_path, [row()])
+    data = Qwen3OmniSpeechSFTData(source, collator)
+    saved = data.state_dict()
+    if field == "template":
+        processor.chat_template += " "
+    elif field == "processor":
+        processor.feature_extractor.dither = 0.25
+    elif field == "tokenizer":
+        processor.tokenizer.add_tokens(["identity_added_token"])
+    elif field == "media_limit":
+        collator.media.max_pixels += 1
+    elif field == "model_config":
+        config.audio_config.n_window += 1
+    elif field == "derived_filter":
+        processor.feature_extractor.mel_filters[0, 0] += 1.0
+    else:
+        config._commit_hash = "b" * 40
+    if operation == "fresh_restore":
+        data = Qwen3OmniSpeechSFTData(source, collator)
+    before, rng = data.state_dict(), _rng_snapshot()
+    with pytest.raises(ValueError, match="identity changed|manifest"):
+        data.get_batch(0, "cpu") if operation == "read" else data.load_state_dict(saved)
+    assert data.state_dict() == before
+    _assert_rng_same(rng)
+
+
+def test_media_changed_during_decoder_use_rejected_and_rng_rolled_back(
+    tmp_path, official, monkeypatch
+):
+    path = _real_media(tmp_path, "image")
+    item = row()
+    item["messages"][0]["content"] = [{"type": "image", "path": path.name}]
+    source = dataset(tmp_path, [item])
+    collator = Qwen3OmniSpeechCollator(*official)
+    data = Qwen3OmniSpeechSFTData(source, collator)
+    original = collator._process
+
+    def replace_after_decode(*args, **kwargs):
+        result = original(*args, **kwargs)
+        path.write_bytes(path.read_bytes() + b"replaced-during-processing")
+        random.random()
+        np.random.rand()
+        torch.rand(2)
+        return result
+
+    monkeypatch.setattr(collator, "_process", replace_after_decode)
+    saved, rng = data.state_dict(), _rng_snapshot()
+    with pytest.raises(ValueError, match="media identity changed"):
+        data.get_batch(0, "cpu")
+    assert data.state_dict() == saved
+    _assert_rng_same(rng)
+
+
+def test_restore_revalidates_nonnext_media_and_codec_archive(tmp_path, official):
+    sample = prepared(tmp_path)
+    sample.pop("root")
+    source = dataset(tmp_path, [row("first"), sample])
+    data = Qwen3OmniSpeechSFTData(source, Qwen3OmniSpeechCollator(*official))
+    saved, rng = data.state_dict(), _rng_snapshot()
+    path = tmp_path / "codec.npz"
+    path.write_bytes(path.read_bytes() + b"changed")
+    with pytest.raises(ValueError, match="codec media identity changed"):
+        data.validate_state_dict(saved)
+    assert data.state_dict() == saved
+    _assert_rng_same(rng)
+
+
+def test_group_preflight_checks_every_asset_before_first_collator_call(tmp_path):
+    path = _real_media(tmp_path, "image")
+    second = row("second")
+    second["messages"][0]["content"] = [{"type": "image", "path": path.name}]
+    calls = []
+    data = Qwen3OmniSpeechSFTData(
+        dataset(tmp_path, [row("first"), second]),
+        IdentityCollator(lambda sample: calls.append(sample)),
+        microbatches_per_scan=2,
+    )
+    saved = data.state_dict()
+    path.write_bytes(path.read_bytes() + b"changed")
+    with pytest.raises(ValueError, match="media identity changed"):
+        data.get_batch(0, "cpu")
+    assert not calls and data.state_dict() == saved
+
+
+@pytest.mark.parametrize("collator", [None, lambda sample: sample])
+def test_strict_reader_never_accepts_unidentified_callable(tmp_path, collator):
+    with pytest.raises(ValueError, match="checkpoint_identity"):
+        Qwen3OmniSpeechSFTData(dataset(tmp_path, [row()]), collator)
+
+
+def test_old_weak_reader_checkpoint_rejected_atomically(tmp_path, official):
+    data = Qwen3OmniSpeechSFTData(dataset(tmp_path, [row()]), Qwen3OmniSpeechCollator(*official))
+    saved = data.state_dict()
+    with pytest.raises(ValueError, match="manifest"):
+        data.load_state_dict(
+            {key: value for key, value in saved.items() if key != "collator_fingerprint"}
+        )
+    assert data.state_dict() == saved
