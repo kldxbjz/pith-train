@@ -23,6 +23,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset, Sampler
 
 from pithtrain.modules.data_config import resolve_bundle_modalities
+from pithtrain.modules.qwen3_omni_av import decode_video_audio
 
 
 class Qwen3OmniDataset(Dataset):
@@ -133,8 +134,8 @@ class Qwen3OmniCollator:
     Prefix a document boundary (the tokenizer's EOS), then predict all paired
     text tokens and EOS. Ignore padding and media wrapper/placeholder targets.
     Media tensors stay attached, never flattened into .bin.
-    Video currently means visual frames only; clips with audio are rejected so
-    an audio track cannot silently disappear from an Omni training sample.
+    Synchronized video audio is opt-in. Its audio is aligned to the video's
+    first frame and its tokens are interleaved by the official processor.
     """
 
     def __init__(
@@ -148,6 +149,7 @@ class Qwen3OmniCollator:
         video_fps=2.0,
         max_video_frames=32,
         max_audio_seconds=30.0,
+        use_audio_in_video=False,
     ):
         if max_length < 2 or video_fps <= 0 or max_video_frames < 2:
             raise ValueError("Invalid sequence length or video sampling limits")
@@ -159,6 +161,9 @@ class Qwen3OmniCollator:
         self.min_pixels, self.max_pixels = min_pixels, max_pixels
         self.video_fps, self.max_video_frames = video_fps, max_video_frames
         self.max_audio_seconds = max_audio_seconds
+        if type(use_audio_in_video) is not bool:
+            raise ValueError("use_audio_in_video must be a boolean")
+        self.use_audio_in_video = use_audio_in_video
         self.sampling_rate = processor.feature_extractor.sampling_rate
         self.media_tokens = [
             getattr(processor, name)
@@ -197,9 +202,10 @@ class Qwen3OmniCollator:
             frames.append(frame.to_ndarray(format="rgb24"))
 
         with av.open(str(path)) as container:
-            if container.streams.audio:
+            has_audio = bool(container.streams.audio)
+            if has_audio and not self.use_audio_in_video:
                 raise ValueError(
-                    f"Video has an audio track: {path}. Synchronized audio/video is not supported yet."
+                    f"Video has an audio track: {path}. Set use_audio_in_video=True to preserve it."
                 )
             start, previous, previous_time = None, None, None
             for frame in container.decode(video=0):
@@ -230,6 +236,9 @@ class Qwen3OmniCollator:
             raise ValueError(f"Video needs at least two sampled frames: {path}")
         return np.stack(frames), dict(
             type="video",
+            has_audio=has_audio,
+            start_seconds=start,
+            duration_seconds=end,
             fps=self.video_fps,
             timestamps=timestamps,
             source_timestamps=source_timestamps,
@@ -244,6 +253,7 @@ class Qwen3OmniCollator:
             raise ValueError("Cannot collate an empty batch")
         processor = self.processor
         texts, images, audio, videos, media_info = [], [], [], [], []
+        video_audio_modes = []
         for sample in samples:
             if any(token in sample["text"] for token in self.media_tokens):
                 raise ValueError(f"{sample['id']}: paired text contains reserved media tokens")
@@ -273,6 +283,16 @@ class Qwen3OmniCollator:
                 else:
                     video, details = self._video(path)
                     videos.append(video)
+                    video_audio_modes.append(details["has_audio"])
+                    if details["has_audio"]:
+                        waveform, audio_details = decode_video_audio(
+                            path, start_seconds=details["start_seconds"],
+                            duration_seconds=details["duration_seconds"],
+                            sampling_rate=self.sampling_rate,
+                            max_seconds=self.max_audio_seconds,
+                        )
+                        audio.append(waveform)
+                        details["audio"] = audio_details
                     info.append(details)
                     prefix.append(
                         processor.vision_bos_token
@@ -281,6 +301,9 @@ class Qwen3OmniCollator:
                     )
             texts.append("".join(prefix) + sample["text"] + processor.tokenizer.eos_token)
             media_info.append(info)
+        if any(video_audio_modes) and not all(video_audio_modes):
+            raise ValueError("A processor microbatch cannot mix videos with and without audio")
+        synchronized = any(video_audio_modes)
         inputs = dict(
             processor(
                 text=texts,
@@ -298,11 +321,13 @@ class Qwen3OmniCollator:
                     cap_pixels_per_frame=True,
                     size=dict(shortest_edge=self.min_pixels, longest_edge=self.max_pixels),
                     position_id_per_seconds=self.config.position_id_per_seconds,
-                    use_audio_in_video=False,
+                    use_audio_in_video=synchronized,
                 ),
                 return_tensors="pt",
             )
         )
+        if synchronized:
+            inputs["use_audio_in_video"] = torch.tensor(True)
         ids, mask = inputs["input_ids"], inputs["attention_mask"]
         if ids.shape[1] - 1 > self.max_length:
             raise ValueError(

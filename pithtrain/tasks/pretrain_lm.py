@@ -85,7 +85,11 @@ def setup_dataset(cfg: PretrainLMCfg) -> PretrainData:
     )
     config = AutoConfig.from_pretrained(cfg.training.model)
     data.validate_model(
-        model_class_for_config(config, native_vision=cfg.training.native_vision), config
+        model_class_for_config(
+            config, native_vision=cfg.training.native_vision, native_video=cfg.training.native_video,
+            native_audio=cfg.training.native_audio, native_multimodal=cfg.training.native_multimodal,
+        ),
+        config,
     )
     return data
 

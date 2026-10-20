@@ -1,8 +1,8 @@
-"""Native image encoder for Qwen3-Omni; no Transformers execution dependency.
+"""Native visual encoders for Qwen3-Omni; no Transformers execution dependency.
 
 Parameter names and math follow Transformers 5.17 Qwen3OmniMoeVisionEncoder
 (Apache-2.0). Geometry is computed per call; no image features are cached on a
-module. Attention segments are independent images, never the packed batch.
+module. Attention segments are independent images or temporal frames, never the packed batch.
 """
 
 import math
@@ -34,17 +34,35 @@ def image_grid(grid_thw, merge_size):
     return grids
 
 
-def vision_geometry(grid_thw, merge_size, side):
+def video_grid(grid_thw, merge_size):
+    """Temporal grids retain frame boundaries in the visual attention sequence."""
+    if (
+        not isinstance(grid_thw, torch.Tensor)
+        or grid_thw.ndim != 2
+        or grid_thw.shape[1] != 3
+        or grid_thw.shape[0] == 0
+    ):
+        raise ValueError("video_grid_thw must be nonempty [videos, 3]")
+    if grid_thw.dtype not in (torch.int32, torch.int64):
+        raise ValueError("video_grid_thw must have integer dtype")
+    grids = grid_thw.tolist()
+    if any(t <= 0 or h <= 0 or w <= 0 or h % merge_size or w % merge_size for t, h, w in grids):
+        raise ValueError("Video grids require positive T/H/W and spatially divisible H/W")
+    return grids
+
+
+def vision_geometry(grid_thw, merge_size, side, *, video=False):
     """Block-major axial positions and align-corners bilinear embedding taps."""
     coords, indices, weights, lengths = [], [], [], []
     device = grid_thw.device
-    for _, h, w in image_grid(grid_thw, merge_size):
+    grids = video_grid(grid_thw, merge_size) if video else image_grid(grid_thw, merge_size)
+    for t, h, w in grids:
         row, col = torch.meshgrid(
             torch.arange(h, device=device), torch.arange(w, device=device), indexing="ij"
         )
         shape = (h // merge_size, merge_size, w // merge_size, merge_size)
         pos = torch.stack([v.reshape(shape).transpose(1, 2).flatten() for v in (row, col)], dim=-1)
-        coords.append(pos)
+        coords.append(pos.repeat(t, 1))
         taps, fractions = [], []
         for axis, size in enumerate((h, w)):
             source = pos[:, axis].float() * (side - 1) / max(size - 1, 1)
@@ -52,9 +70,11 @@ def vision_geometry(grid_thw, merge_size, side):
             taps.append(torch.stack((low, (low + 1).clamp(max=side - 1)), dim=1))
             delta = source - low
             fractions.append(torch.stack((1 - delta, delta), dim=1))
-        indices.append((taps[0][:, :, None] * side + taps[1][:, None, :]).flatten(1))
-        weights.append((fractions[0][:, :, None] * fractions[1][:, None, :]).flatten(1))
-        lengths.append(h * w)
+        indices.append((taps[0][:, :, None] * side + taps[1][:, None, :]).flatten(1).repeat(t, 1))
+        weights.append(
+            (fractions[0][:, :, None] * fractions[1][:, None, :]).flatten(1).repeat(t, 1)
+        )
+        lengths.extend([h * w] * t)
     return torch.cat(coords), torch.cat(indices), torch.cat(weights), tuple(lengths)
 
 
@@ -183,6 +203,7 @@ class Qwen3OmniMoeVisionPatchMerger(nn.Module):
 
 class Qwen3OmniMoeVisionEncoder(nn.Module):
     input_modalities = ("image",)
+    supports_video = False
 
     def __init__(self, config):
         super().__init__()
@@ -219,8 +240,10 @@ class Qwen3OmniMoeVisionEncoder(nn.Module):
 
     def forward(self, pixel_values, grid_thw):
         config = self.config
-        grids = image_grid(grid_thw, config.spatial_merge_size)
-        patches = sum(h * w for _, h, w in grids)
+        grids = (video_grid if self.supports_video else image_grid)(
+            grid_thw, config.spatial_merge_size
+        )
+        patches = sum(t * h * w for t, h, w in grids)
         width = config.in_channels * config.temporal_patch_size * config.patch_size**2
         if pixel_values.shape != (patches, width):
             raise ValueError(
@@ -229,7 +252,10 @@ class Qwen3OmniMoeVisionEncoder(nn.Module):
         if not pixel_values.is_floating_point() or not torch.isfinite(pixel_values).all():
             raise ValueError("pixel_values must be finite floating point values")
         positions, indices, weights, lengths = vision_geometry(
-            grid_thw.to(pixel_values.device), config.spatial_merge_size, self.side
+            grid_thw.to(pixel_values.device),
+            config.spatial_merge_size,
+            self.side,
+            video=self.supports_video,
         )
         hidden = self.patch_embed(pixel_values)
         hidden = hidden + (self.pos_embed(indices) * weights[..., None]).sum(1).to(hidden.dtype)
@@ -240,3 +266,10 @@ class Qwen3OmniMoeVisionEncoder(nn.Module):
             if i in self.deepstack_visual_indexes:
                 deepstack.append(self.merger_list[self.deepstack_visual_indexes.index(i)](hidden))
         return VisionOutput(hidden, self.merger(hidden), tuple(deepstack))
+
+
+class Qwen3OmniMoeVideoEncoder(Qwen3OmniMoeVisionEncoder):
+    """Same HF visual parameters; temporal patches attend within each frame."""
+
+    input_modalities = ("video",)
+    supports_video = True

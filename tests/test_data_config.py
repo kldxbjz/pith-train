@@ -39,7 +39,7 @@ def task_config(**overrides):
         SlottedDefault=SlottedDefault,
         DataCfg=DataCfg,
         DistributedCfg=SimpleNamespace,
-        TrainingCfg=SimpleNamespace,
+        TrainingCfg=lambda: SimpleNamespace(native_vision=False, native_video=False, native_audio=False, native_multimodal=False),
         LoggingCfg=SimpleNamespace,
         DensePretrainData=DensePretrainData,
         OmniPretrainData=OmniPretrainData,
@@ -138,10 +138,12 @@ def test_task_routes_storage_format_with_identical_text_batches(text_bundle, mon
     monkeypatch.setattr(OmniPretrainData, "validate_model", lambda self, *args: checks.append(args))
     task = task_config(
         AutoConfig=SimpleNamespace(from_pretrained=lambda path: path),
-        model_class_for_config=lambda cfg: "Model",
+        model_class_for_config=lambda cfg, **flags: "Model",
     )
     cfg = task.PretrainLMCfg()
     cfg.training = training
+    cfg.training.native_vision = cfg.training.native_video = False
+    cfg.training.native_audio = cfg.training.native_multimodal = False
     cfg.training.model = "model-config"
     cfg.data.dataset = root / "tokens/train"
     dense = task.setup_dataset(cfg)
@@ -259,7 +261,7 @@ def test_task_passes_pipeline_ownership_to_prepared_provider(tmp_path):
             dp_rank=1, dp_size=2, cp_rank=0, cp_size=1, pp_rank=1, pp_size=2, pp_group=group
         ),
         AutoConfig=SimpleNamespace(from_pretrained=lambda _: "native-config"),
-        model_class_for_config=lambda _: "TestModel",
+        model_class_for_config=lambda _, **flags: "TestModel",
     )
     cfg = task.PretrainLMCfg()
     cfg.data.dataset, cfg.data.format = tmp_path, "prepared_bundle"
