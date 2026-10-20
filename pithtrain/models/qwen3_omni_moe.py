@@ -285,8 +285,7 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
         )
         return padded_index_gather(self.mlp.experts(tokens, offs, ks, sizes), reverse)
 
-    @torch.compile(fullgraph=True)
-    def forward_stage5(self, moe_outs, moe_local_idxs, topk_weight, residual):
+    def _forward_stage5(self, moe_outs, moe_local_idxs, topk_weight, residual):
         if not self.is_moe:
             return residual + moe_outs
         if distributed.ep_size == 1:
@@ -298,6 +297,10 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
         result = moe_outs.new_zeros(topk_weight.shape[0], moe_outs.shape[-1])
         result.scatter_add_(0, token_indices[:, None].expand_as(weighted), weighted)
         return residual + result.view_as(residual)
+
+    @torch.compile(fullgraph=True)
+    def forward_stage5(self, moe_outs, moe_local_idxs, topk_weight, residual):
+        return self._forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
 
     def reference_forward(self, hidden_states, rotary_posemb, cu_seqlens=None):
         residual = hidden_states + self.self_attn(
