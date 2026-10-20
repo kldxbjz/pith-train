@@ -11,11 +11,16 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen
 
 from pithtrain.contexts import distributed, training
 from pithtrain.models.interface import RoutingInfo
-from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, MoELoadBalanceLossTracker
+from pithtrain.modules.load_balance import (
+    MoELoadBalanceLossInjector,
+    MoELoadBalanceLossTracker,
+    replay_indices,
+)
 from pithtrain.operators.cp_sequence import zigzag_spans
 from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.flash_attn_v4 import flash_attn_func, flash_attn_varlen_func
 from pithtrain.operators.grouped_linear import GroupedLinearFunc
+from pithtrain.operators.linear import BF16Linear
 from pithtrain.operators.ring_attention import ring_attention_func
 from pithtrain.operators.token_scatter import padded_index_gather, scatter_for_grouped_gemm
 from pithtrain.pipeline.dualpipev import layer_partition
@@ -100,12 +105,12 @@ class Qwen3OmniMoeThinkerTextTopKRouter(nn.Module):
         self.weight = nn.Parameter(torch.empty(config.num_experts, config.hidden_size))
         self.load_balance_loss_fn = self.router_replay = None
 
-    def forward(self, hidden_states):
+    def forward(self, hidden_states, replay_idx=None):
         logits = F.linear(hidden_states.reshape(-1, hidden_states.shape[-1]), self.weight)
         scores = logits.softmax(dim=-1, dtype=torch.float32)
         weights, indices = torch.topk(scores, self.top_k, dim=-1)
-        if self.router_replay is not None:
-            indices = self.router_replay(indices)
+        if replay_idx is not None:
+            indices = replay_idx
             weights = scores.gather(-1, indices)
         if self.norm_topk_prob:
             weights = weights / weights.sum(-1, keepdim=True)
@@ -131,7 +136,8 @@ class Qwen3OmniMoeThinkerTextSparseMoeBlock(nn.Module):
 
     def reference_forward(self, hidden_states):
         shape = hidden_states.shape
-        indices, weights, lb_loss = self.gate(hidden_states)
+        replay_idx = replay_indices(self.gate, hidden_states, self.num_experts_per_tok)
+        indices, weights, lb_loss = self.gate(hidden_states, replay_idx)
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
         flat = hidden_states.reshape(-1, shape[-1])
@@ -233,19 +239,26 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
         )
 
     @torch.compile(fullgraph=True)
-    def forward_stage1_compute(self, hidden_states, rotary_posemb, cu_seqlens=None):
+    def forward_stage1_compute(
+        self, hidden_states, rotary_posemb, cu_seqlens=None, replay_idx=None
+    ):
         residual = hidden_states + self.self_attn(
             self.input_layernorm(hidden_states), rotary_posemb, cu_seqlens
         )
         hidden_states = self.post_attention_layernorm(residual)
-        routing = self.mlp.gate(hidden_states) if self.is_moe else (None, None, None)
+        routing = self.mlp.gate(hidden_states, replay_idx) if self.is_moe else (None, None, None)
         return hidden_states, residual, *routing
 
     def forward_stage1(
         self, hidden_states, rotary_posemb, cu_seqlens=None
     ) -> tuple[torch.Tensor, torch.Tensor, RoutingInfo | None]:
+        replay_idx = (
+            replay_indices(self.mlp.gate, hidden_states, self.mlp.num_experts_per_tok)
+            if self.is_moe
+            else None
+        )
         hidden_states, residual, indices, weights, lb_loss = self.forward_stage1_compute(
-            hidden_states, rotary_posemb, cu_seqlens
+            hidden_states, rotary_posemb, cu_seqlens, replay_idx
         )
         if not self.is_moe:
             return hidden_states, residual, None
@@ -323,7 +336,7 @@ class Qwen3OmniMoeThinkerTextModel(nn.Module):
             )
         if self.stage_index == self.stage_count - 1:
             self.norm = Qwen3OmniMoeThinkerTextRMSNorm(config.hidden_size, config.rms_norm_eps)
-            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+            self.lm_head = BF16Linear(config.hidden_size, config.vocab_size, bias=False)
         self.layers = nn.ModuleDict(
             {
                 str(i): Qwen3OmniMoeThinkerTextDecoderLayer(config, i)
