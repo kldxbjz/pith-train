@@ -136,19 +136,19 @@ class Qwen3OmniMoeAudioAttention(nn.Module):
             projection(hidden_states).reshape(shape)
             for projection in (self.q_proj, self.k_proj, self.v_proj)
         )
-        outputs = [
-            F.scaled_dot_product_attention(
-                queries.transpose(0, 1),
-                keys.transpose(0, 1),
-                values.transpose(0, 1),
-                dropout_p=0.0,
-                is_causal=False,
-            ).transpose(0, 1)
-            for queries, keys, values in zip(
-                q.split(lengths), k.split(lengths), v.split(lengths), strict=True
+        outputs = []
+        for queries, keys, values in zip(
+            q.split(lengths), k.split(lengths), v.split(lengths), strict=True
+        ):
+            queries, keys, values = (
+                tensor.transpose(0, 1).unsqueeze(0) for tensor in (queries, keys, values)
             )
-        ]
-        return self.out_proj(torch.cat(outputs).reshape(hidden_states.shape))
+            # Preserve the reference's scaling/FP32-softmax arithmetic. Reordering
+            # via SDPA changes the near-zero key-bias gradients even on CPU.
+            scores = torch.matmul(queries, keys.transpose(2, 3)) * self.head_dim**-0.5
+            probabilities = F.softmax(scores, dim=-1, dtype=torch.float32).to(queries.dtype)
+            outputs.append(torch.matmul(probabilities, values).transpose(1, 2).contiguous())
+        return self.out_proj(torch.cat(outputs, dim=1).reshape(hidden_states.shape))
 
 
 class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
