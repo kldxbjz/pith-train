@@ -389,3 +389,28 @@ def test_released_output_lengths_include_chunk_boundaries():
     torch.testing.assert_close(
         audio_output_lengths(sizes), torch.tensor([1, 1, 1, 2, 13, 13, 14, 26, 26, 27])
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_attention_matches_hf_arithmetic_including_near_zero_key_bias(dtype):
+    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+        Qwen3OmniMoeAudioAttention as HFAttention,
+    )
+
+    from pithtrain.models.qwen3_omni_audio import Qwen3OmniMoeAudioAttention
+
+    config = audio_config()
+    config._attn_implementation = "eager"
+    reference = HFAttention(config).to(dtype=dtype)
+    native = Qwen3OmniMoeAudioAttention(config).to(dtype=dtype)
+    native.load_state_dict(reference.state_dict(), strict=True)
+    hidden = torch.randn(43, config.d_model, dtype=dtype, requires_grad=True)
+    expected_hidden = hidden.detach().clone().requires_grad_()
+    actual = native(hidden, (26, 13, 4))
+    expected = reference(expected_hidden, torch.tensor([0, 26, 39, 43], dtype=torch.int32))
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    probe = torch.randn_like(actual)
+    (actual * probe).sum().backward()
+    (expected * probe).sum().backward()
+    assert_gradients(native, reference, rtol=0, atol=0)
+    torch.testing.assert_close(hidden.grad, expected_hidden.grad, rtol=0, atol=0)
