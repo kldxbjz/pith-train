@@ -116,8 +116,12 @@ The historical `omni_noise_regression.py` keeps its original a0b14f7/d237e4c
 commit locks and workload hash. Use `omni_final_noise.py` for an explicitly
 reviewed newer feature SHA; do not edit the historical guards.
 
-The reviewed baseline is `be0b2cb59c865e0fecc05ae7b9a7ebef968bec11`, containing
-current upstream, reviewed #100/#101 fixes and the same text stage5 helper.
+The reviewed baseline is `d9c791d0c91978499ea3c4b823d46ed61fee014c`, a descendant of
+`be0b2cb59c865e0fecc05ae7b9a7ebef968bec11` with the same two stable expert-row ordering
+commits applied to the feature and PR101. It retains current upstream,
+reviewed #100/#101 fixes and the shared text stage5 helper. The common
+ordering fix is excluded from this feature-vs-baseline noise comparison;
+it requires its own kernel/reference and strict-resume validation.
 The adapter checks identical numerical/model/data source and declares the
 checkpoint increment's scope. It does not compare the entirety of #100/#101,
 new modalities or full-size training.
