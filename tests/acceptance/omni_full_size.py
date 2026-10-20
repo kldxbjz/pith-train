@@ -174,9 +174,51 @@ def metric(actual, reference):
     return 0.0 if denominator == 0 else numerator / denominator
 
 
-def gradient_rows(parameters, shapes, reference=None):
+def gradient_diagnostics(actual, reference=None):
+    """Chunked CPU FP64 diagnostics, including tiny/zero gradients without omissions."""
     import torch
 
+    tensors = {"actual": actual.detach().cpu().reshape(-1)}
+    if reference is not None:
+        tensors["reference"] = reference.detach().cpu().reshape(-1)
+    result = {}
+    for side, values in tensors.items():
+        finite, nonzero, square_sum, maximum = True, False, 0.0, 0.0
+        for start in range(0, values.numel(), METRIC_CHUNK):
+            value = values[start : start + METRIC_CHUNK].double()
+            valid = bool(torch.isfinite(value).all())
+            finite &= valid
+            nonzero |= bool(torch.count_nonzero(value))
+            if valid:
+                square_sum += value.square().sum().item()
+                maximum = max(maximum, value.abs().max().item())
+        result.update(
+            {
+                side + "_finite": finite,
+                side + "_nonzero": nonzero,
+                side + "_l2": math.sqrt(square_sum) if finite else None,
+                side + "_max_abs": maximum if finite else None,
+            }
+        )
+    if reference is not None:
+        if result["actual_finite"] and result["reference_finite"]:
+            a, b = tensors["actual"], tensors["reference"]
+            maximum = 0.0
+            for start in range(0, a.numel(), METRIC_CHUNK):
+                difference = (
+                    a[start : start + METRIC_CHUNK].double()
+                    - b[start : start + METRIC_CHUNK].double()
+                )
+                maximum = max(maximum, difference.abs().max().item())
+            result["difference_max_abs"] = maximum
+            result["difference"] = metric(tensors["actual"], tensors["reference"])
+            result["nse"] = result["difference"]
+        else:
+            result.update(difference_max_abs=None, difference=None, nse=None)
+    return result
+
+
+def gradient_rows(parameters, shapes, reference=None):
     check_inventory(parameters, shapes)
     rows = []
     for name in sorted(shapes):
@@ -187,17 +229,18 @@ def gradient_rows(parameters, shapes, reference=None):
         elif tuple(gradient.shape) != shapes[name]:
             row["reason"] = "wrong gradient shape"
         else:
+            diagnostics = gradient_diagnostics(
+                gradient, None if reference is None else reference[name]
+            )
             row.update(
+                diagnostics,
                 dtype=str(gradient.dtype),
-                finite=bool(torch.isfinite(gradient).all()),
-                nonzero=bool(torch.count_nonzero(gradient)),
+                finite=diagnostics["actual_finite"],
+                nonzero=diagnostics["actual_nonzero"],
             )
             if row["finite"] and row["nonzero"]:
                 row["status"] = "PASS"
             if reference is not None:
-                row["difference"] = (
-                    metric(gradient.detach().cpu(), reference[name]) if row["finite"] else None
-                )
                 row["threshold"] = GRAD_THRESHOLD
                 if row["difference"] is None or row["difference"] >= GRAD_THRESHOLD:
                     row["status"] = "FAIL"
