@@ -47,6 +47,7 @@ from tests.acceptance.omni_reference_attention import (
     reference_attention_kwargs,
     reference_contract,
 )
+from tests.acceptance.omni_reference_precision import FP32GradientReference
 from tests.test_qwen3_omni_av import write_av
 
 MEDIA_KEYS = ("pixel_values", "pixel_values_videos", "input_features")
@@ -368,12 +369,13 @@ def staged(args):
     dist.barrier()
     data = ObservedData(pretrain_lm.setup_dataset(cfg))
     setup_training(cfg)
-    reference = HFReference(config, torch.bfloat16).to(distributed.device)
-    attention = configure_reference_attention(reference, config, reference_contract(args))
+    hf_reference = HFReference(config, torch.bfloat16).to(distributed.device)
+    attention = configure_reference_attention(hf_reference, config, reference_contract(args))
     (args.output / f"reference-attention-rank-{rank:05d}.json").write_text(
         json.dumps(attention, indent=2) + "\n"
     )
-    expected, actual = dict(reference.named_parameters()), {}
+    reference = FP32GradientReference(hf_reference)
+    expected, actual = reference.master_parameters, {}
     for module in training.model.module:
         for name, parameter in module.named_parameters():
             key = (
@@ -417,16 +419,17 @@ def staged(args):
     for batch in global_batches:
         inputs = {key: value.to(distributed.device) for key, value in batch.model_inputs.items()}
         logits = reference(inputs)
-        loss = (
-            F.cross_entropy(
-                logits.float().flatten(0, 1),
-                batch.labels.to(distributed.device).flatten(),
-                reduction="sum",
-            )
-            / count
+        loss = F.cross_entropy(
+            logits.float().flatten(0, 1),
+            batch.labels.to(distributed.device).flatten(),
+            reduction="sum",
         )
         loss.backward()
         hf_loss += loss.detach()
+    # Match native BF16 compute with FP32 accumulation, then normalize once.
+    # The checked layout provides the positive integer API; count is FP32.
+    reference.normalize_gradients_(layout["global_target_count"])
+    hf_loss = hf_loss / count
     outputs = training.model.step(microbatches, pretrain_lm.objective)
     if distributed.pp_rank == 0:
         loss = global_loss_mean(torch.stack(outputs).sum(), count, group)
@@ -474,6 +477,7 @@ def staged(args):
         scenario=args.scenario,
         target_layout=layout,
         gradient_errors=errors,
+        reference_precision=reference.precision_contract(),
         reference_attention=attention,
         module_updates=updates,
         strict_resume="EXACT",

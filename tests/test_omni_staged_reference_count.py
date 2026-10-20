@@ -1,4 +1,4 @@
-"""Exercise the real staged HF block against the production count producer."""
+"""Exercise single-modality and mixed HF blocks against the production count producer."""
 
 import ast
 import copy
@@ -29,13 +29,24 @@ class TokenReference(nn.Module):
         return self.projection(inputs["features"])
 
 
-def staged_reference_block():
+def staged_reference_block(driver):
     """Use the actual caller without constructing native CUDA-only training."""
-    path = Path(__file__).parent / "acceptance" / "omni_image_staged.py"
+    path = Path(__file__).parent / "acceptance" / driver
+    entrypoint = "run" if driver == "omni_image_staged.py" else "staged"
     module = ast.parse(path.read_text())
     run = next(
-        node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == "run"
+        node
+        for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name == entrypoint
     )
+    constructors = [
+        node
+        for node in run.body
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Call)
+        and ast.unparse(node.value.func) == "FP32GradientReference"
+    ]
+    assert len(constructors) == 1
     starts = [
         index
         for index, node in enumerate(run.body)
@@ -50,7 +61,9 @@ def staged_reference_block():
         and isinstance(run.body[index].value, ast.Call)
         and ast.unparse(run.body[index].value.func) == "training.model.step"
     )
-    return compile(ast.Module(body=run.body[start:end], type_ignores=[]), str(path), "exec")
+    return compile(
+        ast.Module(body=[constructors[0], *run.body[start:end]], type_ignores=[]), str(path), "exec"
+    )
 
 
 @pytest.mark.parametrize(
@@ -58,6 +71,18 @@ def staged_reference_block():
     [(1, "nonuniform"), (2, "nonuniform"), (4, "nonuniform"), (2, "rank-zero"), (4, "rank-zero")],
 )
 def test_actual_staged_caller_accepts_production_float_count(dp_size, scenario, monkeypatch):
+    check_actual_staged_caller("omni_image_staged.py", dp_size, scenario, monkeypatch)
+
+
+@pytest.mark.parametrize(
+    ("dp_size", "scenario"),
+    [(1, "nonuniform"), (2, "nonuniform"), (4, "nonuniform"), (2, "rank-zero"), (4, "rank-zero")],
+)
+def test_actual_mixed_caller_accepts_production_float_count(dp_size, scenario, monkeypatch):
+    check_actual_staged_caller("omni_multimodal_training.py", dp_size, scenario, monkeypatch)
+
+
+def check_actual_staged_caller(driver, dp_size, scenario, monkeypatch):
     torch.manual_seed(42)
     source = [
         SimpleNamespace(
@@ -103,7 +128,6 @@ def test_actual_staged_caller_accepts_production_float_count(dp_size, scenario, 
 
     module = TokenReference()
     independent = copy.deepcopy(module)
-    reference = FP32GradientReference(module)
     # Preserve the strict positive-integer API. The old actual caller fails here.
     with pytest.raises(ValueError, match="positive integer scalar"):
         FP32GradientReference(copy.deepcopy(module)).normalize_gradients_(counts[0])
@@ -124,17 +148,20 @@ def test_actual_staged_caller_accepts_production_float_count(dp_size, scenario, 
             oracle[name].add_(parameter.grad.float())
         independent.zero_grad(set_to_none=True)
     namespace = dict(
-        reference=reference,
+        hf_reference=module,
+        FP32GradientReference=FP32GradientReference,
         global_batches=batches,
         layout=layout,
         count=counts[0],
         distributed=SimpleNamespace(device=torch.device("cpu")),
         F=F,
     )
-    exec(staged_reference_block(), namespace)
-    assert reference.normalized
+    exec(staged_reference_block(driver), namespace)
+    reference = namespace["reference"]
+    assert type(reference) is FP32GradientReference and reference.normalized
     assert reference.master_parameters.keys() == oracle.keys()
     for name, parameter in reference.master_parameters.items():
+        assert parameter.dtype == parameter.grad.dtype == torch.float32
         torch.testing.assert_close(parameter.grad, oracle[name] / expected_count, rtol=0, atol=0)
     torch.testing.assert_close(namespace["hf_loss"], expected_loss / expected_count, rtol=0, atol=0)
     assert not torch.cuda.is_initialized()
