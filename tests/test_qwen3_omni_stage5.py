@@ -1,7 +1,7 @@
-"""Compile the production text stage5 with CPU Dynamo/Inductor.
+"""Check production eager text stage5 and its explicit CPU fullgraph control.
 
 Extracting these pure methods avoids unrelated CUDA-only kernel imports. The
-production bodies and fullgraph decorators are executed without replacement.
+production bodies are executed without replacement in both controls.
 """
 
 import ast
@@ -41,7 +41,6 @@ def test_text_stage5_fullgraph_output_and_all_gradients(is_moe, ep):
         if is_moe
         else torch.randn_like(residual, requires_grad=True)
     )
-    actual = layer.forward_stage5(output, indexes if is_moe else None, weights, residual)
     if is_moe:
         # Independent per-token weighted sum also covers sparse, unordered EP2
         # assignments and tokens with no local experts.
@@ -54,9 +53,14 @@ def test_text_stage5_fullgraph_output_and_all_gradients(is_moe, ep):
         expected = residual + torch.stack(contributions).reshape_as(residual)
     else:
         expected = residual + output
-    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=2e-6)
     values = (residual, output, weights) if is_moe else (residual, output)
-    actual_grads = torch.autograd.grad(actual.square().sum(), values, retain_graph=True)
     expected_grads = torch.autograd.grad(expected.square().sum(), values)
-    for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
-        torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=2e-6)
+    compiled = torch.compile(
+        layer.forward_stage5, fullgraph=True, options={"emulate_precision_casts": True}
+    )
+    for call in (layer.forward_stage5, compiled):
+        actual = call(output, indexes if is_moe else None, weights, residual)
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=2e-6)
+        actual_grads = torch.autograd.grad(actual.square().sum(), values)
+        for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
+            torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=2e-6)
