@@ -18,8 +18,12 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeTextConfig
-from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeAudioEncoder as HFAudio
-from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoePreTrainedModelForConditionalGeneration as HFPositions
+from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+    Qwen3OmniMoeAudioEncoder as HFAudio,
+)
+from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+    Qwen3OmniMoePreTrainedModelForConditionalGeneration as HFPositions,
+)
 
 from pithtrain.models.qwen3_omni_audio_inputs import flatten_audio_features
 from pithtrain.models.qwen3_omni_multimodal_inputs import multimodal_position_ids
@@ -28,10 +32,14 @@ from pithtrain.modules.microbatch import Microbatch
 from pithtrain.modules.qwen3_omni_data import Qwen3OmniCollator, Qwen3OmniDataset
 from pithtrain.modules.training_data import OmniPretrainData, global_loss_mean, global_target_count
 from pithtrain.tasks.prepare_omni_data import processor_for, verify_bundle
-from tests.acceptance.omni_image_evidence import module_update_evidence, training_groups, validate_target_layout
+from tests.acceptance.omni_image_evidence import (
+    module_update_evidence,
+    training_groups,
+    validate_target_layout,
+)
 from tests.acceptance.omni_image_staged import expected_shard, local_tensor
-from tests.acceptance.omni_image_training import HFReference as ImageReference
 from tests.acceptance.omni_image_training import REPO, commit, error_ratio, tensor_hash
+from tests.acceptance.omni_image_training import HFReference as ImageReference
 from tests.acceptance.omni_native_resume import equal
 from tests.test_qwen3_omni_av import write_av
 
@@ -43,12 +51,17 @@ def digest(path):
 
 
 def positions(config, inputs):
-    owner = SimpleNamespace(config=config, spatial_merge_size=config.vision_config.spatial_merge_size)
+    owner = SimpleNamespace(
+        config=config, spatial_merge_size=config.vision_config.spatial_merge_size
+    )
     owner.get_llm_pos_ids_for_vision = HFPositions.get_llm_pos_ids_for_vision.__get__(owner)
     mask = inputs.get("feature_attention_mask")
     return HFPositions.get_rope_index(
-        owner, inputs["input_ids"], image_grid_thw=inputs.get("image_grid_thw"),
-        video_grid_thw=inputs.get("video_grid_thw"), attention_mask=inputs["attention_mask"],
+        owner,
+        inputs["input_ids"],
+        image_grid_thw=inputs.get("image_grid_thw"),
+        video_grid_thw=inputs.get("video_grid_thw"),
+        attention_mask=inputs["attention_mask"],
         audio_seqlens=None if mask is None else mask.sum(-1),
         second_per_grids=inputs.get("video_second_per_grid"),
         use_audio_in_video=bool(inputs.get("use_audio_in_video", False)),
@@ -88,12 +101,17 @@ class HFReference(ImageReference):
                 flatten_audio_features(inputs),
                 feature_lens=inputs["feature_attention_mask"].sum(-1),
             ).last_hidden_state
-            hidden = hidden.masked_scatter((ids == cfg.audio_token_id)[..., None], audio.to(hidden.dtype))
+            hidden = hidden.masked_scatter(
+                (ids == cfg.audio_token_id)[..., None], audio.to(hidden.dtype)
+            )
         hidden = self.model(
-            inputs_embeds=hidden, attention_mask=inputs["attention_mask"],
+            inputs_embeds=hidden,
+            attention_mask=inputs["attention_mask"],
             position_ids=positions(cfg, inputs),
             visual_pos_masks=visual_mask if visual_mask.any() else None,
-            deepstack_visual_embeds=[lane[visual_mask] for lane in lanes] if visual_mask.any() else None,
+            deepstack_visual_embeds=[lane[visual_mask] for lane in lanes]
+            if visual_mask.any()
+            else None,
             use_cache=False,
         ).last_hidden_state
         return self.lm_head(hidden)
@@ -104,13 +122,16 @@ def source_inputs(dataset):
     processor, config = processor_for(bundle["recipe"], offline=True)
     records = {}
     for kind in ("text", "image", "audio", "video"):
-        reader = Qwen3OmniDataset([dataset / p for p in bundle["manifests"]["train"][kind]], media_root=dataset)
+        reader = Qwen3OmniDataset(
+            [dataset / p for p in bundle["manifests"]["train"][kind]], media_root=dataset
+        )
         records[kind] = reader[0]
         if kind == "video":
             assert len(reader) == 2
             records["av"] = reader[1]
     records["all"] = dict(
-        id="controlled-all", text="An image, speech and synchronized frames.",
+        id="controlled-all",
+        text="An image, speech and synchronized frames.",
         media=[*records["audio"]["media"], *records["image"]["media"], *records["av"]["media"]],
     )
     collator = Qwen3OmniCollator(processor, config, **bundle["recipe"]["batch"])
@@ -120,7 +141,12 @@ def source_inputs(dataset):
     vision, audio = config.vision_config, config.audio_config
     vision.depth, vision.hidden_size, vision.num_heads, vision.intermediate_size = 3, 64, 4, 96
     vision.out_hidden_size, vision.deepstack_visual_indexes = config.text_config.hidden_size, [0, 2]
-    audio.encoder_layers, audio.d_model, audio.encoder_attention_heads, audio.encoder_ffn_dim = 2, 64, 4, 96
+    audio.encoder_layers, audio.d_model, audio.encoder_attention_heads, audio.encoder_ffn_dim = (
+        2,
+        64,
+        4,
+        96,
+    )
     audio.downsample_hidden_size, audio.output_dim = 8, config.text_config.hidden_size
     return bundle, records, batches, config
 
@@ -135,7 +161,9 @@ def prepare(args):
     (destination / "media").mkdir()
     (destination / "train").mkdir()
     recipe = copy.deepcopy(source["recipe"])
-    recipe["batch"].update(use_audio_in_video=True, min_pixels=4096, max_pixels=4096, max_length=2048)
+    recipe["batch"].update(
+        use_audio_in_video=True, min_pixels=4096, max_pixels=4096, max_length=2048
+    )
     recipe["sampling_weights"] = {kind: 1 for kind in ("text", "image", "audio", "video")}
     manifests, statistics, files = {}, {}, []
     for kind in ("text", "image", "audio", "video"):
@@ -154,62 +182,111 @@ def prepare(args):
             name = "media/controlled-av.mkv"
             write_av(destination / name)
             files.append(name)
-            rows.append(dict(id="controlled-av", text="Frames brighten with a tone.", media=[dict(type="video", path=name)]))
+            rows.append(
+                dict(
+                    id="controlled-av",
+                    text="Frames brighten with a tone.",
+                    media=[dict(type="video", path=name)],
+                )
+            )
         name = f"train/{kind}.jsonl"
         (destination / name).write_text("".join(json.dumps(item) + "\n" for item in rows))
         files.append(name)
         manifests[kind], statistics[kind] = [name], dict(samples=len(rows))
-    bundle = dict(status="complete", recipe=recipe, manifests=dict(train=manifests),
-                  statistics=dict(train=statistics), source_checksum=digest(args.dataset / "checksums.sha256"),
-                  purpose="Controlled mixed acceptance; selected real records plus synthetic timestamped AV")
+    bundle = dict(
+        status="complete",
+        recipe=recipe,
+        manifests=dict(train=manifests),
+        statistics=dict(train=statistics),
+        source_checksum=digest(args.dataset / "checksums.sha256"),
+        purpose="Controlled mixed acceptance; selected real records plus synthetic timestamped AV",
+    )
     (destination / "bundle.json").write_text(json.dumps(bundle, indent=2) + "\n")
     files.append("bundle.json")
-    (destination / "checksums.sha256").write_text("".join(f"{digest(destination / name)}  {name}\n" for name in sorted(files)))
+    (destination / "checksums.sha256").write_text(
+        "".join(f"{digest(destination / name)}  {name}\n" for name in sorted(files))
+    )
     _, _, batches, config = source_inputs(destination)
     config.save_pretrained(args.output / "model")
     audits = {}
     for kind, batch in batches.items():
-        actual = multimodal_position_ids(batch.model_inputs["input_ids"], batch.model_inputs, config)
+        actual = multimodal_position_ids(
+            batch.model_inputs["input_ids"], batch.model_inputs, config
+        )
         torch.testing.assert_close(actual, positions(config, batch.model_inputs), rtol=0, atol=0)
         audits[kind] = dict(
-            sample_ids=batch.sample_ids, targets=int((batch.labels != -100).sum()),
-            inputs={key: dict(shape=list(value.shape), dtype=str(value.dtype), sha256=tensor_hash(value)) for key, value in batch.model_inputs.items()},
+            sample_ids=batch.sample_ids,
+            targets=int((batch.labels != -100).sum()),
+            inputs={
+                key: dict(
+                    shape=list(value.shape), dtype=str(value.dtype), sha256=tensor_hash(value)
+                )
+                for key, value in batch.model_inputs.items()
+            },
         )
     # Verify the actual deterministic production mixture, then prove exact data resume.
     data_cfg = DataCfg()
     data_cfg.dataset, data_cfg.format = destination, "prepared_bundle"
     data_cfg.modalities, data_cfg.epoch_samples = ("text", "image", "audio", "video"), 32
-    train_cfg = SimpleNamespace(global_batch_size=8, micro_batch_size=1, sequence_length=2048, seed=1234)
+    train_cfg = SimpleNamespace(
+        global_batch_size=8, micro_batch_size=1, sequence_length=2048, seed=1234
+    )
     data = OmniPretrainData(data_cfg, train_cfg)
-    data.validate_model(SimpleNamespace(input_modalities=data_cfg.modalities, validate_media_batch=multimodal_position_ids), config)
+    data.validate_model(
+        SimpleNamespace(
+            input_modalities=data_cfg.modalities, validate_media_batch=multimodal_position_ids
+        ),
+        config,
+    )
     steps, saved = [], None
     for step in range(4):
         micro = data.get_batch(step, "cpu")
         kinds = [batch.sample_ids for batch in micro]
         steps.append(kinds)
-        assert any("input_features" in (batch.media_inputs or {}) for batch in micro), f"No audio at step {step}"
-        assert any(any(key in (batch.media_inputs or {}) for key in ("pixel_values", "pixel_values_videos")) for batch in micro), f"No vision at step {step}"
+        assert any("input_features" in (batch.media_inputs or {}) for batch in micro), (
+            f"No audio at step {step}"
+        )
+        assert any(
+            any(
+                key in (batch.media_inputs or {}) for key in ("pixel_values", "pixel_values_videos")
+            )
+            for batch in micro
+        ), f"No vision at step {step}"
         data.commit_step(step)
         if step == 1:
             saved = data.state_dict()
         if step == 2:
             expected = batch_hashes(micro)
     restored = OmniPretrainData(data_cfg, train_cfg)
-    restored.validate_model(SimpleNamespace(input_modalities=data_cfg.modalities, validate_media_batch=multimodal_position_ids), config)
+    restored.validate_model(
+        SimpleNamespace(
+            input_modalities=data_cfg.modalities, validate_media_batch=multimodal_position_ids
+        ),
+        config,
+    )
     restored.load_state_dict(saved)
     equal(batch_hashes(restored.get_batch(2, "cpu")), expected, "restored-mixed-data")
-    report = dict(status="PASSED", scope="CPU real/controlled processor positions and exact next-data restore",
-                  gpu_acceptance="NOT_RUN", commit=commit(), inputs=audits, mixture_steps=steps,
-                  dataset_checksum=digest(destination / "checksums.sha256"), torch=torch.__version__)
+    report = dict(
+        status="PASSED",
+        scope="CPU real/controlled processor positions and exact next-data restore",
+        gpu_acceptance="NOT_RUN",
+        commit=commit(),
+        inputs=audits,
+        mixture_steps=steps,
+        dataset_checksum=digest(destination / "checksums.sha256"),
+        torch=torch.__version__,
+    )
     (args.output / "prepare.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report))
 
 
 def batch_hashes(batches):
     return [
-        dict(sample_ids=batch.sample_ids,
-             labels=tensor_hash(batch.objective_inputs[0]),
-             context={key: tensor_hash(value) for key, value in batch.context_for_stage(0).items()})
+        dict(
+            sample_ids=batch.sample_ids,
+            labels=tensor_hash(batch.objective_inputs[0]),
+            context={key: tensor_hash(value) for key, value in batch.context_for_stage(0).items()},
+        )
         for batch in batches
     ]
 
@@ -228,9 +305,15 @@ class ObservedData:
 
 
 def component_groups(config):
-    return (*training_groups(config), "audio_tower.conv2d", "audio_tower.conv_out.",
-            "audio_tower.ln_post.", "audio_tower.proj1.", "audio_tower.proj2.",
-            *(f"audio_tower.layers.{i}." for i in range(config.audio_config.encoder_layers)))
+    return (
+        *training_groups(config),
+        "audio_tower.conv2d",
+        "audio_tower.conv_out.",
+        "audio_tower.ln_post.",
+        "audio_tower.proj1.",
+        "audio_tower.proj2.",
+        *(f"audio_tower.layers.{i}." for i in range(config.audio_config.encoder_layers)),
+    )
 
 
 def staged(args):
@@ -239,7 +322,11 @@ def staged(args):
     from pithtrain.modules.distributed import setup_distributed
     from pithtrain.modules.distributed_checkpoint import resume_contract
     from pithtrain.modules.logging import setup_logging
-    from pithtrain.modules.training import make_adamw_optimizer, make_constant_scheduler, setup_training
+    from pithtrain.modules.training import (
+        make_adamw_optimizer,
+        make_constant_scheduler,
+        setup_training,
+    )
     from pithtrain.tasks import pretrain_lm
     from tests.acceptance.omni_distributed_resume import snapshot
 
@@ -254,7 +341,13 @@ def staged(args):
     t.model, t.native_multimodal = args.output / "model", True
     t.fp8, t.moe_load_balance_coef = False, 0.0
     t.optimizer, t.scheduler = make_adamw_optimizer, make_constant_scheduler
-    t.lr, t.max_steps, t.sequence_length, t.global_batch_size, t.micro_batch_size = 1e-4, 4, 2048, 8, 1
+    t.lr, t.max_steps, t.sequence_length, t.global_batch_size, t.micro_batch_size = (
+        1e-4,
+        4,
+        2048,
+        8,
+        1,
+    )
     t.save_interval, t.strict_resume = None, True
     cfg.data.dataset, cfg.data.format = args.dataset, "prepared_bundle"
     cfg.data.modalities, cfg.data.epoch_samples = ("text", "image", "audio", "video"), 32
@@ -272,7 +365,11 @@ def staged(args):
     expected, actual = dict(reference.named_parameters()), {}
     for module in training.model.module:
         for name, parameter in module.named_parameters():
-            key = name if name.startswith(("visual.", "audio_tower.", "lm_head.")) else "model." + name
+            key = (
+                name
+                if name.startswith(("visual.", "audio_tower.", "lm_head."))
+                else "model." + name
+            )
             assert key not in actual and key in expected, key
             actual[key] = parameter
             with torch.no_grad():
@@ -289,13 +386,19 @@ def staged(args):
             batch.labels[:, ::2] = -100
     layout = validate_target_layout(global_batches, distributed.dp_size, args.scenario)
     microbatches = []
-    for batch in global_batches[distributed.dp_rank::distributed.dp_size]:
+    for batch in global_batches[distributed.dp_rank :: distributed.dp_size]:
         inputs = {key: value.to(distributed.device) for key, value in batch.model_inputs.items()}
         media = {key: inputs.pop(key) for key in MEDIA_KEYS if key in inputs}
-        microbatches.append(Microbatch(
-            model_inputs=(inputs["input_ids"],), cu_seqlens=None, objective_inputs=(batch.labels.to(distributed.device),),
-            model_context=inputs, media_inputs=media if distributed.pp_rank == 0 else None, sample_ids=batch.sample_ids,
-        ))
+        microbatches.append(
+            Microbatch(
+                model_inputs=(inputs["input_ids"],),
+                cu_seqlens=None,
+                objective_inputs=(batch.labels.to(distributed.device),),
+                model_context=inputs,
+                media_inputs=media if distributed.pp_rank == 0 else None,
+                sample_ids=batch.sample_ids,
+            )
+        )
     group = distributed.attn_mesh["dp", "cp"]._flatten().get_group()
     count = global_target_count(microbatches, group)
     assert int(count) == layout["global_target_count"]
@@ -303,7 +406,14 @@ def staged(args):
     for batch in global_batches:
         inputs = {key: value.to(distributed.device) for key, value in batch.model_inputs.items()}
         logits = reference(inputs)
-        loss = F.cross_entropy(logits.float().flatten(0, 1), batch.labels.to(distributed.device).flatten(), reduction="sum") / count
+        loss = (
+            F.cross_entropy(
+                logits.float().flatten(0, 1),
+                batch.labels.to(distributed.device).flatten(),
+                reduction="sum",
+            )
+            / count
+        )
         loss.backward()
         hf_loss += loss.detach()
     outputs = training.model.step(microbatches, pretrain_lm.objective)
@@ -320,30 +430,48 @@ def staged(args):
     before = {name: local_tensor(param).detach().clone() for name, param in actual.items()}
     for optimizer in training.optimizers:
         optimizer.step()
-    updates = module_update_evidence(actual, before, component_groups(config), reduce=dist.all_reduce)
+    updates = module_update_evidence(
+        actual, before, component_groups(config), reduce=dist.all_reduce
+    )
     for optimizer in training.optimizers:
         optimizer.zero_grad(set_to_none=True)
     contract, checkpoint = resume_contract(cfg), args.output / "checkpoint"
     for step in range(4):
         pretrain_lm.train_step(cfg, data, step)
         if step == 1:
-            save_checkpoint(checkpoint, 2, data_state=data.checkpoint_state, strict=True, resume_config=contract)
+            save_checkpoint(
+                checkpoint, 2, data_state=data.checkpoint_state, strict=True, resume_config=contract
+            )
             boundary = snapshot(data)
         if step == 2:
             next_inputs, next_state = data.batches[2], snapshot(data)
     assert data.consumed_samples == 32
-    load_checkpoint(checkpoint, 2, data_state=data.checkpoint_state, strict=True, resume_config=contract)
+    load_checkpoint(
+        checkpoint, 2, data_state=data.checkpoint_state, strict=True, resume_config=contract
+    )
     equal(snapshot(data), boundary, "restored-model-optimizer-scheduler-rng-data")
     pretrain_lm.train_step(cfg, data, 2)
     equal(data.batches[2], next_inputs, "next-mixed-inputs-and-media")
     equal(snapshot(data), next_state, "next-native-update")
-    report = dict(status="PASSED", commit=commit(), rank=rank, world=world, pp=args.pp, ep=args.ep,
-                  scenario=args.scenario, target_layout=layout, gradient_errors=errors,
-                  module_updates=updates, strict_resume="EXACT", next_inputs=next_inputs,
-                  processor=verify_bundle(args.dataset)["recipe"]["revision"],
-                  dataset_checksum=digest(args.dataset / "checksums.sha256"),
-                  torch=torch.__version__, hardware=torch.cuda.get_device_name(),
-                  max_allocated_bytes=torch.cuda.max_memory_allocated())
+    report = dict(
+        status="PASSED",
+        commit=commit(),
+        rank=rank,
+        world=world,
+        pp=args.pp,
+        ep=args.ep,
+        scenario=args.scenario,
+        target_layout=layout,
+        gradient_errors=errors,
+        module_updates=updates,
+        strict_resume="EXACT",
+        next_inputs=next_inputs,
+        processor=verify_bundle(args.dataset)["recipe"]["revision"],
+        dataset_checksum=digest(args.dataset / "checksums.sha256"),
+        torch=torch.__version__,
+        hardware=torch.cuda.get_device_name(),
+        max_allocated_bytes=torch.cuda.max_memory_allocated(),
+    )
     (args.output / f"rank-{rank:05d}.json").write_text(json.dumps(report, indent=2) + "\n")
     dist.barrier()
 

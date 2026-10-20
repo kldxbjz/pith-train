@@ -435,7 +435,9 @@ def model_class_for_config(
     if native_vision or native_audio or native_video or native_multimodal:
         thinker = getattr(module_config, "thinker_config", module_config)
         if getattr(thinker, "model_type", None) != "qwen3_omni_moe_thinker":
-            raise ValueError("native_vision/native_audio/native_video/native_multimodal requires a composite Omni Thinker config")
+            raise ValueError(
+                "native_vision/native_audio/native_video/native_multimodal requires a composite Omni Thinker config"
+            )
         if native_multimodal:
             return Qwen3OmniMoeThinkerMultimodalModel
         if native_audio:

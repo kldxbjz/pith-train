@@ -10,8 +10,8 @@ import torch
 from pithtrain.models.qwen3_omni_multimodal_inputs import multimodal_position_ids
 from pithtrain.modules.qwen3_omni_av import decode_video_audio
 from pithtrain.modules.qwen3_omni_data import Qwen3OmniCollator
-from tests.test_qwen3_omni_multimodal import hf_positions
 from tests import test_qwen3_omni_data as data_fixtures
+from tests.test_qwen3_omni_multimodal import hf_positions
 
 processor_config = data_fixtures.processor_config
 
