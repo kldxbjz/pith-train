@@ -19,6 +19,11 @@ import time
 from pathlib import Path
 
 from tests.acceptance import omni_full_size as text_gate
+from tests.acceptance.omni_reference_attention import (
+    add_reference_attention_argument,
+    configure_reference_attention,
+    reference_contract,
+)
 from tests.acceptance.omni_topology_contract import verify_source, write_json
 
 MODALITIES = ("image", "audio", "video")
@@ -343,6 +348,7 @@ def execute(args, config, shapes, source, batch, fixture):
         "fixture": fixture,
         "estimate": estimate(args.modality),
         "configuration": config.to_dict(),
+        "reference_attention": {"contract": reference_contract(args)},
         "phases": [],
         "update": "NOT_RUN",
         "fp32_main_grad": "NOT_RUN",
@@ -390,6 +396,10 @@ def execute(args, config, shapes, source, batch, fixture):
             )
         text_gate.configure_native(device)
         model = build_model(config, args.modality, False, device)
+        report["reference_attention"] = configure_reference_attention(
+            model, config, reference_contract(args)
+        )
+        save()
         parameters = parameter_map(model, False)
         text_gate.check_inventory(parameters, shapes)
         reference_init = text_gate.initialize(parameters, config.text_config.initializer_range)
@@ -476,6 +486,7 @@ def execute(args, config, shapes, source, batch, fixture):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    add_reference_attention_argument(parser)
     parser.add_argument("--official-config", type=Path, required=True)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--modality", choices=MODALITIES, required=True)

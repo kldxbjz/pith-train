@@ -18,6 +18,9 @@ from pithtrain.modules.qwen3_omni_data import Qwen3OmniCollator, Qwen3OmniDatase
 from pithtrain.tasks.prepare_omni_data import processor_for, verify_bundle
 from tests.acceptance.omni_audio_reference import HFReference
 from tests.acceptance.omni_image_evidence import fixed_image_batches, validate_target_layout
+from tests.acceptance.omni_reference_attention import (
+    add_reference_attention_argument,
+)
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -103,6 +106,7 @@ def preflight(args):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    add_reference_attention_argument(parser)
     parser.add_argument("--mode", choices=("preflight", "staged"), required=True)
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)

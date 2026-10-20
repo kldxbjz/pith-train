@@ -19,6 +19,13 @@ import subprocess
 import time
 from pathlib import Path
 
+from tests.acceptance.omni_reference_attention import (
+    LEGACY,
+    add_reference_attention_argument,
+    configure_reference_attention,
+    reference_attention_kwargs,
+    reference_contract,
+)
 from tests.acceptance.omni_topology_contract import verify_source, write_json
 
 MODEL_ID = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
@@ -314,7 +321,9 @@ def phase(model, native, inputs, labels, shapes, reference=None):
         logits = model.reference_forward(inputs)
     else:
         logits = model["lm_head"](
-            model["model"](input_ids=inputs, use_cache=False).last_hidden_state
+            model["model"](
+                input_ids=inputs, use_cache=False, **reference_attention_kwargs(model)
+            ).last_hidden_state
         )
     loss = F.cross_entropy(logits.float().flatten(0, 1), labels.flatten())
     if not bool(torch.isfinite(logits).all()) or not bool(torch.isfinite(loss)):
@@ -323,7 +332,9 @@ def phase(model, native, inputs, labels, shapes, reference=None):
     torch.cuda.synchronize()
     parameters = parameter_map(model, native)
     result = {
-        "mode": "native" if native else "hf-eager",
+        "mode": "native"
+        if native
+        else getattr(model, "reference_attention", {"contract": LEGACY})["contract"],
         "cross_entropy": loss.item(),
         "logits_shape": list(logits.shape),
         "logits_finite": True,
@@ -354,6 +365,7 @@ def execute(args, config_data, shapes, source):
         "official_config_sha256": OFFICIAL_CONFIG_SHA256,
         "weight_source": args.weight_source,
         "mode": args.mode,
+        "reference_attention": {"contract": reference_contract(args)},
         "status": "RUNNING",
         "resource_estimate": resource_estimate(),
         "dtype": "bfloat16",
@@ -413,6 +425,10 @@ def execute(args, config_data, shapes, source):
         reference_gradients = reference_init = reference_logits = reference_loss = None
         if args.mode == "hf-parity":
             model = build_model(config, False, device)
+            report["reference_attention"] = configure_reference_attention(
+                model, config, reference_contract(args)
+            )
+            save()
             parameters = parameter_map(model, False)
             check_inventory(parameters, shapes)
             reference_init = initialize(parameters, config.initializer_range)
@@ -473,6 +489,7 @@ def execute(args, config_data, shapes, source):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    add_reference_attention_argument(parser)
     parser.add_argument("--official-config", type=Path, required=True)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--weight-source", choices=("random", "released"), required=True)

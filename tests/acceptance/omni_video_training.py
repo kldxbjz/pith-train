@@ -26,6 +26,10 @@ from tests.acceptance.omni_image_training import REPO, commit, error_ratio, tens
 from tests.acceptance.omni_image_training import (
     HFReference as ImageHFReference,
 )
+from tests.acceptance.omni_reference_attention import (
+    add_reference_attention_argument,
+    reference_attention_kwargs,
+)
 from tests.test_qwen3_omni_video import hf_video_positions
 
 
@@ -83,6 +87,7 @@ class HFReference(ImageHFReference):
             visual_pos_masks=mask,
             deepstack_visual_embeds=output.deepstack_features,
             use_cache=False,
+            **reference_attention_kwargs(self),
         ).last_hidden_state
         return self.lm_head(hidden)
 
@@ -199,6 +204,7 @@ def cpu_gate(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    add_reference_attention_argument(parser)
     parser.add_argument("--mode", choices=("cpu", "reference", "staged"), required=True)
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)

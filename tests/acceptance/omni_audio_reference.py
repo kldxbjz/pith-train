@@ -36,6 +36,13 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 
 from pithtrain.models.qwen3_omni_audio import Qwen3OmniMoeAudioEncoder
 from tests.acceptance.omni_image_training import FP32MasterAdamW
+from tests.acceptance.omni_reference_attention import (
+    LEGACY,
+    add_reference_attention_argument,
+    configure_reference_attention,
+    reference_attention_kwargs,
+    reference_contract,
+)
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -221,11 +228,12 @@ class HFReference(nn.Module):
             attention_mask=inputs["attention_mask"],
             position_ids=positions,
             use_cache=False,
+            **reference_attention_kwargs(self),
         ).last_hidden_state
         return self.lm_head(hidden)
 
 
-def text_gate(config, batches, device):
+def text_gate(config, batches, device, *, reference_attention=LEGACY, attention_report=None):
     # Optional CUDA kernels are loaded only after the explicit GPU gate.
     from pithtrain.contexts import distributed, training
     from pithtrain.models.qwen3_omni_audio_model import Qwen3OmniMoeThinkerAudioModel
@@ -238,6 +246,9 @@ def text_gate(config, batches, device):
     distributed.pp_group = distributed.cp_group = distributed.ep_group = None
     training.fp8, training.Linear, training.GroupedLinear = False, nn.Linear, GroupedLinear
     reference = HFReference(config).to(device)
+    attention = configure_reference_attention(reference, config, reference_attention)
+    if attention_report is not None:
+        attention_report.update(attention)
     with torch.device(device):
         native = Qwen3OmniMoeThinkerAudioModel(config, -1).to(torch.bfloat16)
     expected = dict(reference.named_parameters())
@@ -328,6 +339,7 @@ def text_gate(config, batches, device):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    add_reference_attention_argument(parser)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     assert os.environ.get("PITHTRAIN_RUN_OMNI_GPU_TESTS") == "1", "GPU execution is opt-in"
@@ -359,7 +371,14 @@ def main():
     args.output.parent.mkdir(parents=True, exist_ok=True)
     try:
         report["encoder"] = encoder_gate(config, device)
-        report["audio_text"] = text_gate(config, batches, device)
+        report["reference_attention"] = {"contract": reference_contract(args)}
+        report["audio_text"] = text_gate(
+            config,
+            batches,
+            device,
+            reference_attention=reference_contract(args),
+            attention_report=report["reference_attention"],
+        )
         report["status"] = "PASSED"
     except Exception as error:
         report["status"] = "FAILED"

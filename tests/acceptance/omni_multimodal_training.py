@@ -41,6 +41,12 @@ from tests.acceptance.omni_image_staged import expected_shard, local_tensor
 from tests.acceptance.omni_image_training import REPO, commit, error_ratio, tensor_hash
 from tests.acceptance.omni_image_training import HFReference as ImageReference
 from tests.acceptance.omni_native_resume import equal
+from tests.acceptance.omni_reference_attention import (
+    add_reference_attention_argument,
+    configure_reference_attention,
+    reference_attention_kwargs,
+    reference_contract,
+)
 from tests.test_qwen3_omni_av import write_av
 
 MEDIA_KEYS = ("pixel_values", "pixel_values_videos", "input_features")
@@ -113,6 +119,7 @@ class HFReference(ImageReference):
             if visual_mask.any()
             else None,
             use_cache=False,
+            **reference_attention_kwargs(self),
         ).last_hidden_state
         return self.lm_head(hidden)
 
@@ -362,6 +369,10 @@ def staged(args):
     data = ObservedData(pretrain_lm.setup_dataset(cfg))
     setup_training(cfg)
     reference = HFReference(config, torch.bfloat16).to(distributed.device)
+    attention = configure_reference_attention(reference, config, reference_contract(args))
+    (args.output / f"reference-attention-rank-{rank:05d}.json").write_text(
+        json.dumps(attention, indent=2) + "\n"
+    )
     expected, actual = dict(reference.named_parameters()), {}
     for module in training.model.module:
         for name, parameter in module.named_parameters():
@@ -463,6 +474,7 @@ def staged(args):
         scenario=args.scenario,
         target_layout=layout,
         gradient_errors=errors,
+        reference_attention=attention,
         module_updates=updates,
         strict_resume="EXACT",
         next_inputs=next_inputs,
@@ -478,6 +490,7 @@ def staged(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    add_reference_attention_argument(parser)
     parser.add_argument("mode", choices=("prepare", "staged"))
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)

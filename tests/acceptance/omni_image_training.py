@@ -32,6 +32,12 @@ from tests.acceptance.omni_image_evidence import (
     training_groups,
     validate_target_layout,
 )
+from tests.acceptance.omni_reference_attention import (
+    add_reference_attention_argument,
+    configure_reference_attention,
+    reference_attention_kwargs,
+    reference_contract,
+)
 from tests.test_qwen3_omni_vision import hf_positions
 
 REPO = Path(__file__).resolve().parents[2]
@@ -116,6 +122,7 @@ class HFReference(nn.Module):
             visual_pos_masks=mask,
             deepstack_visual_embeds=output.deepstack_features,
             use_cache=False,
+            **reference_attention_kwargs(self),
         ).last_hidden_state
         return self.lm_head(hidden)
 
@@ -303,6 +310,9 @@ def gpu_reference(
     distributed.pp_group = distributed.cp_group = distributed.ep_group = None
     training.fp8, training.Linear, training.GroupedLinear = False, nn.Linear, GroupedLinear
     reference = reference_class(config, torch.bfloat16).to(device)
+    attention = configure_reference_attention(reference, config, reference_contract(args))
+    args.output.mkdir(parents=True)
+    (args.output / "reference_attention.json").write_text(json.dumps(attention, indent=2) + "\n")
     native_class = native_class or Qwen3OmniMoeThinkerImageModel
     with torch.device(device):
         native = native_class(config, -1).to(torch.bfloat16)
@@ -372,14 +382,17 @@ def gpu_reference(
         )
         opt.zero_grad(set_to_none=True)
         ref_opt.zero_grad(set_to_none=True)
-    args.output.mkdir(parents=True)
     (args.output / "reference.json").write_text(
-        json.dumps(dict(status="PASSED", commit=commit(), steps=reports), indent=2)
+        json.dumps(
+            dict(status="PASSED", commit=commit(), reference_attention=attention, steps=reports),
+            indent=2,
+        )
     )
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    add_reference_attention_argument(parser)
     parser.add_argument("--mode", choices=("cpu", "reference", "staged"), required=True)
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)

@@ -111,6 +111,7 @@ def test_actual_reference_control_flow_checks_gradients_before_master_updates(
         def __init__(self, config, dtype=None):
             super().__init__()
             self.model = nn.Module()
+            self.model.config = SimpleNamespace(_attn_implementation="eager")
             self.model.norm = Norm()
 
         def forward(self, inputs):

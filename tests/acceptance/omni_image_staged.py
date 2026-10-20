@@ -26,6 +26,10 @@ from tests.acceptance.omni_image_training import (
     hf_name,
     source_inputs,
 )
+from tests.acceptance.omni_reference_attention import (
+    configure_reference_attention,
+    reference_contract,
+)
 from tests.acceptance.omni_reference_precision import FP32GradientReference
 
 
@@ -106,9 +110,12 @@ def run(
     dist.barrier()
     data = pretrain_lm.setup_dataset(cfg)
     setup_training(cfg)
-    reference = FP32GradientReference(
-        reference_class(config, torch.bfloat16).to(distributed.device)
+    hf_reference = reference_class(config, torch.bfloat16).to(distributed.device)
+    attention = configure_reference_attention(hf_reference, config, reference_contract(args))
+    (args.output / f"reference-attention-rank-{rank:05d}.json").write_text(
+        json.dumps(attention, indent=2) + "\n"
     )
+    reference = FP32GradientReference(hf_reference)
     expected = reference.master_parameters
     actual = {}
     for module in training.model.module:
@@ -237,6 +244,7 @@ def run(
         target_count=int(count),
         gradient_errors=errors,
         reference_precision=reference.precision_contract(),
+        reference_attention=attention,
         updated_parameters=updated,
         training_modules=modules,
         real_reader_module_updates=observer.steps,
