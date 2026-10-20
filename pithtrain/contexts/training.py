@@ -25,7 +25,7 @@ inputs and carry this dtype. DualPipeV allocates its receive buffers with it.
 
 deterministic_attention: bool = False
 """
-Request FA4's ordered backward reductions for strict-resume training.
+Request FA4's ordered backward reductions for deterministic or strict-resume training.
 
 False preserves the ordinary training default. This controls FA4 itself; the
 PyTorch global deterministic-algorithm switch does not reach its CuTe kernels.

@@ -35,6 +35,7 @@ from pithtrain.models.qwen35_moe import Qwen35MoeModel
 from pithtrain.modules.load_balance import force_balance, make_load_balance_loss_fn
 from pithtrain.modules.model_config import resolve_text_model_config
 from pithtrain.modules.optimizer import Muon
+from pithtrain.modules.reproducibility import configure_deterministic_training
 from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
 from pithtrain.operators.linear import BF16Linear, FP8Linear
 from pithtrain.operators.wgrad_accumulation import install_wgrad_accumulation
@@ -219,10 +220,20 @@ class TrainingCfg(SlottedDefault):
     enough to pretrain from scratch.
     """
 
+    deterministic: bool = False
+    """Request PyTorch/cuDNN and FA4 deterministic policies without checkpoint features.
+
+    This independent numerical setting lets baseline and strict-resume runs use
+    identical compute policies. Strict resume also enables it implicitly.
+    CUDA launches require CUBLAS_WORKSPACE_CONFIG=:4096:8 or :16:8 before Python.
+    """
+
     strict_resume: bool = False
     """Opt into fixed-topology transactional resume, including every rank's data/RNG.
 
-    Also requests FA4 ordered backward reductions; this alone does not guarantee
+    Also requests PyTorch deterministic algorithms, fixed cuDNN policy and FA4
+    ordered backward reductions. CUDA launches require CUBLAS_WORKSPACE_CONFIG
+    set to :4096:8 or :16:8 before Python starts. These policies do not guarantee
     whole-model bitwise reproducibility. Currently requires prepared data, AdamW
     and StepLR/LambdaLR. Weight-only
     initialization and changed-world-size resharding keep the legacy path.
@@ -657,7 +668,11 @@ def setup_training(cfg: object) -> None:
     np.random.seed(cfg.training.seed)
     torch.manual_seed(cfg.training.seed)
     torch.cuda.manual_seed_all(cfg.training.seed)
-    training.deterministic_attention = bool(getattr(cfg.training, "strict_resume", False))
+    training.deterministic_attention = bool(
+        getattr(cfg.training, "deterministic", False)
+        or getattr(cfg.training, "strict_resume", False)
+    )
+    configure_deterministic_training(training.deterministic_attention)
     setup_model(cfg.training, cfg.distributed)
     training.optimizers = cfg.training.optimizer(cfg.training)
     training.schedulers = cfg.training.scheduler(cfg.training)
