@@ -72,6 +72,15 @@ class ConvertCheckpointCfg(SlottedDefault):
     omni_thinker_only: bool = False
     """Explicitly exclude and report Talker/code2wav on complete Thinker import."""
 
+    omni_components: Literal["thinker", "talker", "code2wav", "all"] | None = None
+    """Explicit complete-component selection, separate from legacy text/Thinker modes."""
+
+    omni_component_config: Path | None = None
+    """Exact component/full config for model-only native DCP export."""
+
+    omni_component_namespace: Literal["component", "standalone"] = "component"
+    """HF key namespace; all requires component roots. Native canonical keys are fixed."""
+
     omni_restore_resume: bool = False
     """Rebuild original strict shards from an HF export with resume companion."""
 
@@ -79,9 +88,36 @@ class ConvertCheckpointCfg(SlottedDefault):
     """Logging configuration."""
 
 
+def _component_mode(cfg, load_path):
+    selected = cfg.omni_components is not None
+    if selected:
+        if (
+            cfg.omni_multimodal
+            or cfg.omni_text_only
+            or cfg.omni_text_config
+            or cfg.omni_thinker_config
+            or cfg.omni_thinker_only
+            or cfg.omni_prefix != "thinker."
+        ):
+            raise ConversionError("Component selection cannot be combined with legacy Omni options")
+        return True
+    if (
+        cfg.omni_component_config
+        or cfg.omni_component_namespace != "component"
+        or (load_path / "qwen3_omni_components.json").exists()
+    ):
+        raise ConversionError("Component checkpoint/options require explicit omni_components")
+    return False
+
+
 def hf2dcp(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
     """Convert HuggingFace checkpoint to DCP format."""
     load_path, save_path = Path(cfg.load_path), Path(cfg.save_path)
+    if _component_mode(cfg, load_path):
+        from . import qwen3_omni_full
+
+        qwen3_omni_full.hf2dcp(cfg, stdout)
+        return
     if cfg.omni_multimodal:
         from . import qwen3_omni_thinker
 
@@ -154,6 +190,11 @@ def hf2dcp(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
 def dcp2hf(cfg: ConvertCheckpointCfg, stdout: Logger) -> None:
     """Convert DCP checkpoint to HuggingFace format."""
     load_path, save_path = Path(cfg.load_path), Path(cfg.save_path)
+    if _component_mode(cfg, load_path):
+        from . import qwen3_omni_full
+
+        qwen3_omni_full.dcp2hf(cfg, stdout)
+        return
     if cfg.omni_multimodal:
         from . import qwen3_omni_thinker
 
