@@ -41,14 +41,33 @@ PITHTRAIN_RUN_OMNI_GPU_TESTS=1 HF_HUB_OFFLINE=1 PYTHONPATH=. \
   --pp 2 --ep 2 --dp 2 --scenario rank-zero
 ```
 
-For full native checkpoint acceptance, prepare a separate directory on CPU.
-Preparation copies and verifies the bundle, records source identity and exact
-sample hashes, and saves the reduced composite model config:
+For full native checkpoint acceptance, select `--component audio|video|multimodal`
+and prepare a separate directory on CPU. Audio remains the default. Video uses
+the actual temporal visual consumer and requires `visual.` checkpoint state.
+Multimodal uses `native_multimodal` and requires both `audio_tower.` and `visual.`.
+
+Pass the original verified real-data bundle for audio/video. For multimodal,
+pass the already prepared and checksum-locked mixed bundle from
+`omni_multimodal_training.py prepare`, containing selected real records and the
+controlled synchronized AV fixture. Reuse those exact bytes across runs; do not
+regenerate the AV container. The six fixture classes are text, image, audio,
+video, synchronized AV and combined audio/image/AV (`all`).
+
+Preparation validates every fixture through its native input validator, copies
+and verifies the bundle, records named fixture hashes, and saves the reduced
+composite model config. It also uses the unchanged production `OmniPretrainData`
+reader with the requested DP partitions, seed 1234 and 32-sample epochs. It
+checks all three global steps contain input for each required tower and proves
+exact next-data restoration after step two. This CPU check does not execute PP,
+model updates, or GPU checkpoint loading.
+
+Use the same component in all three commands (replace `audio` with `video` or
+`multimodal` for the other consumers):
 
 ```bash
 CUDA_VISIBLE_DEVICES= HF_HUB_OFFLINE=1 PYTHONPATH=. OMP_NUM_THREADS=2 \
   timeout 180 python tests/acceptance/omni_media_resume.py \
-  --mode prepare --dataset DATA --output RESUME_OUTPUT \
+  --component audio --mode prepare --dataset DATA --output RESUME_OUTPUT \
   --world-size 4 --pp 2 --ep 2
 ```
 
@@ -59,13 +78,13 @@ with the same shared output storage and source/input identity:
 PITHTRAIN_RUN_OMNI_GPU_TESTS=1 HF_HUB_OFFLINE=1 PYTHONPATH=. \
   timeout --signal=TERM --kill-after=10s 180s \
   torchrun --standalone --nproc-per-node=4 tests/acceptance/omni_media_resume.py \
-  --mode produce --dataset DATA --output RESUME_OUTPUT \
+  --component audio --mode produce --dataset DATA --output RESUME_OUTPUT \
   --world-size 4 --pp 2 --ep 2
 
 PITHTRAIN_RUN_OMNI_GPU_TESTS=1 HF_HUB_OFFLINE=1 PYTHONPATH=. \
   timeout --signal=TERM --kill-after=10s 180s \
   torchrun --standalone --nproc-per-node=4 tests/acceptance/omni_media_resume.py \
-  --mode restore --dataset DATA --output RESUME_OUTPUT \
+  --component audio --mode restore --dataset DATA --output RESUME_OUTPUT \
   --world-size 4 --pp 2 --ep 2
 ```
 
@@ -75,21 +94,23 @@ The restore process starts with empty optimizer state, deliberately clears
 model weights, changes RNG, then uses production strict loading. It requires
 exact model/optimizer/scheduler/Python/NumPy/CPU/CUDA RNG/data restoration,
 identical next input IDs, labels, media tensors, layout/context and sample IDs,
-identical third objective sums, and exact third-update state. Missing media
-towers, gradients or component updates cannot pass.
+identical third objective sums, exact third-update state, and identical
+per-component third-step gradient/update evidence. The observer requires finite,
+nonzero gradients and updates for every declared component, including every
+encoder/decoder layer and DeepStack head. Missing media towers, missing/nonfinite
+parameter gradients or absent component updates cannot pass.
 
 The existing five corruption cases are available in fresh processes:
 `--mode negative --negative-case missing-rank|missing-cuda-rng|shape|topology|optimizer-order`.
 They corrupt only copies beneath the evidence directory and require all-rank
 failure atomicity.
 
-The runner exposes `MediaSpec` and `execute(args, spec)` for a combined native
-consumer. Supply its actual source/config loader, parameter-name mapper,
-component groups, training flag and modality tuple. Set
-`required_components=("audio_tower.", "visual.")` to require both towers in
-the globally collected checkpoint keys. The default audio CLI requires only
-`audio_tower.`. Every required component must be exercised in each observed
-global training step.
+The CLI selects the existing component source/config loader and group definitions.
+Its GPU path always calls production `setup_dataset` and `train_step`; the six
+named mixed fixtures are preparation evidence, not a replacement fixed-batch
+training reader. Every required component must be exercised in each observed
+global training step. `MediaSpec` and `execute(args, spec)` also remain available
+to callers that supply their native input validator and explicit sampling contract.
 
 `--restore-root` can validate a checkpoint rebuilt through an authorized
 complete-Thinker HF bridge while still comparing against the original producer
