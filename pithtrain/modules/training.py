@@ -222,7 +222,9 @@ class TrainingCfg(SlottedDefault):
     strict_resume: bool = False
     """Opt into fixed-topology transactional resume, including every rank's data/RNG.
 
-    Currently requires prepared data, AdamW and StepLR/LambdaLR. Weight-only
+    Also requests FA4 ordered backward reductions; this alone does not guarantee
+    whole-model bitwise reproducibility. Currently requires prepared data, AdamW
+    and StepLR/LambdaLR. Weight-only
     initialization and changed-world-size resharding keep the legacy path.
     """
 
@@ -655,6 +657,7 @@ def setup_training(cfg: object) -> None:
     np.random.seed(cfg.training.seed)
     torch.manual_seed(cfg.training.seed)
     torch.cuda.manual_seed_all(cfg.training.seed)
+    training.deterministic_attention = cfg.training.strict_resume
     setup_model(cfg.training, cfg.distributed)
     training.optimizers = cfg.training.optimizer(cfg.training)
     training.schedulers = cfg.training.scheduler(cfg.training)
