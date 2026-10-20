@@ -24,6 +24,7 @@ from pithtrain.modules.strict_checkpoint import (
     _rng_state,
     _validate_rng,
 )
+from pithtrain.modules.task_checkpoint import TASK_STATE_VERSION, TaskCheckpointState
 
 MANIFEST = "strict-manifest.json"
 VERSION = 1
@@ -175,9 +176,11 @@ def _membership(model, optimizers):
     ]
 
 
-def _optimizer_template(optimizer):
+def _optimizer_template(optimizer, *, empty=False):
     # No get_state_dict dummy optimizer step: the fresh live optimizer stays empty.
     template = optimizer.state_dict()
+    if empty:
+        return dict(state={}, param_groups=template["param_groups"])
     state = {}
     for saved_group, group in zip(template["param_groups"], optimizer.param_groups, strict=True):
         for index, parameter in zip(saved_group["params"], group["params"], strict=True):
@@ -192,7 +195,12 @@ def _optimizer_template(optimizer):
     return dict(state=state, param_groups=template["param_groups"])
 
 
-def _validate_data(value, *, step, global_batch_size, fingerprint):
+def _validate_data(value, *, step, global_batch_size, fingerprint, data_state=None):
+    if isinstance(data_state, TaskCheckpointState):
+        data_state.validate_state_dict(value)
+        if value["cursors"]["transaction"] != step:
+            raise DistributedCheckpointError("Checkpoint transaction and task cursor disagree")
+        return value["cursors"]["updates"]
     if (
         set(value) != {"version", "fingerprint", "consumed_samples"}
         or type(value["version"]) is not int
@@ -206,6 +214,7 @@ def _validate_data(value, *, step, global_batch_size, fingerprint):
         or value["consumed_samples"] != step * global_batch_size
     ):
         raise DistributedCheckpointError("Step and committed data cursor disagree")
+    return step
 
 
 def _objects(data_state, step, config):
@@ -236,9 +245,11 @@ def _objects(data_state, step, config):
             "Optimizer parameter coverage is missing, duplicated or unexpected"
         )
     device = next(model.parameters()).device
-    global_batch_size = config["training"]["global_batch_size"]
-    if type(global_batch_size) is not int or global_batch_size < 1:
-        raise DistributedCheckpointError("Invalid global batch size")
+    global_batch_size = None
+    if not isinstance(data_state, TaskCheckpointState):
+        global_batch_size = config["training"]["global_batch_size"]
+        if type(global_batch_size) is not int or global_batch_size < 1:
+            raise DistributedCheckpointError("Invalid global batch size")
     data = (
         data_state.state_dict()
     )  # Reject pending, uncommitted reads before collectives with state.
@@ -307,15 +318,26 @@ def save(root, step, *, data_state, config):
         raise DistributedCheckpointError("Initialize the real process group before strict saving")
     objects = _phase("save arguments", lambda: _objects(data_state, step, config))
     model, opts, scheds, device, batch, data = objects
-    _phase(
+    task_mode = isinstance(data_state, TaskCheckpointState)
+    version = TASK_STATE_VERSION if task_mode else VERSION
+    updates = _phase(
         "committed cursor",
         lambda: _validate_data(
-            data, step=step, global_batch_size=batch, fingerprint=data["fingerprint"]
+            data,
+            step=step,
+            global_batch_size=batch,
+            fingerprint=data["fingerprint"],
+            data_state=data_state,
         ),
     )
     contract = _phase(
         "save contract arguments",
-        lambda: dict(step=step, config=config, data=data, root=str(Path(root).resolve())),
+        lambda: dict(
+            step=step,
+            config=config,
+            data=data_state.checkpoint_contract(data, include_cursors=True) if task_mode else data,
+            root=str(Path(root).resolve()),
+        ),
     )
     _agree(contract, "save contract")
     values, layout = _phase(
@@ -323,12 +345,16 @@ def save(root, step, *, data_state, config):
     )
     _phase(
         "complete optimizer",
-        lambda: _check_training_state(values, [_optimizer_template(opt) for opt in opts], step),
+        lambda: _check_training_state(
+            values,
+            [_optimizer_template(opt, empty=task_mode and updates == 0) for opt in opts],
+            updates,
+        ),
     )
     header = _phase(
         "rank header",
         lambda: dict(
-            version=VERSION,
+            version=version,
             step=step,
             config=config,
             topology=_topology(),
@@ -342,8 +368,11 @@ def save(root, step, *, data_state, config):
         "stage shards",
         lambda: dict(
             header=header,
-            state=_pack({k: v for k, v in values.items() if k != "rng"}),
+            state=_pack(
+                {k: v for k, v in values.items() if k != "rng" and (not task_mode or k != "data")}
+            ),
             rng=values["rng"],
+            **({"task": values["data"]} if task_mode else {}),
         ),
     )
     location = Path(root, "torch-dcp", f"{step:08d}")
@@ -361,7 +390,7 @@ def save(root, step, *, data_state, config):
         if dist.get_rank() != 0:
             return
         manifest = dict(
-            version=VERSION,
+            version=version,
             world_size=dist.get_world_size(),
             step=step,
             files={f"rank-{rank:05d}.pt": digest for rank, digest in enumerate(hashes)},
@@ -383,12 +412,18 @@ def load(root, step, *, data_state, config):
     model, opts, scheds, device, batch, data = _phase(
         "load arguments", lambda: _objects(data_state, step, config)
     )
+    task_mode = isinstance(data_state, TaskCheckpointState)
+    version = TASK_STATE_VERSION if task_mode else VERSION
     contract = _phase(
         "load contract arguments",
         lambda: dict(
             step=step,
             config=config,
-            fingerprint=data["fingerprint"],
+            fingerprint=(
+                data_state.checkpoint_contract(data, include_cursors=False)
+                if task_mode
+                else data["fingerprint"]
+            ),
             root=str(Path(root).resolve()),
         ),
     )
@@ -404,7 +439,7 @@ def load(root, step, *, data_state, config):
         names = {f"rank-{rank:05d}.pt" for rank in range(dist.get_world_size())}
         if (
             set(manifest) != {"version", "world_size", "step", "files"}
-            or manifest["version"] != VERSION
+            or manifest["version"] != version
             or manifest["world_size"] != dist.get_world_size()
             or manifest["step"] != step
             or set(manifest["files"]) != names
@@ -425,7 +460,7 @@ def load(root, step, *, data_state, config):
     header = _phase(
         "rank header",
         lambda: dict(
-            version=VERSION,
+            version=version,
             step=step,
             config=config,
             topology=_topology(),
@@ -440,23 +475,50 @@ def load(root, step, *, data_state, config):
         if not isinstance(payload, dict) or "header" not in payload:
             raise DistributedCheckpointError("Invalid rank payload")
         _check_schema(payload["header"], header, path="header")
-        if set(payload) != {"header", "state", "rng"} or payload["header"] != header:
+        fields = {"header", "state", "rng"} | ({"task"} if task_mode else set())
+        if set(payload) != fields or payload["header"] != header:
             raise DistributedCheckpointError(
                 "Rank topology, configuration, membership or model layout differs"
             )
-        template = dict(before, optimizer=templates)
+        updates = step
+        expected_optimizers = templates
+        if task_mode:
+            updates = _validate_data(
+                payload["task"],
+                step=step,
+                global_batch_size=None,
+                fingerprint=data["fingerprint"],
+                data_state=data_state,
+            )
+            if updates == 0:
+                expected_optimizers = [_optimizer_template(opt, empty=True) for opt in opts]
+        template = dict(before, optimizer=expected_optimizers)
         del template["rng"]
+        if task_mode:
+            del template["data"]
         restored = _unpack(payload["state"], template)
-        _validate_data(
-            restored["data"], step=step, global_batch_size=batch, fingerprint=data["fingerprint"]
-        )
-        _check_training_state(restored, templates, step)
+        if task_mode:
+            restored["data"] = copy.deepcopy(payload["task"])
+        else:
+            _validate_data(
+                restored["data"],
+                step=step,
+                global_batch_size=batch,
+                fingerprint=data["fingerprint"],
+            )
+        _check_training_state(restored, expected_optimizers, updates)
         _check_schema(payload["rng"], before["rng"], path="app.resume.rng")
         _validate_rng(payload["rng"], device)
         restored["rng"] = payload["rng"]
         return restored
 
     restored = _phase("validate every rank before mutation", validate)
+    if task_mode:
+        restored_contract = _phase(
+            "restored task contract",
+            lambda: data_state.checkpoint_contract(restored["data"], include_cursors=True),
+        )
+        _agree(restored_contract, "restored task global cursors")
     rollback = _phase(
         "stage rollback", lambda: _pack({k: v for k, v in before.items() if k != "rng"})
     )
