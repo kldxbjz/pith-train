@@ -123,7 +123,7 @@ def test_fullgraph_aot_autograd_preserves_policy(wrapper, monkeypatch, packed, s
     assert [options["deterministic"] for name, options in calls if name == "backward"] == [strict]
 
 
-@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("strict", [None, False, True])
 def test_setup_training_sets_policy_before_model_construction(strict):
     path = ROOT / "pithtrain/modules/training.py"
     tree = ast.parse(path.read_text())
@@ -133,11 +133,11 @@ def test_setup_training_sets_policy_before_model_construction(strict):
     runtime = SimpleNamespace(deterministic_attention=not strict)
     observed = []
     cfg = SimpleNamespace(
-        training=SimpleNamespace(
-            seed=1234, strict_resume=strict, optimizer=lambda _: (), scheduler=lambda _: ()
-        ),
+        training=SimpleNamespace(seed=1234, optimizer=lambda _: (), scheduler=lambda _: ()),
         distributed=SimpleNamespace(),
     )
+    if strict is not None:
+        cfg.training.strict_resume = strict
     noop_seed = SimpleNamespace(seed=lambda _: None)
     namespace = dict(
         TrainingCfg=SimpleNamespace,
@@ -151,5 +151,5 @@ def test_setup_training_sets_policy_before_model_construction(strict):
     )
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
     namespace["setup_training"](cfg)
-    assert observed == [strict]
-    assert runtime.deterministic_attention is strict
+    assert observed == [bool(strict)]
+    assert runtime.deterministic_attention is bool(strict)
