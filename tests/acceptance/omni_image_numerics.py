@@ -6,6 +6,7 @@ does not replay routes, freeze features, skip gradients, or change thresholds.
 """
 
 import argparse
+import copy
 import json
 import os
 from pathlib import Path
@@ -69,7 +70,12 @@ def local_expert_checks(native, reference, snapshots):
     """Identical actual normalized inputs, weights, and free routing; local kernel diagnosis."""
     reports = {}
     for index, native_layer in enumerate(native.layers.values()):
-        left, right = native_layer.mlp, reference.model.layers[index].mlp
+        left = copy.deepcopy(native_layer.mlp)
+        right = copy.deepcopy(reference.model.layers[index].mlp)
+        for model in (left, right):
+            for module in model.modules():
+                module._forward_hooks.clear()
+                module._forward_pre_hooks.clear()
         source = snapshots[f"layer.{index}.router"]["input"]
         a = source.detach().clone().unsqueeze(0).requires_grad_()
         b = source.detach().clone().unsqueeze(0).requires_grad_()
@@ -78,8 +84,11 @@ def local_expert_checks(native, reference, snapshots):
         probe = torch.linspace(-1, 1, output.numel(), device=output.device).reshape_as(output)
         params, expected = dict(left.named_parameters()), dict(right.named_parameters())
         assert params.keys() == expected.keys()
-        gradients = torch.autograd.grad((output.float() * probe).sum(), [a, *params.values()])
-        targets = torch.autograd.grad((target.float() * probe).sum(), [b, *expected.values()])
+        (output.float() * probe).sum().backward()
+        (target.float() * probe).sum().backward()
+        gradients = [a.grad, *(p.grad for p in params.values())]
+        targets = [b.grad, *(p.grad for p in expected.values())]
+        assert all(value is not None for value in gradients + targets)
         reports[str(index)] = dict(
             output_error=error_ratio(output, target),
             gradient_errors={
