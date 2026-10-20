@@ -301,3 +301,14 @@ def test_complete_strict_hf_strict_and_fresh_process_resume(tmp_path, profile):
     with pytest.raises(ConversionError, match="HF weights changed"):
         hf2dcp(cfg, fixtures.LOGGER)
     assert not cfg.save_path.exists()
+
+
+def test_legacy_released_vision_position_count_uses_hf_default():
+    raw = configuration().to_dict()
+    del raw["vision_config"]["num_position_embeddings"]
+    config = thinker_config(raw)
+    assert config.vision_config.num_position_embeddings == 2304
+    assert parameter_shapes(config)["visual.pos_embed.weight"] == (2304, 32)
+    raw["vision_config"]["num_position_embeddings"] = 0
+    with pytest.raises(ConversionError, match="num_position_embeddings"):
+        thinker_config(raw)

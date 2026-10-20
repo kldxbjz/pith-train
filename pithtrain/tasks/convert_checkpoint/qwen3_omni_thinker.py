@@ -47,7 +47,6 @@ def thinker_config(raw):
                 "temporal_patch_size",
                 "spatial_merge_size",
                 "in_channels",
-                "num_position_embeddings",
             ),
         ),
         (
@@ -79,6 +78,13 @@ def thinker_config(raw):
         raise text.ConversionError("Missing vision_config.deepstack_visual_indexes")
     config = Qwen3OmniMoeThinkerConfig(**copy.deepcopy(raw))
     text_cfg = text.text_config(raw)
+    # The released 26291f7 config omits this field. HF's config supplies its
+    # documented architecture default; explicit checkpoint values still win.
+    if (
+        type(config.vision_config.num_position_embeddings) is not int
+        or config.vision_config.num_position_embeddings <= 0
+    ):
+        raise text.ConversionError("Invalid vision_config.num_position_embeddings")
     if (
         config.vision_config.out_hidden_size != text_cfg.hidden_size
         or config.audio_config.output_dim != text_cfg.hidden_size
