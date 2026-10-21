@@ -90,7 +90,7 @@ def inputs(tmp_path):
     return data, tokens
 
 
-def trainer(tmp_path, *, initial=None):
+def trainer(tmp_path, *, initial=None, sequential_models=False):
     prompts, tokens = inputs(tmp_path)
     torch.manual_seed(42)
     policy, config = _new_hf(raw_config(), "text")
@@ -105,7 +105,9 @@ def trainer(tmp_path, *, initial=None):
             policy.lm_head.weight.mul_(1.1)
     reward = ExactAnswerReward(prompts, tokens)
     rollout = LocalHFThinkerRollout(
-        LocalHFRolloutCfg(max_sequence_length=10, max_new_tokens=2),
+        LocalHFRolloutCfg(
+            max_sequence_length=10, max_new_tokens=2, sequential_models=sequential_models
+        ),
         model_config=raw_config(),
         prompts=prompts,
         reference=reference,
@@ -124,9 +126,10 @@ def trainer(tmp_path, *, initial=None):
     )
 
 
-def test_real_hf_sampling_update_resynchronize_and_fresh_resume(tmp_path):
+@pytest.mark.parametrize("sequential_models", [False, True])
+def test_real_hf_sampling_update_resynchronize_and_fresh_resume(tmp_path, sequential_models):
     torch.set_num_threads(1)
-    first = trainer(tmp_path / "first")
+    first = trainer(tmp_path / "first", sequential_models=sequential_models)
     restored = None
     try:
         initial = _cpu_tree(first.backend.model.state_dict())
@@ -148,7 +151,9 @@ def test_real_hf_sampling_update_resynchronize_and_fresh_resume(tmp_path):
         expected_weights = _cpu_tree(first.backend.model.state_dict())
         expected_optimizer = _cpu_tree(first.backend.optimizer.state_dict())
         # Same content in another directory: identity binds contents, not machine paths.
-        restored = trainer(tmp_path / "restored", initial=initial)
+        restored = trainer(
+            tmp_path / "restored", initial=initial, sequential_models=sequential_models
+        )
         restored.backend.load(tmp_path / "checkpoint", restored)
         assert restored.train_step() == expected
         tree_equal(restored.backend.model.state_dict(), expected_weights)
@@ -184,7 +189,9 @@ def test_engine_selected_logprobs_match_independent_actual_forward(tmp_path):
     assert result["model_context"] is None
 
 
-@pytest.mark.parametrize("change", ["data", "rng", "cursor", "reward", "dtype", "reference"])
+@pytest.mark.parametrize(
+    "change", ["data", "rng", "cursor", "reward", "dtype", "reference", "residency"]
+)
 def test_resume_rejects_drift_before_any_training_parameter_apply(tmp_path, change):
     task = trainer(tmp_path)
     state = task.rollout.state_dict()
@@ -199,6 +206,8 @@ def test_resume_rejects_drift_before_any_training_parameter_apply(tmp_path, chan
         state["semantic"]["contract"]["reward_config_sha256"] = "0" * 64
     elif change == "dtype":
         state["semantic"]["cfg"]["compute_dtype"] = "bfloat16"
+    elif change == "residency":
+        state["semantic"]["cfg"]["sequential_models"] = True
     else:
         state["semantic"]["contract"]["reference_policy_sha256"] = "0" * 64
     with pytest.raises((ValueError, RuntimeError)):
