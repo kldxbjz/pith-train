@@ -44,6 +44,8 @@ def parse_args(argv=None):
     parser.add_argument("--hf-compute-dtype", choices=("bfloat16",), default="bfloat16")
     parser.add_argument("--worker-timeout", type=float, default=120)
     parser.add_argument("--weight-limit-mib", type=int, default=512)
+    parser.add_argument("--host-weight-limit-mib", type=int)
+    parser.add_argument("--device-weight-limit-mib", type=int)
     parser.add_argument("--media-options", type=json.loads, default={})
     parser.add_argument("--reward-casefold", action="store_true")
     parser.add_argument("--reward-no-strip", action="store_true")
@@ -76,7 +78,6 @@ def parse_args(argv=None):
 
 def main(argv=None, *, observer=None):
     args = parse_args(argv)
-    import torch
 
     from pithtrain.modules.omni_hf_transport import (
         DistributedHFThinkerRollout,
@@ -91,6 +92,7 @@ def main(argv=None, *, observer=None):
         _config,
         _converter,
         configuration_identity,
+        weight_memory_plan,
     )
     from pithtrain.tasks.omni_rl import OmniRLCfg, OmniRLTrainer, PithTrainPolicyAdapter
 
@@ -107,15 +109,15 @@ def main(argv=None, *, observer=None):
         seed=args.seed,
         timeout_seconds=args.worker_timeout,
         max_weight_bytes=args.weight_limit_mib * (1 << 20),
+        max_host_weight_bytes=None
+        if args.host_weight_limit_mib is None
+        else args.host_weight_limit_mib * (1 << 20),
+        max_device_weight_bytes=None
+        if args.device_weight_limit_mib is None
+        else args.device_weight_limit_mib * (1 << 20),
     )
     cfg.validate()
-    required = sum(
-        torch.Size(s).numel() * 4 for s in _converter(args.scope).parameter_shapes(config).values()
-    )
-    if required > cfg.max_weight_bytes:
-        raise ValueError(
-            "Policy FP32 bytes exceed explicit memory admission limit; no model allocated"
-        )
+    memory_plan = weight_memory_plan(config, cfg)
     if args.plan:
         print(
             json.dumps(
@@ -127,11 +129,12 @@ def main(argv=None, *, observer=None):
                     cp=1,
                     hsdp=1,
                     scope=args.scope,
-                    canonical_fp32_bytes=required,
+                    canonical_fp32_bytes=memory_plan["canonical_fp32_bytes"],
+                    memory_plan=memory_plan,
                     hf_device=args.hf_device,
                     hf_fp32_model_copies=2,
                     parent_reference_copy=True,
-                    transient_snapshot_conversion_copies=True,
+                    transient_snapshot_conversion_copies=False,
                     native_training_memory_additional=True,
                     requests=args.requests,
                     steps=args.updates,

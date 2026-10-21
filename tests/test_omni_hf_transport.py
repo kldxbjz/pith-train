@@ -90,6 +90,17 @@ def run_transport(rank, world, init, directory, mode):
             group=dist.group.WORLD,
             chunk_bytes=32,
         )
+        # All ranks reject the same explicit memory admission before weight transfer.
+        from dataclasses import replace
+
+        with pytest.raises(ValueError, match="host weight residency"):
+            gather_native_policy(
+                model,
+                config,
+                replace(opts, max_host_weight_bytes=1),
+                group=dist.group.WORLD,
+                chunk_bytes=32,
+            )
         gathered = gather_native_policy(model, config, opts, group=dist.group.WORLD, chunk_bytes=32)
         if rank == 0:
             tree_equal(gathered, reference)

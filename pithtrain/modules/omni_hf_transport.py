@@ -23,13 +23,16 @@ from pithtrain.tasks.omni_hf_rollout import (
     execution_identity,
     validate_native_runtime,
     validate_policy_semantics,
+    weight_memory_plan,
+)
+from pithtrain.tasks.omni_hf_rollout import (
+    _stream_weights_digest as _weights_digest,
 )
 from pithtrain.tasks.omni_rl import (
     PolicyIdentity,
     PolicySnapshot,
     RolloutBatch,
     RolloutContract,
-    _weights_digest,
     fingerprint,
 )
 
@@ -102,6 +105,7 @@ def _leader(function, group, limit):
 def _pieces(model, config, cfg, *, hashes, chunk_elements):
     from pithtrain.modules.checkpoint import to_canonical_model
 
+    weight_memory_plan(config, cfg)
     expected = _converter(cfg.scope).parameter_shapes(config)
     if sum(torch.Size(shape).numel() * 4 for shape in expected.values()) > cfg.max_weight_bytes:
         raise ValueError("Canonical export exceeds reviewed host weight bound")
@@ -202,7 +206,10 @@ def gather_native_policy(model, config, cfg, *, group, chunk_bytes=4 << 20):
     owners = _ownership(all_rows, expected)  # Identical metadata on every rank.
     rank = dist.get_rank()
     result = (
-        {name: torch.empty(shape, dtype=torch.float32) for name, shape in expected.items()}
+        {
+            name: torch.empty(shape, dtype=torch.float32, device="cpu")
+            for name, shape in expected.items()
+        }
         if rank == 0
         else None
     )

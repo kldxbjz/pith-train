@@ -132,6 +132,10 @@ def test_real_hf_sampling_update_resynchronize_and_fresh_resume(tmp_path):
         initial = _cpu_tree(first.backend.model.state_dict())
         result = first.train_step()
         assert result["status"] == "UPDATED"
+        # The real spawned worker releases consumed weight files before ready/ok.
+        worker_files = Path(first.rollout.worker.directory.name)
+        assert not (worker_files / "reference.pt").exists()
+        assert not (worker_files / "request.pt").exists()
         first_digest = first.rollout.installation_receipt["installed_weights_sha256"]
         first.backend.save(tmp_path / "checkpoint", first)
         expected = first.train_step()
@@ -412,3 +416,105 @@ def test_worker_deadline_includes_serialization_and_result_loading(tmp_path, mon
         process.call("synchronize", {})
     assert sent == ["synchronize"] and polls == [1.0] and closed
     assert not (tmp_path / "result.pt").exists()
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.uint8])
+def test_stream_digest_keeps_exact_encoding_with_bounded_host_chunks(dtype):
+    from pithtrain.tasks.omni_hf_rollout import _stream_weights_digest
+
+    values = {
+        "large": torch.arange((4 << 20) + 7, dtype=torch.float32).to(dtype),
+        "strided": torch.arange(20, dtype=torch.float32).reshape(4, 5).t().to(dtype),
+        "scalar": torch.tensor(3, dtype=dtype),
+        "empty": torch.empty(0, dtype=dtype),
+    }
+    assert _stream_weights_digest(values) == _weights_digest(values)
+
+
+def test_real_hf_installation_uses_live_views_without_fused_export_or_full_cpu_clone(monkeypatch):
+    from pithtrain.tasks import omni_hf_rollout as provider
+
+    raw = raw_config()
+    raw["vocab_size"] = 65539  # An actual embedding/head crosses the 4 MiB copy boundary.
+    hf, config = _new_hf(raw, "text")
+    values = _canonical(_cpu_tree(hf.state_dict()), config, "text")
+    cfg = LocalHFRolloutCfg(max_sequence_length=10, max_new_tokens=2)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Installation must not export a full fused/CPU model copy")
+
+    monkeypatch.setattr(provider, "_cpu_tree", forbidden)
+    monkeypatch.setattr(provider._converter("text"), "canonical_to_hf", forbidden)
+    engine = provider._Engine(raw, cfg, values)
+    original = {name: value.data_ptr() for name, value in engine.policy.named_parameters()}
+    changed = {name: value + 0.125 for name, value in values.items()}
+    receipt = engine.synchronize(changed)
+    assert receipt["installed_weights_sha256"] == _weights_digest(changed)
+    assert receipt["reference_weights_sha256"] == _weights_digest(values)
+    assert original == {name: value.data_ptr() for name, value in engine.policy.named_parameters()}
+    tree_equal(_canonical(engine.policy.state_dict(), config, "text"), changed)
+    tree_equal(_canonical(engine.reference.state_dict(), config, "text"), values)
+    oracle, _ = _new_hf(raw, "text")
+    for name, view in _canonical(oracle.state_dict(), config, "text").items():
+        view.copy_(changed[name])
+    ids = torch.tensor([[2, 3, 4]])
+    torch.testing.assert_close(engine.policy(ids), oracle(ids), rtol=0, atol=0)
+
+
+def test_install_rejects_canonical_copies_and_budget_before_hf_allocation(monkeypatch):
+    from pithtrain.tasks import omni_hf_rollout as provider
+
+    raw = raw_config()
+    hf, config = _new_hf(raw, "text")
+    values = _canonical(_cpu_tree(hf.state_dict()), config, "text")
+    cfg = LocalHFRolloutCfg(max_sequence_length=10, max_new_tokens=2)
+    before = _cpu_tree(hf.state_dict())
+    canonical = provider._canonical
+    monkeypatch.setattr(provider, "_canonical", lambda *args: _cpu_tree(canonical(*args)))
+    with pytest.raises(ValueError, match="live parameter storage"):
+        provider._install_canonical(hf, values, config, cfg)
+    tree_equal(hf.state_dict(), before)
+
+    def forbidden(*args):
+        raise AssertionError("Rejected weights must not construct an HF model")
+
+    monkeypatch.setattr(provider, "_new_hf", forbidden)
+    with pytest.raises(ValueError, match="host weight residency"):
+        provider._Engine(raw, replace(cfg, max_host_weight_bytes=1), values)
+
+
+def test_released_provider_weight_admission_is_meta_only_and_explicit():
+    from pithtrain.tasks.omni_hf_rollout import weight_memory_plan
+
+    raw = json.loads(
+        (Path(__file__).parent / "configs/qwen3_omni_full/released-config.json").read_text()
+    )
+    config = _config(raw, "thinker")
+    cfg = LocalHFRolloutCfg(scope="thinker")
+    with pytest.raises(ValueError, match="byte limit"):
+        weight_memory_plan(config, cfg)
+    cfg = replace(cfg, max_weight_bytes=128 << 30)
+    with pytest.raises(ValueError, match="explicit host/device"):
+        weight_memory_plan(config, cfg)
+    with pytest.raises(ValueError, match="host weight residency"):
+        weight_memory_plan(config, replace(cfg, max_host_weight_bytes=256 << 30))
+    plan = weight_memory_plan(config, replace(cfg, max_host_weight_bytes=640 << 30))
+    assert plan["canonical_fp32_bytes"] == 126876821952
+    assert plan["host_peak_weight_bytes"] == 5 * plan["canonical_fp32_bytes"]
+    assert plan["device_resident_weight_bytes"] == 0
+    assert plan["feasibility"] == "WEIGHT_BUDGET_ONLY_NOT_FULLSIZE_VALIDATION"
+    with pytest.raises(ValueError, match="device weight budget"):
+        weight_memory_plan(
+            config,
+            replace(
+                cfg,
+                device="cuda:0",
+                max_host_weight_bytes=640 << 30,
+                max_device_weight_bytes=141 << 30,
+            ),
+        )
+    with pytest.raises(ValueError, match="host weight residency"):
+        weight_memory_plan(
+            config, replace(cfg, max_host_weight_bytes=640 << 30), local_reference_copy=True
+        )
+    assert not torch.cuda.is_initialized()
