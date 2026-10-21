@@ -901,8 +901,8 @@ def run_gpu(args):
             rollout=Rollout(reference, topology, observer),
             reward=DecidableReward(),
         )
-        task_state = backend._checkpoint_state(trainer)
-        resume_config = trainer.resume_config()
+        resume_config = backend.checkpoint_contract(trainer)
+        task_state = backend._checkpoint_state(trainer, contract=resume_config)
     else:
         sftcfg = sft_lm.SFTLMCfg()
         sftcfg.max_updates, sftcfg.max_batches, sftcfg.max_grad_norm = UPDATES, REQUESTS, 1.0

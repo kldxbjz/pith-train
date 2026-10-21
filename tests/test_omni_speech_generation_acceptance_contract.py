@@ -546,3 +546,61 @@ def test_official_full_cpu_fixture_initializes_poisoned_expert_storage():
         torch.utils.deterministic.fill_uninitialized_memory = policy[2]
         torch.set_rng_state(rng)
         torch.set_num_threads(threads)
+
+
+def test_real_qwen3_generate_accepts_explicit_attention_policy_at_forward():
+    from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+        Qwen3OmniMoeThinkerConfig,
+    )
+    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+        Qwen3OmniMoeThinkerForConditionalGeneration,
+    )
+
+    from tests.test_omni_speech_integration import config as talker_config
+    from tests.test_qwen3_omni_audio import audio_config
+    from tests.test_qwen3_omni_vision import vision_config
+
+    torch.manual_seed(17)
+    torch.set_num_threads(1)
+    cfg = Qwen3OmniMoeThinkerConfig(
+        text_config=talker_config().text_config.to_dict(),
+        audio_config=audio_config().to_dict(),
+        vision_config=vision_config().to_dict(),
+        audio_token_id=10,
+        image_token_id=13,
+        video_token_id=14,
+        vision_start_token_id=15,
+    )
+    cfg._attn_implementation = "eager"
+    model = Qwen3OmniMoeThinkerForConditionalGeneration(cfg).eval()
+    model.reference_attention = dict(contract="native-matched-v2", deterministic=True)
+    ids = torch.tensor([[3, 4, 5]])
+    options = dict(
+        max_new_tokens=2, do_sample=False, use_cache=False, eos_token_id=None, pad_token_id=0
+    )
+    with pytest.raises(ValueError, match="deterministic"):
+        model.generate(ids, deterministic=True, **options)
+    original_hooks = dict(model._forward_pre_hooks)
+    seen = []
+    with gate.generation_attention_policy(model):
+        observer = model.register_forward_pre_hook(
+            lambda module, args, kwargs: seen.append(kwargs["deterministic"]), with_kwargs=True
+        )
+        try:
+            actual = model.generate(ids, **options)
+        finally:
+            observer.remove()
+    expected = model.generate(ids, **options)
+    assert seen == [True, True]
+    assert torch.equal(actual, expected) and actual.shape == (1, 5)
+    assert dict(model._forward_pre_hooks) == original_hooks
+
+
+def test_generation_attention_policy_restores_hooks_on_conflict():
+    model = MethodModel()
+    model.reference_attention = dict(contract="native-matched-v2", deterministic=True)
+    prior = dict(model._forward_pre_hooks)
+    with pytest.raises(ValueError, match="conflicts"):
+        with gate.generation_attention_policy(model):
+            model(torch.ones(1, 2), deterministic=False)
+    assert dict(model._forward_pre_hooks) == prior
