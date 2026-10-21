@@ -221,6 +221,7 @@ component settings as the checkpoint, before reading. The caller supplies the
 manifest SHA from its completed checkpoint receipt and explicit host/file caps.
 
 ```python
+import torch
 from pithtrain.modules.omni_speech_generation_checkpoint import read_speech_generation_state
 
 # model is a fresh complete native meta model; no FSDP wrapping in this process.
@@ -232,19 +233,34 @@ state, receipt = read_speech_generation_state(
 )
 model.load_state_dict(state, strict=True, assign=True)
 del state
-model.to(device=device).eval()  # Retain FP32 masters and the existing BF16 compute path.
-result = model.generate(
-    input_ids, model_context, max_text_tokens=max_new_tokens,
-    max_codec_frames=max_codec_frames, do_sample=False,
-)
+model.to(device=device).eval()  # FP32 masters remain owned by this fresh model.
+
+# Match the existing acceptance precision: BF16 compute parameters while
+# retaining native buffer dtypes. A method call needs a forward dispatch wrapper.
+class Generate(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, *args, **kwargs):
+        return self.model.generate(*args, **kwargs)
+
+call = Generate(model)
+with torch.no_grad():
+    parameters = {name: p.to(torch.bfloat16) for name, p in call.named_parameters()}
+    result = torch.func.functional_call(
+        call, (parameters, dict(call.named_buffers())), (input_ids, model_context),
+        dict(max_text_tokens=max_new_tokens, max_codec_frames=max_codec_frames,
+             do_sample=False), strict=True,
+    )
 ```
 
 The reader validates every rank and all model tensor layouts/checksums before
 allocating the owned full CPU state. It checks the files again while assembling;
 it never mutates the target, optimizer, gradients or RNG. It uses mmap for rank
 payloads, but the caller still needs host capacity for the full FP32 state plus
-page-cache/transient overhead and device capacity for an unsharded model. The
-state cap is not a whole-process memory limit. Loading with `assign=True` is for
+page-cache/transient overhead and device capacity for the unsharded FP32 model
+plus BF16 compute copies and activations. The state cap is not a whole-process memory limit. Loading with `assign=True` is for
 a fresh generation model, before constructing any optimizer.
 
 This bridges a training checkpoint to independent generation. It does not resume
