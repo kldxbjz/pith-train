@@ -1,12 +1,12 @@
 """CPU tests for the training data boundary, checkpoint state and rank reductions."""
 
 import copy
-import hashlib
 import json
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
@@ -41,19 +41,33 @@ def single_cpu_thread():
 
 
 @pytest.fixture
-def training_bundle(manifest):
+def training_bundle(manifest, processor_config):
+    from pithtrain.tasks.prepare_omni_data import write_bundle, write_json
+    from pithtrain.tasks.tokenize_corpus import Writer
+
     root = manifest.parent
     recipe_path = (
         Path(__file__).parents[1] / "examples/prepare_omni_data/qwen3-omni-training/config.json"
     )
     recipe = json.loads(recipe_path.read_text())
-    files, manifests, statistics = [], {}, {}
+    write_json(root / "recipe.json", dict(recipe=recipe, stage="video", format_version=3))
+    (root / "rejected.jsonl").write_text("")
+    files, manifests, statistics = ["recipe.json", "rejected.jsonl"], {}, {}
     for row in [json.loads(line) for line in manifest.read_text().splitlines()]:
         kind = row["media"][0]["type"] if row["media"] else "text"
         filename = f"train/{kind}.jsonl"
         (root / filename).parent.mkdir(exist_ok=True)
         (root / filename).write_text(json.dumps(row) + "\n")
         files.append(filename)
+        if kind == "text":
+            token_name = "tokens/train/00000.bin"
+            (root / token_name).parent.mkdir(parents=True)
+            tokenizer = processor_config[0].tokenizer
+            tokens = tokenizer.encode(row["text"]) + [tokenizer.eos_token_id]
+            writer = Writer(root / token_name)
+            writer.append(np.asarray(tokens, dtype=np.uint32))
+            writer.flush()
+            files.append(token_name)
         files.extend(item["path"] for item in row["media"])
         manifests[kind], statistics[kind] = [filename], {"samples": 1}
     bundle = dict(
@@ -62,13 +76,7 @@ def training_bundle(manifest):
         manifests={"train": manifests},
         statistics={"train": statistics},
     )
-    (root / "bundle.json").write_text(json.dumps(bundle))
-    files.append("bundle.json")
-    (root / "checksums.sha256").write_text(
-        "".join(
-            f"{hashlib.sha256((root / name).read_bytes()).hexdigest()}  {name}\n" for name in files
-        )
-    )
+    write_bundle(root, bundle, files)
     return root
 
 

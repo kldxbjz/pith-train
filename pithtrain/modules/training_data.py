@@ -159,7 +159,7 @@ class OmniPretrainData:
         if cfg.format != "prepared_bundle":
             raise ValueError("OmniPretrainData requires prepared_bundle format")
         # Keep legacy text training independent of the optional omni-data extra.
-        from pithtrain.tasks.prepare_omni_data import verify_bundle
+        from pithtrain.tasks.prepare_omni_data import read_verified_bundle
 
         self.root, self.cfg = Path(cfg.dataset).resolve(), cfg
         self.is_text = list(cfg.modalities) == ["text"]
@@ -177,11 +177,7 @@ class OmniPretrainData:
             if dist.get_world_size(pp_group) != pp_size or dist.get_rank(pp_group) != pp_rank:
                 raise ValueError("Pipeline process group does not match the data rank/size")
 
-        def verify():
-            bundle = verify_bundle(self.root)
-            return bundle, hashlib.sha256((self.root / "bundle.json").read_bytes()).hexdigest()
-
-        self.bundle, bundle_sha256 = self._share_metadata(verify)
+        self.bundle, bundle_sha256 = self._share_metadata(lambda: read_verified_bundle(self.root))
         self.recipe = self.bundle["recipe"]
         self.modalities, self.stage = resolve_bundle_modalities(self.recipe, cfg.modalities)
         if set(self.modalities) - set(self.bundle["manifests"]["train"]):
