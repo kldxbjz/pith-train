@@ -5,8 +5,9 @@ existing scheduler. All feature state belongs to a microbatch's activation graph
 CP, packed/padded samples, audio/video and FP8 are explicitly unsupported here.
 """
 
+from functools import partial
+
 import torch
-from torch import nn
 
 from pithtrain.contexts import distributed, training
 from pithtrain.models.qwen3_omni_image_inputs import (
@@ -72,16 +73,16 @@ class Qwen3OmniMoeThinkerImageModel(Qwen3OmniMoeThinkerTextModel):
             or count > text.num_hidden_layers
         ):
             raise ValueError("Vision projection width/DeepStack count must fit the text decoder")
-        super().__init__(text, phase)
+        super().__init__(
+            text,
+            phase,
+            decoder_layer_factory=partial(
+                Qwen3OmniMoeThinkerImageDecoderLayer, deepstack_count=count
+            ),
+        )
         self.image_config = config
         self.text_hidden_size, self.deepstack_count = text.hidden_size, count
         self.hidden_size = text.hidden_size * (1 + count)
-        self.layers = nn.ModuleDict(
-            {
-                key: Qwen3OmniMoeThinkerImageDecoderLayer(text, int(key), count)
-                for key in self.layers
-            }
-        )
         self.visual = (
             self.vision_encoder_class(config.vision_config) if self.stage_index == 0 else None
         )
