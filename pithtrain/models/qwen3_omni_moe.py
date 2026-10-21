@@ -38,18 +38,19 @@ class Qwen3OmniMoeThinkerTextRotaryEmbedding(nn.Module):
         if len(self.mrope_section) != 3 or sum(self.mrope_section) != self.head_dim // 2:
             raise ValueError("mrope_section must partition half of head_dim into T/H/W sections")
 
-    @torch.no_grad()
-    def forward(self, position_ids, dtype):
-        # HF's interleaved T/H/W recomposition; text gives all three axes the
-        # same positions. Recompute frequencies in FP32 so model.to(bfloat16)
-        # cannot round an inverse-frequency buffer before the trigonometry.
+        # Match HF's CPU FP32 construction even when this module is built on CUDA/meta.
+        # Plain constants keep dtype/device moves and strict buffer/checkpoint keys unchanged.
         inv_freq = 1.0 / (
             self.base
             ** (
-                torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=position_ids.device)
-                / self.head_dim
+                torch.arange(0, self.head_dim, 2, dtype=torch.float32, device="cpu") / self.head_dim
             )
         )
+        self.inv_freq = tuple(inv_freq.tolist())
+
+    @torch.no_grad()
+    def forward(self, position_ids, dtype):
+        inv_freq = torch.tensor(self.inv_freq, dtype=torch.float32, device=position_ids.device)
         freq = position_ids.float().unsqueeze(-1) * inv_freq
         outputs = []
         for values in (freq.cos(), freq.sin()):

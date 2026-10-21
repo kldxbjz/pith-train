@@ -158,3 +158,15 @@ def test_native_interleaved_rotary_matches_hf():
         torch.empty(2, 17, config.hidden_size, device="cuda", dtype=torch.bfloat16), positions
     )
     torch.testing.assert_close(native(positions, torch.bfloat16), expected, rtol=0, atol=0)
+
+    # Long text exposed a BF16 cosine difference at position850, dimensions18/82.
+    # Meta construction and BF16 moves must preserve the canonical FP32 constants.
+    positions = torch.arange(1278, device="cuda").view(1, 1, -1).expand(3, 1, -1)
+    with torch.device("meta"):
+        native = Qwen3OmniMoeThinkerTextRotaryEmbedding(config).to(dtype=torch.bfloat16)
+    native.to_empty(device="cuda")
+    assert not native.state_dict() and not tuple(native.buffers())
+    expected = hf(
+        torch.empty(1, 1278, config.hidden_size, device="cuda", dtype=torch.bfloat16), positions
+    )
+    torch.testing.assert_close(native(positions, torch.bfloat16), expected, rtol=0, atol=0)
