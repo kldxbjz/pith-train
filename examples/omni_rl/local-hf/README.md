@@ -58,15 +58,52 @@ exactly. The native CLI requires `--hf-compute-dtype bfloat16` autocast. The
 library also supports explicit FP32 for CPU HF tests. Both models default to CPU.
 `--hf-device cuda:0` puts both on the leader's native training GPU,
 which generally has a much larger memory cost. There is **no automatic offload
-or memory-fit guarantee**. Only the leader holds full reference/publication tensors;
-worker initialization, conversion, readback and serialization create further
-temporary copies. The `--weight-limit-mib` limit is a per-canonical-state bound,
-not a process-RAM limit. The default 512 MiB intentionally rejects released 30B
-weights before model allocation. Full-size operation requires a separate memory
-review; prior four-GPU training feasibility is not evidence for this recipe.
-Native canonical conversion may additionally copy expert-local tensors. A Gloo
-timeout bounds stalled collectives; released-model transport latency and peak
-host RAM have not been measured.
+or memory-fit guarantee**. `--weight-limit-mib` bounds one canonical state;
+the unchanged 512 MiB default rejects released 30B weights before allocation.
+Above that bound, an explicitly raised canonical limit also requires
+`--host-weight-limit-mib`, and CUDA placement requires
+`--device-weight-limit-mib`. These are provider **weight-residency budgets**,
+not declarations that the entire native training job fits.
+
+The pinned released Thinker configuration has 126,876,821,952 FP32 parameter
+bytes (118.163 GiB). The native recipe's conservative synchronous-installation
+phase contains the parent's reference/publication (2 copies), two worker HF
+models, and one incoming worker payload: **5 copies, 590.816 GiB on CPU**.
+Consumed reference/request payloads and their IPC files are released before the
+worker acknowledges completion; idle provider weights therefore need 4 copies.
+The separate single-process `LocalHFThinkerRollout` convenience adapter retains a
+defensive parent reference copy and requires a 6-copy host budget instead.
+Native parameters/Adam/checkpoint state, model buffers, activations, allocator
+fragmentation, temporary tensor contiguity copies, and the OS need additional
+memory outside these budgets. Native canonical conversion can also copy expert
+local tensors. No released peak RSS or throughput has been measured.
+
+Installation copies at most 4 MiB at a time directly into strict canonical views
+of the live HF parameters. Readback hashes the actual model in the same bounded
+chunks, retaining the original byte-for-byte digest encoding. It neither builds
+a full fused-expert export nor clones an entire model for readback. The worker
+keeps at most one full weight IPC file at a time, plus bounded request/results
+and serialization metadata; allow more than 118.163 GiB of temporary disk for
+the released model, separately from its input files and training checkpoints.
+No checkpoint, source input, or unrelated file is deleted by this cleanup.
+
+A metadata-only **weight-budget** example for the native CPU-worker recipe is
+`--scope thinker --hf-device cpu --weight-limit-mib 131072
+--host-weight-limit-mib 655360 --plan`, along with the required local paths.
+The 640 GiB declared host weight budget is not a full-job resource reservation:
+native training/checkpoint and runtime memory must still be planned separately.
+A 256 GiB host cannot pass this released-model admission. Existing worker and
+Gloo deadlines still apply; slow full-model IO is not implicitly given retries
+or a longer timeout.
+
+With `--hf-device cuda:0`, both worker models still retain FP32 parameters:
+**236.326 GiB of device weights alone**, alongside native training on that GPU.
+A declared 141 GiB device budget is rejected. This implementation does not
+provide sharded HF serving. Two all-BF16 device models would use about 118.163 GiB
+of weights, but would change embedding/residual/RMSNorm dtype behavior and fail
+the current exact FP32 installed-weight readback. BF16 autocast is not that
+storage contract. Such a backend needs a distinct numerical/installation
+contract and independent validation; it is not silently enabled here.
 
 Publication validates native live `config/image_config`, RMS, RoPE, head and
 routing attributes, forward implementation and compute policy against explicit

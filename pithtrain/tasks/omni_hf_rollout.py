@@ -7,6 +7,7 @@ owns one spawned HF worker. Native training remains in the caller's process.
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.metadata
 import json
 import multiprocessing as mp
@@ -27,7 +28,6 @@ from pithtrain.tasks.omni_rl import (
     RolloutContract,
     TorchPolicyAdapter,
     _cpu_tree,
-    _weights_digest,
     fingerprint,
 )
 
@@ -45,6 +45,10 @@ class LocalHFRolloutCfg:
     timeout_seconds: float = 120.0
     max_weight_bytes: int = 512 << 20
     max_result_bytes: int = 256 << 20
+    # Explicit provider weight residency budgets, not whole-training RAM/VRAM.
+    # None preserves the small-model default; models above 512 MiB require them.
+    max_host_weight_bytes: int | None = None
+    max_device_weight_bytes: int | None = None
     cpu_threads: int = 1
 
     def validate(self):
@@ -65,6 +69,10 @@ class LocalHFRolloutCfg:
         ):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
                 raise ValueError(f"{name} must be a positive integer")
+        for name in ("max_host_weight_bytes", "max_device_weight_bytes"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value < 1):
+                raise ValueError(f"{name} must be an explicit positive integer")
         if self.group_size < 2 or self.max_new_tokens >= self.max_sequence_length:
             raise ValueError("Complete GRPO group and prompt space required")
         if (
@@ -94,18 +102,92 @@ def _canonical(hf, config, scope):
     return _converter(scope).hf_to_canonical(hf, config, prefix="")[0]
 
 
+def weight_memory_plan(config, cfg, *, local_reference_copy=False):
+    """Worst live provider weight phases; no native optimizer/activation estimate.
+
+    The native producer owns reference + publication (2W). During synchronous
+    installation its worker owns two FP32 models + one incoming payload (3W).
+    The local convenience provider additionally owns a defensive reference copy.
+    Device execution retains two FP32 models; BF16 autocast is not BF16 storage.
+    """
+    cfg.validate()
+    shapes = _converter(cfg.scope).parameter_shapes(config)
+    weight = sum(torch.Size(shape).numel() * 4 for shape in shapes.values())
+    if weight > cfg.max_weight_bytes:
+        raise ValueError("Canonical FP32 weight byte limit exceeded before allocation")
+    host = (6 if local_reference_copy else 5) * weight
+    device = 2 * weight if cfg.device.startswith("cuda") else 0
+    if weight > 512 << 20 and (
+        cfg.max_host_weight_bytes is None or (device and cfg.max_device_weight_bytes is None)
+    ):
+        raise ValueError(
+            "Full-size provider requires explicit host/device weight residency budgets"
+        )
+    if cfg.max_host_weight_bytes is not None and host > cfg.max_host_weight_bytes:
+        raise ValueError("Provider peak host weight residency exceeds explicit budget")
+    if cfg.max_device_weight_bytes is not None and device > cfg.max_device_weight_bytes:
+        raise ValueError("Two FP32 HF models exceed explicit device weight budget")
+    return dict(
+        canonical_fp32_bytes=weight,
+        host_peak_weight_bytes=host,
+        device_resident_weight_bytes=device,
+        worker_models=2,
+        host_phase="parent reference/publication + worker models/incoming payload",
+        local_reference_copy=local_reference_copy,
+        transient_copy_chunk_bytes=4 << 20,
+        temporary_weight_files=1,
+        additional_memory_required="native training/checkpoint, activations, buffers, allocator and OS",
+        feasibility="WEIGHT_BUDGET_ONLY_NOT_FULLSIZE_VALIDATION",
+    )
+
+
+def _stream_weights_digest(values):
+    """Exact existing digest encoding, without a tensor-sized Python bytes copy."""
+    digest = hashlib.sha256()
+    for name, value in sorted(values.items()):
+        digest.update(json.dumps([name, str(value.dtype), list(value.shape)]).encode())
+        flat = value.detach().reshape(-1)
+        elements = max(1, (4 << 20) // value.element_size())
+        for begin in range(0, flat.numel(), elements):
+            piece = flat[begin : begin + elements].contiguous().cpu()
+            digest.update(memoryview(piece.view(torch.uint8).numpy()))
+    return digest.hexdigest()
+
+
+def _install_canonical(model, values, config, cfg):
+    """Write through the strict converter's HF canonical views, not fused stacks."""
+    _check_weights(values, config, cfg)
+    stored = model.state_dict()
+    target = _canonical(stored, config, cfg.scope)
+    storages = {(v.device, v.untyped_storage().data_ptr()) for v in stored.values()}
+    if any((v.device, v.untyped_storage().data_ptr()) not in storages for v in target.values()):
+        raise ValueError("HF canonical installation must use live parameter storage views")
+    # Fused HF expert slices are contiguous live views, as are media parameters.
+    # No model parameters or buffers are rebound and no reference dtype changes.
+    with torch.no_grad():
+        for name, value in values.items():
+            destination, source = target[name].view(-1), value.reshape(-1)
+            for begin in range(0, source.numel(), (4 << 20) // 4):
+                destination[begin : begin + (4 << 20) // 4].copy_(
+                    source[begin : begin + (4 << 20) // 4]
+                )
+    digest = _stream_weights_digest(_canonical(model.state_dict(), config, cfg.scope))
+    if digest != _stream_weights_digest(values):
+        raise ValueError("Installed policy readback differs from published weights")
+    return digest
+
+
 def _check_weights(values, config, cfg):
     from pithtrain.tasks.convert_checkpoint.qwen3_omni_moe import validate_tensors
 
+    weight_memory_plan(config, cfg)
     shapes = _converter(cfg.scope).parameter_shapes(config)
-    if sum(torch.Size(shape).numel() * 4 for shape in shapes.values()) > cfg.max_weight_bytes:
-        raise ValueError("Canonical FP32 weight byte limit exceeded before allocation")
     validate_tensors(values, shapes, "Local rollout complete canonical weights")
     if any(
         v.device.type != "cpu"
         or v.dtype != torch.float32
         or v.requires_grad
-        or not torch.isfinite(v).all()
+        or any(not torch.isfinite(chunk).all() for chunk in v.reshape(-1).split((4 << 20) // 4))
         for v in values.values()
     ):
         raise ValueError("Canonical rollout weights must be finite detached FP32 CPU tensors")
@@ -433,7 +515,7 @@ class HFCanonicalPolicyAdapter(TorchPolicyAdapter):
         values = _canonical(_cpu_tree(self.model.state_dict()), self.model.config, "text")
         semantics = self.model_semantics()
         return PolicySnapshot(
-            PolicyIdentity(version, _weights_digest(values), contract, semantics["sha256"]),
+            PolicyIdentity(version, _stream_weights_digest(values), contract, semantics["sha256"]),
             values,
             semantics,
         )
@@ -444,29 +526,17 @@ class _Engine:
         if importlib.metadata.version("transformers") != "5.17.0":
             raise ValueError("HF worker requires Transformers 5.17.0")
         self.cfg = cfg
-        self.policy, self.config = _new_hf(raw, cfg.scope)
+        self.config = _config(raw, cfg.scope)
         _check_weights(reference, self.config, cfg)
+        self.policy, _ = _new_hf(raw, cfg.scope)
         self.reference = copy.deepcopy(self.policy)
-        converted = _converter(cfg.scope).canonical_to_hf(reference, self.config, prefix="")
-        self.reference.load_state_dict(converted, strict=True)
-        if _weights_digest(
-            _canonical(self.reference.state_dict(), self.config, cfg.scope)
-        ) != _weights_digest(reference):
-            raise ValueError("Reference installation readback differs")
+        self.reference_digest = _install_canonical(self.reference, reference, self.config, cfg)
         self.reference.to(cfg.device)
         self.policy.to(cfg.device)
-        self.reference_digest = _weights_digest(reference)
         self.contract = worker_contract(self.config.to_dict(), cfg)
 
     def synchronize(self, values):
-        _check_weights(values, self.config, self.cfg)
-        self.policy.load_state_dict(
-            _converter(self.cfg.scope).canonical_to_hf(values, self.config, prefix=""), strict=True
-        )
-        actual = _canonical(_cpu_tree(self.policy.state_dict()), self.config, self.cfg.scope)
-        digest = _weights_digest(actual)
-        if digest != _weights_digest(values):
-            raise ValueError("Installed policy readback differs from published weights")
+        digest = _install_canonical(self.policy, values, self.config, self.cfg)
         return dict(
             installed_weights_sha256=digest,
             reference_weights_sha256=self.reference_digest,
@@ -612,6 +682,8 @@ def _worker(connection, directory, raw, cfg):
             Path(directory) / "reference.pt", map_location="cpu", weights_only=True
         )
         engine = _Engine(raw, cfg, reference)
+        del reference
+        (Path(directory) / "reference.pt").unlink()
         connection.send(("ready", None))
         while True:
             command = connection.recv()
@@ -626,6 +698,8 @@ def _worker(connection, directory, raw, cfg):
                 result = engine.generate(**payload)
             else:
                 raise ValueError("Unknown HF worker operation")
+            del payload
+            (Path(directory) / "request.pt").unlink()
             output = Path(directory) / "result.pt"
             torch.save(result, output)
             if output.stat().st_size > cfg.max_result_bytes:
@@ -732,6 +806,7 @@ class LocalHFThinkerRollout:
             raise ValueError("This provider requires the reviewed Transformers 5.17.0 API")
         self.cfg, self.raw, self.prompts = cfg, copy.deepcopy(model_config), prompts
         self.config = _config(self.raw, cfg.scope)
+        weight_memory_plan(self.config, cfg, local_reference_copy=True)
         _check_weights(reference, self.config, cfg)
         self.reference = _cpu_tree(reference)
         vocab = (
@@ -751,7 +826,7 @@ class LocalHFThinkerRollout:
             fingerprint(
                 dict(config=self.raw, input_format="document-prefix-v1", hf_attention="eager")
             ),
-            _weights_digest(self.reference),
+            _stream_weights_digest(self.reference),
             fingerprint(reward_config),
         )
         self.semantic = dict(
@@ -771,7 +846,7 @@ class LocalHFThinkerRollout:
         if self.failed:
             raise ValueError("Failed provider requires fresh construction and restore")
         self.prompts.validate()
-        if _weights_digest(self.reference) != self.contract.reference_policy_sha256:
+        if _stream_weights_digest(self.reference) != self.contract.reference_policy_sha256:
             raise ValueError("Fixed reference policy changed")
         snapshot.identity.validate()
         if (
@@ -782,7 +857,7 @@ class LocalHFThinkerRollout:
             raise ValueError("Snapshot contract/model semantics mismatch")
         expected_worker = validate_policy_semantics(snapshot.semantics, self.raw, self.cfg)
         _check_weights(snapshot.payload, self.config, self.cfg)
-        if _weights_digest(snapshot.payload) != snapshot.identity.weights_sha256:
+        if _stream_weights_digest(snapshot.payload) != snapshot.identity.weights_sha256:
             raise ValueError("Published canonical payload digest mismatch")
         try:
             if self.worker is None:
@@ -859,7 +934,7 @@ class LocalHFThinkerRollout:
 
     def validate_state_dict(self, state):
         self.prompts.validate()
-        if _weights_digest(self.reference) != self.contract.reference_policy_sha256:
+        if _stream_weights_digest(self.reference) != self.contract.reference_policy_sha256:
             raise ValueError("Fixed reference policy changed")
         if (
             set(state) != {"schema", "semantic", "requests", "cursor", "rng"}
@@ -998,6 +1073,7 @@ def publish_native_single_rank(model, config, cfg, version, contract, semantics)
 
     if not dist.is_initialized() or dist.get_world_size() != 1:
         raise ValueError("Native local HF publisher requires initialized world_size=1")
+    weight_memory_plan(config, cfg)
     shapes = _converter(cfg.scope).parameter_shapes(config)
     if sum(torch.Size(shape).numel() * 4 for shape in shapes.values()) > cfg.max_weight_bytes:
         raise ValueError("Native publication exceeds reviewed weight byte bound")
@@ -1006,11 +1082,11 @@ def publish_native_single_rank(model, config, cfg, version, contract, semantics)
         value = value.detach()
         if isinstance(value, DTensor):
             value = value.full_tensor()
-        localized[name] = value.cpu().clone()
+        localized[name] = value.to(device="cpu", copy=True)
     canonical = to_canonical_model(localized, model)
     _check_weights(canonical, config, cfg)
     return PolicySnapshot(
-        PolicyIdentity(version, _weights_digest(canonical), contract, semantics["sha256"]),
+        PolicyIdentity(version, _stream_weights_digest(canonical), contract, semantics["sha256"]),
         canonical,
         semantics,
     )

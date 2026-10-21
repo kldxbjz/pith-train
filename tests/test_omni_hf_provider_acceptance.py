@@ -45,6 +45,10 @@ def test_actual_prepare_local_hf_tensors_and_cli_plan_no_cuda(tmp_path, monkeypa
     plan = json.loads(capsys.readouterr().out)
     assert (plan["world"], plan["pp"], plan["ep"]) == (4, 2, 2)
     assert plan["gpu_validation"] == "NOT_RUN"
+    assert plan["canonical_fp32_bytes"] == plan["memory_plan"]["canonical_fp32_bytes"]
+    assert plan["memory_plan"]["host_peak_weight_bytes"] == 5 * plan["canonical_fp32_bytes"]
+    assert plan["memory_plan"]["temporary_weight_files"] == 1
+    assert plan["transient_snapshot_conversion_copies"] is False
     assert not torch.cuda.is_initialized()
 
 
