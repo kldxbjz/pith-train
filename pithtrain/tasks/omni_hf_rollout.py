@@ -11,6 +11,7 @@ import importlib.metadata
 import json
 import multiprocessing as mp
 import tempfile
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -149,6 +150,18 @@ def _hf_implementation():
     )
 
 
+def execution_identity():
+    """Bind worker behavior independently of provider/reward source co-location."""
+    return dict(
+        schema=1,
+        torch=str(torch.__version__),
+        transformers=importlib.metadata.version("transformers"),
+        hf=_hf_implementation(),
+        engine=implementation_contract(_Engine),
+        worker=implementation_contract(_WorkerProcess),
+    )
+
+
 def worker_contract(raw, cfg):
     return dict(
         config=_config(raw, cfg.scope).to_dict(),
@@ -157,7 +170,7 @@ def worker_contract(raw, cfg):
         device=cfg.device,
         attention="eager",
         fp32_masters=True,
-        implementation=_hf_implementation(),
+        execution=execution_identity(),
     )
 
 
@@ -626,12 +639,14 @@ def _worker(connection, directory, raw, cfg):
 
 class _WorkerProcess:
     def __init__(self, raw, cfg, reference):
+        deadline = time.monotonic() + cfg.timeout_seconds
         self.cfg = cfg
         self.directory = tempfile.TemporaryDirectory(prefix="pithtrain-hf-rollout-")
         self.process = None
         self.connection = None
         try:
             torch.save(reference, Path(self.directory.name) / "reference.pt")
+            self._remaining(deadline)
             context = mp.get_context("spawn")
             self.connection, child = context.Pipe()
             self.process = context.Process(
@@ -639,33 +654,49 @@ class _WorkerProcess:
             )
             self.process.start()
             child.close()
-            self._wait("ready")
+            self._wait("ready", deadline)
         except BaseException:
             self.close()
             raise
 
-    def _wait(self, expected):
-        if not self.connection.poll(self.cfg.timeout_seconds):
-            self.close()
+    def _remaining(self, deadline):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             raise TimeoutError("Owned HF worker exceeded request deadline; no retry")
-        status, error = self.connection.recv()
-        if status != expected:
+        return remaining
+
+    def _wait(self, expected, deadline):
+        try:
+            if not self.connection.poll(self._remaining(deadline)):
+                raise TimeoutError("Owned HF worker exceeded request deadline; no retry")
+            status, error = self.connection.recv()
+            self._remaining(deadline)
+            if status != expected:
+                raise ValueError(f"Owned HF worker failed: {error}")
+        except BaseException:
             self.close()
-            raise ValueError(f"Owned HF worker failed: {error}")
+            raise
 
     def call(self, command, payload):
         if self.process is None or not self.process.is_alive():
             raise ValueError("HF worker is closed/failed; construct fresh and restore")
-        torch.save(payload, Path(self.directory.name) / "request.pt")
-        self.connection.send(command)
-        self._wait("ok")
-        path = Path(self.directory.name) / "result.pt"
-        if path.stat().st_size > self.cfg.max_result_bytes:
+        # Serialization, IPC and result loading share one elapsed-time budget.
+        deadline = time.monotonic() + self.cfg.timeout_seconds
+        try:
+            torch.save(payload, Path(self.directory.name) / "request.pt")
+            self._remaining(deadline)
+            self.connection.send(command)
+            self._wait("ok", deadline)
+            path = Path(self.directory.name) / "result.pt"
+            if path.stat().st_size > self.cfg.max_result_bytes:
+                raise ValueError("HF result byte limit exceeded")
+            result = torch.load(path, map_location="cpu", weights_only=True)
+            path.unlink()
+            self._remaining(deadline)
+            return result
+        except BaseException:
             self.close()
-            raise ValueError("HF result byte limit exceeded")
-        result = torch.load(path, map_location="cpu", weights_only=True)
-        path.unlink()
-        return result
+            raise
 
     def close(self):
         if self.process is not None:
@@ -728,12 +759,8 @@ class LocalHFThinkerRollout:
             model=self.raw,
             contract=asdict(self.contract),
             eos=eos_token_id,
-            torch=str(torch.__version__),
-            transformers="5.17.0",
-            hf_implementation=_hf_implementation(),
+            execution=execution_identity(),
             implementation=implementation_contract(type(self)),
-            engine=implementation_contract(_Engine),
-            worker=implementation_contract(_WorkerProcess),
         )
         self.requests = self.cursor = 0
         self.rng = torch.Generator().manual_seed(cfg.seed).get_state()

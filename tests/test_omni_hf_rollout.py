@@ -302,6 +302,7 @@ def _wait_forever():
 def test_owned_worker_deadline_terminates_real_process_without_retry():
     import multiprocessing as mp
     import tempfile
+    import time
 
     from pithtrain.tasks.omni_hf_rollout import _WorkerProcess
 
@@ -313,7 +314,7 @@ def test_owned_worker_deadline_terminates_real_process_without_retry():
     process.process = context.Process(target=_wait_forever, daemon=True)
     process.process.start()
     with pytest.raises(TimeoutError, match="no retry"):
-        process._wait("ready")
+        process._wait("ready", time.monotonic() + process.cfg.timeout_seconds)
     assert process.process is None
     assert process.connection is None
     assert not Path(process.directory.name).exists()
@@ -347,3 +348,67 @@ def test_same_shape_policy_semantic_drift_rejected_before_install(tmp_path, chan
         task.rollout.synchronize(task.backend.snapshot(0, task.contract))
     assert task.rollout.worker is None
     assert before == _weights_digest(_cpu_tree(task.backend.model.state_dict()))
+
+
+def test_worker_deadline_includes_serialization_and_result_loading(tmp_path, monkeypatch):
+    """Clock/IPC control simulation; real disk IO, no HF model or worker execution."""
+    import tempfile
+    from types import SimpleNamespace
+
+    from pithtrain.tasks import omni_hf_rollout as provider
+
+    clock = [0.0]
+    monkeypatch.setattr(provider, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    save, load, temporary = torch.save, torch.load, tempfile.TemporaryDirectory
+
+    def slow_save(value, path):
+        save(value, path)
+        clock[0] += 4.0
+
+    def forbidden_spawn(*args):
+        raise AssertionError("Expired serialization must not start a worker")
+
+    monkeypatch.setattr(provider.torch, "save", slow_save)
+    monkeypatch.setattr(provider.mp, "get_context", forbidden_spawn)
+    monkeypatch.setattr(
+        provider.tempfile, "TemporaryDirectory", lambda **kw: temporary(dir=tmp_path, **kw)
+    )
+    cfg = LocalHFRolloutCfg(timeout_seconds=3.0)
+    with pytest.raises(TimeoutError, match="no retry"):
+        provider._WorkerProcess({}, cfg, {"weight": torch.ones(1)})
+    assert list(tmp_path.iterdir()) == []
+
+    sent, polls, closed = [], [], []
+    process = provider._WorkerProcess.__new__(provider._WorkerProcess)
+    process.cfg = cfg
+    process.directory = SimpleNamespace(name=str(tmp_path))
+    process.process = SimpleNamespace(is_alive=lambda: True)
+    process.close = lambda: closed.append(True)
+
+    def poll(remaining):
+        polls.append(remaining)
+        clock[0] += 0.5
+        return True
+
+    process.connection = SimpleNamespace(send=sent.append, poll=poll, recv=lambda: ("ok", None))
+    with pytest.raises(TimeoutError, match="no retry"):
+        process.call("synchronize", {})
+    assert not sent and not polls and closed
+    closed.clear()
+
+    def serialize(value, path):
+        save(value, path)
+        clock[0] += 2.0
+
+    def deserialize(*args, **kwargs):
+        result = load(*args, **kwargs)
+        clock[0] += 1.0
+        return result
+
+    save({"receipt": True}, tmp_path / "result.pt")
+    monkeypatch.setattr(provider.torch, "save", serialize)
+    monkeypatch.setattr(provider.torch, "load", deserialize)
+    with pytest.raises(TimeoutError, match="no retry"):
+        process.call("synchronize", {})
+    assert sent == ["synchronize"] and polls == [1.0] and closed
+    assert not (tmp_path / "result.pt").exists()

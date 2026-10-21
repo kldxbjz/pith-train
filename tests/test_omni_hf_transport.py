@@ -5,8 +5,11 @@ HF sampling and processor/reward/cursor semantics are real.
 """
 
 import copy
+import time
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -93,7 +96,7 @@ def run_transport(rank, world, init, directory, mode):
         prompts, tokens = inputs(Path(directory) / f"{mode}-{rank}")
         reward = ExactAnswerReward(prompts, tokens, dp_rank=dp_rank, dp_size=world // pp_size)
 
-        def construct():
+        def construct(reward_config=None):
             return DistributedHFThinkerRollout(
                 opts,
                 group=dist.group.WORLD,
@@ -104,7 +107,7 @@ def run_transport(rank, world, init, directory, mode):
                 prompts=prompts,
                 reference=reference if rank == 0 else None,
                 eos_token_id=1,
-                reward_config=reward.config,
+                reward_config=reward.config if reward_config is None else reward_config,
             )
 
         active = construct()
@@ -168,6 +171,33 @@ def run_transport(rank, world, init, directory, mode):
             tree_equal(peers[0], peers[1])
         else:
             assert peers[0]["ids"] != peers[1]["ids"]
+        if mode == "dp":
+            # Independent reward config deliberately has no same-file source hash.
+            # This extends the existing real-Gloo case without another worker run.
+            from pithtrain.tasks import omni_hf_rollout as provider
+
+            external_reward = {"kind": "external_reward_fixture"}
+            independent = construct(external_reward)
+            saved = independent.state_dict()
+            assert saved["semantic"]["binding"]["execution"] == provider.execution_identity()
+            assert (
+                provider.worker_contract(raw_config(), opts)["execution"]
+                == provider.execution_identity()
+            )
+            original = provider.implementation_contract
+
+            def changed_engine(value):
+                identity = original(value)
+                if value is provider._Engine:
+                    identity["source_sha256"] = "0" * 64
+                return identity
+
+            with patch.object(provider, "implementation_contract", changed_engine):
+                changed = construct(external_reward)
+                with pytest.raises(ValueError, match="resume semantics"):
+                    changed.load_state_dict(saved)
+                assert changed.worker is None
+            independent.close()
         assert not torch.cuda.is_initialized()
     finally:
         if active is not None:
@@ -198,3 +228,89 @@ def test_metadata_owner_selection_and_replica_drift_fail_closed():
         _ownership([[first], [{**first, "sha256": "different"}, second]], {"weight": (4,)})
     with pytest.raises(ValueError, match="Incomplete"):
         _ownership([[first]], {"weight": (4,)})
+
+
+def run_slow_phase_control(rank, init):
+    """Real Gloo; simulated slow worker control only, not HF/model acceptance."""
+    from pithtrain.modules import omni_hf_transport as transport
+    from pithtrain.modules.resume_semantics import seal
+    from pithtrain.tasks import omni_hf_rollout as provider
+    from pithtrain.tasks.omni_rl import PolicyIdentity, PolicySnapshot, RolloutContract
+
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo", init_method=init, rank=rank, world_size=2, timeout=timedelta(seconds=5)
+    )
+    active = None
+    try:
+        reference = {"weight": torch.ones(1)}
+        digest = _weights_digest(reference)
+        contract = RolloutContract("0" * 64, "0" * 64, "0" * 64, digest, "0" * 64)
+        semantics = seal({"fixture": "control-flow-only"})
+        identity = PolicyIdentity(0, digest, contract, semantics["sha256"])
+        snapshot = PolicySnapshot(identity, reference if rank == 0 else None, semantics)
+        receipt = dict(
+            installed_weights_sha256=digest,
+            reference_weights_sha256=digest,
+            worker_contract={"fixture": "control-flow-only"},
+        )
+        calls = dict(start=0, install=0, close=0)
+
+        class SlowWorker:
+            fail = False
+
+            def __init__(self, *args):
+                calls["start"] += 1
+                time.sleep(3)
+
+            def call(self, command, payload):
+                assert command == "synchronize"
+                calls["install"] += 1
+                if self.fail:
+                    raise TimeoutError("controlled install failure; no retry")
+                time.sleep(3)
+                return receipt
+
+            def close(self):
+                calls["close"] += 1
+
+        active = DistributedHFThinkerRollout.__new__(DistributedHFThinkerRollout)
+        active.cfg = LocalHFRolloutCfg(timeout_seconds=4)
+        active.group = dist.group.WORLD
+        active.prompts = SimpleNamespace(validate=lambda: None)
+        active.raw = {}
+        active.reference = reference if rank == 0 else None
+        active.contract = contract
+        active.failed = False
+        active.worker = None
+        with (
+            patch.object(provider, "_WorkerProcess", SlowWorker),
+            patch.object(
+                transport, "validate_policy_semantics", lambda *args: receipt["worker_contract"]
+            ),
+        ):
+            # Each 3s phase fits the 4s worker budget/5s collective timeout;
+            # the former combined 6s phase times out the follower.
+            assert active.synchronize(snapshot) == identity
+            if rank == 0:
+                active.worker.fail = True
+            with pytest.raises(ValueError, match="controlled install failure"):
+                active.synchronize(snapshot)
+            assert active.failed and active.worker is None
+        peers = [None, None]
+        dist.all_gather_object(peers, calls)
+        assert peers == [dict(start=1, install=2, close=1), dict(start=0, install=0, close=0)]
+        assert not torch.cuda.is_initialized()
+    finally:
+        if active is not None:
+            active.close()
+        dist.destroy_process_group()
+
+
+def test_startup_and_install_have_separate_gloo_deadlines_and_failure_cleanup(tmp_path):
+    mp.spawn(
+        run_slow_phase_control,
+        args=(f"file://{tmp_path / 'slow-phases'}",),
+        nprocs=2,
+        join=True,
+    )

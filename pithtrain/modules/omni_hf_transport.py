@@ -20,7 +20,7 @@ from pithtrain.tasks.omni_hf_rollout import (
     _check_weights,
     _config,
     _converter,
-    _hf_implementation,
+    execution_identity,
     validate_native_runtime,
     validate_policy_semantics,
 )
@@ -331,7 +331,7 @@ class DistributedHFThinkerRollout:
             prompts=prompts.sha256,
             eos=eos_token_id,
             reward=fingerprint(reward_config),
-            hf=_hf_implementation(),
+            execution=execution_identity(),
         )
         bindings = [None] * dist.get_world_size()
         dist.all_gather_object(bindings, fingerprint(binding), group=group)
@@ -417,7 +417,7 @@ class DistributedHFThinkerRollout:
             error = exc
         _agree_error(error, self.group)
 
-        def install():
+        def start():
             if (
                 _weights_digest(self.reference) != self.contract.reference_policy_sha256
                 or _weights_digest(snapshot.payload) != snapshot.identity.weights_sha256
@@ -425,10 +425,14 @@ class DistributedHFThinkerRollout:
                 raise ValueError("Fixed reference/published policy digest differs")
             if self.worker is None:
                 self.worker = _WorkerProcess(self.raw, self.cfg, self.reference)
-            return self.worker.call("synchronize", snapshot.payload)
 
         try:
-            receipt = _leader(install, self.group, 1 << 20)
+            # Followers acknowledge startup before entering the installation wait.
+            # Each collective phase covers at most one worker operation deadline.
+            _leader(start, self.group, 1 << 20)
+            receipt = _leader(
+                lambda: self.worker.call("synchronize", snapshot.payload), self.group, 1 << 20
+            )
             if receipt != dict(
                 installed_weights_sha256=snapshot.identity.weights_sha256,
                 reference_weights_sha256=self.contract.reference_policy_sha256,
