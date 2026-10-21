@@ -115,7 +115,7 @@ def _media_worker(rank, rendezvous, root, reference_file):
 
     with ExitStack() as stack:
         for module, name, counter in (
-            (prepare_omni_data, "verify_bundle", "verify"),
+            (prepare_omni_data, "read_verified_bundle", "verify"),
             (prepare_omni_data, "processor_for", "processor"),
             (qwen3_omni_data, "create_omni_dataloader", "loader"),
         ):
