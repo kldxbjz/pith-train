@@ -207,10 +207,13 @@ def train_step(cfg: PretrainLMCfg, dataset: ConcatDataset, step: int) -> None:
 
     cp_size = distributed.cp_size
     if distributed.pp_rank == 0:
-        loss = torch.stack(objective_outputs).sum() / num_tokens
-        if cp_size > 1:
-            torch.distributed.all_reduce(loss, group=distributed.cp_group)
-            loss /= cp_size
+        # Log the same global token mean that scales the gradients. Each
+        # objective output is detached; this reduction only affects reporting.
+        loss = torch.stack(objective_outputs).sum()
+        if dp_size * cp_size > 1:
+            token_group = distributed.attn_mesh["dp", "cp"]._flatten().get_group()
+            torch.distributed.all_reduce(loss, group=token_group)
+        loss /= num_tokens * dp_size * cp_size
 
     # The one gradient normalization. FSDP reduces with a plain sum (see apply_fsdp), so dividing
     # by the global token count leaves every parameter, attn or expt, at the token-weighted mean.
