@@ -200,10 +200,12 @@ def test_existing_examples_use_shared_text_config(monkeypatch, model):
 
 
 @pytest.mark.parametrize(
-    "arguments,format,kinds",
+    "script,arguments,format,kinds",
     [
-        ([], "prepared_bundle", ("text",)),
+        ("qwen3-omni-thinker-text", [], "token_bin", ("text",)),
+        ("qwen3-omni", [], "prepared_bundle", ("text",)),
         (
+            "qwen3-omni",
             [
                 "--modalities",
                 "text",
@@ -216,14 +218,14 @@ def test_existing_examples_use_shared_text_config(monkeypatch, model):
             "prepared_bundle",
             ("text", "image"),
         ),
-        (["--data-format", "token_bin"], "token_bin", ("text",)),
+        ("qwen3-omni", ["--data-format", "token_bin"], "token_bin", ("text",)),
     ],
 )
 def test_qwen_omni_example_cli_builds_one_data_config(
-    monkeypatch, tmp_path, arguments, format, kinds
+    monkeypatch, tmp_path, script, arguments, format, kinds
 ):
     calls = example_modules(monkeypatch)
-    path = ROOT / "examples/pretrain_lm/qwen3-omni/script.py"
+    path = ROOT / f"examples/pretrain_lm/{script}/script.py"
     monkeypatch.setattr(
         sys,
         "argv",
@@ -233,7 +235,7 @@ def test_qwen_omni_example_cli_builds_one_data_config(
             str(tmp_path),
             "--model",
             "model-config",
-            "--checkpoint",
+            "--checkpoints" if script == "qwen3-omni-thinker-text" else "--checkpoint",
             str(tmp_path / "ckpt"),
             *arguments,
         ],
@@ -243,6 +245,7 @@ def test_qwen_omni_example_cli_builds_one_data_config(
     cfg = calls[0]
     assert cfg.data.dataset == tmp_path and cfg.data.format == format
     assert cfg.data.modalities == kinds
+    assert not hasattr(cfg, "__dict__") and not hasattr(cfg, "dataset")
     cfg.data.validate()
 
 
