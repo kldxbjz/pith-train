@@ -207,13 +207,30 @@ def hf_codec(model, condition, batch, *, max_frames=CODEC_FRAMES, logits_process
     return SimpleNamespace(codes=codes, code_lengths=lengths, reached_eos=reached, waveforms=waves)
 
 
+@contextmanager
+def generation_attention_policy(thinker):
+    """Inject kernel kwargs at forward, after official generate validates inputs."""
+    from tests.acceptance.omni_reference_attention import reference_attention_kwargs
+
+    policy = reference_attention_kwargs(thinker)
+
+    def inject(module, args, kwargs):
+        if any(key in kwargs and kwargs[key] != value for key, value in policy.items()):
+            raise ValueError("Generation attention policy conflicts with reference contract")
+        return args, dict(kwargs, **policy)
+
+    handle = thinker.register_forward_pre_hook(inject, with_kwargs=True)
+    try:
+        yield
+    finally:
+        handle.remove()
+
+
 def hf_generate(model, batch, *, eos_id=None, text_tokens=TEXT_TOKENS, codec_frames=CODEC_FRAMES):
     """Invoke the unmodified official composite, including its conditioning state machine."""
     from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
         Qwen3OmniMoeForConditionalGeneration as HFComposite,
     )
-
-    from tests.acceptance.omni_reference_attention import reference_attention_kwargs
 
     if type(model) is not HFComposite:
         raise TypeError("Generation reference must be the actual official HF composite class")
@@ -266,13 +283,8 @@ def hf_generate(model, batch, *, eos_id=None, text_tokens=TEXT_TOKENS, codec_fra
         ],
         return_audio=True,
     )
-    options.update(
-        {
-            f"thinker_{key}": value
-            for key, value in reference_attention_kwargs(model.thinker).items()
-        }
-    )
     with (
+        generation_attention_policy(model.thinker),
         observe_method(model.thinker, "generate", thinker),
         observe_method(model.talker, "generate", talker),
         observe_method(model.code2wav, "chunked_decode", decoder),
