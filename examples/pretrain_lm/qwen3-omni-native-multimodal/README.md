@@ -23,6 +23,20 @@ torchrun --standalone --nproc-per-node=4 \
   --modalities text image audio video --global-batch-size 8 --pp 2 --ep 2
 ```
 
+To start from HF weights, first convert the **complete Thinker** weights to the
+canonical DCP format, then add `--initialize-from /path/to/converted-dcp-root`
+(`--initialize-step 0` is the default source checkpoint). The output `--checkpoint`
+must contain no existing checkpoint. This loads model tensors only: optimizer,
+scheduler, configured-seed RNG, prepared-data cursor and training step start fresh.
+The source checkpoint step is an identifier, not the new run's step.
+
+To resume, keep the output `--checkpoint` and omit both initialization arguments.
+The recipe still requires strict same-topology model/optimizer/scheduler/RNG/data
+recovery. A model-only checkpoint cannot satisfy resume; specifying initialization
+alongside an existing output checkpoint fails before training setup. A strict
+rank-local checkpoint must be exported to canonical model weights before using
+it as a new run's initialization source.
+
 Current supported layout: BF16, CP=1, one unpadded document per microbatch, AdamW
 with strict same-topology resume. PP/EP remain the existing staged decoder paths.
 FP8, packing, padding and CP>1 fail explicitly. Talker and speech output are

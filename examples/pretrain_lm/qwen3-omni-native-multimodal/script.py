@@ -9,7 +9,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True, help="Full composite Thinker config")
-    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--checkpoint", type=Path, required=True, help="Output / strict resume root"
+    )
+    parser.add_argument(
+        "--initialize-from", type=Path, help="Canonical DCP root: load model weights into a new run"
+    )
+    parser.add_argument(
+        "--initialize-step", type=int, default=0, help="Source DCP step (default: 0)"
+    )
     parser.add_argument(
         "--modalities",
         nargs="+",
@@ -41,12 +49,15 @@ def main():
         or args.lr <= 0
     ):
         parser.error("Sizes, steps, parallelism and learning rate must be positive")
+    if args.initialize_step < 0 or (args.initialize_from is None and args.initialize_step != 0):
+        parser.error("--initialize-step must be nonnegative and requires --initialize-from")
     if args.epoch_samples % args.global_batch_size:
         parser.error("--epoch-samples must be a multiple of --global-batch-size")
     from pithtrain.modules.training import make_adamw_optimizer, make_constant_scheduler
     from pithtrain.tasks.pretrain_lm import PretrainLMCfg, launch
 
     cfg = PretrainLMCfg()
+    cfg.initialize_from, cfg.initialize_step = args.initialize_from, args.initialize_step
     cfg.data.dataset, cfg.data.format = args.dataset, "prepared_bundle"
     cfg.data.modalities = tuple(args.modalities)
     cfg.data.sampling_weights, cfg.data.epoch_samples = args.sampling_weights, args.epoch_samples
