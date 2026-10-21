@@ -386,3 +386,124 @@ def test_update_delta_gate_keeps_all_rows_when_one_parameter_is_nonfinite():
 def test_model_setup_failure_is_attempted_failure_not_unrun_precondition():
     report = gate.failure_report("model_setup", RuntimeError("out of memory"))
     assert report["status"] == "FAIL" and report["gpu_acceptance"] == "FAIL_THIS_GATE"
+
+
+def test_hf_chain_audio_vjp_uses_official_single_codebook_reduction(request):
+    """CPU arithmetic regression, not native/CUDA numerical acceptance.
+
+    A second forward replaces only the teacher-forced codec prefix with the
+    official concatenation/single-reduction expression, independently using
+    HF's tables and assistant-conditioning helper. All audio gradients must
+    remain exact, including the near-null key-projection biases.
+    """
+    from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
+        Qwen3OmniMoeForConditionalGeneration as HFComposite,
+    )
+
+    from tests.test_omni_speech_hidden_states import config as text_config
+    from tests.test_qwen3_omni_multimodal import context
+
+    rng, threads = torch.get_rng_state(), torch.get_num_threads()
+    request.addfinalizer(lambda: torch.set_rng_state(rng))
+    request.addfinalizer(lambda: torch.set_num_threads(threads))
+    torch.set_num_threads(1)
+    torch.manual_seed(gate.SEED)
+    released = json.loads(
+        (gate.REPO / "tests/configs/qwen3_omni_full/released-config.json").read_text()
+    )
+    thinker, inputs = context("audio")
+    thinker.text_config = text_config()
+    thinker.text_config.vocab_size = 256
+    released.update(
+        im_start_token_id=100,
+        user_token_id=101,
+        assistant_token_id=102,
+        tts_bos_token_id=200,
+        tts_eos_token_id=201,
+        tts_pad_token_id=202,
+    )
+    cfg = gate.tiny_config(thinker, released)
+    model = gate.ComputeModel(gate.HFChain(cfg)).eval()
+    sample = gate.make_sample(SimpleNamespace(model_inputs=inputs), cfg, 2)
+    results = []
+    for replace_with_official in (False, True):
+        model.zero_grad(set_to_none=True)
+        observed = {}
+
+        def audio_hook(module, args, output):
+            output.last_hidden_state.retain_grad()
+            observed["audio"] = output.last_hidden_state
+
+        def thinker_hook(module, args, output):
+            observed["thinker"] = output
+
+        def trunk_hook(module, args, kwargs):
+            # Compute the official per-frame expression separately from the
+            # HFChain implementation, under the same BF16 functional weights.
+            codes = sample["codes"]
+            batch, frames, groups = codes.shape
+            flat = codes.reshape(batch * frames, groups)
+            talker = model.talker
+            embedded = [talker.get_input_embeddings()(flat[:, :1])]
+            embedded += [
+                table(flat[:, i + 1 : i + 2])
+                for i, table in enumerate(talker.code_predictor.get_input_embeddings())
+            ]
+            previous = torch.cat(embedded, dim=1).sum(1).reshape(batch, frames, -1)
+            specials = sample["input_ids"].new_tensor(
+                [[cfg.tts_bos_token_id, cfg.tts_eos_token_id, cfg.tts_pad_token_id]]
+            )
+            bos, eos, pad = talker.text_projection(
+                model.thinker.get_input_embeddings()(specials)
+            ).chunk(3, 1)
+            _, _, tail = HFComposite._get_talker_assistant_parts(
+                model.model,
+                sample["prompt_lengths"][0] - 3,
+                sample["input_ids"].shape[1],
+                cfg.talker_config.speaker_id["ethan"],
+                observed["thinker"].hidden_states[0],
+                pad,
+                bos,
+                eos,
+            )
+            expected = previous + torch.cat((tail, pad.expand(-1, frames, -1)), 1)[:, :frames]
+            actual = kwargs["inputs_embeds"][:, -frames:]
+            observed["prefix_matches"] = torch.equal(actual, expected)
+            if replace_with_official:
+                kwargs = dict(
+                    kwargs,
+                    inputs_embeds=torch.cat((kwargs["inputs_embeds"][:, :-frames], expected), 1),
+                )
+                return args, kwargs
+
+        hooks = [
+            model.thinker.audio_tower.register_forward_hook(audio_hook),
+            model.thinker.register_forward_hook(thinker_hook),
+            model.talker.model.register_forward_pre_hook(trunk_hook, with_kwargs=True),
+        ]
+        try:
+            batch = gate.move(sample, torch.device("cpu"), gradients=True)
+            positional, kwargs = gate.speech_args(batch)
+            output = model(*positional, **kwargs)
+            value, count, text_value, text_count = gate.loss_terms(output, batch["labels"])
+            (value / count + text_value / text_count).backward()
+            assert observed["prefix_matches"], (
+                "HFChain codebook prefix differs from official BF16 reduction"
+            )
+            results.append(
+                dict(
+                    outputs=(output.first_logits.detach(), output.residual_logits.detach()),
+                    cotangent=observed["audio"].grad.clone(),
+                    gradients={
+                        name: p.grad.clone()
+                        for name, p in model.thinker.audio_tower.named_parameters()
+                    },
+                )
+            )
+        finally:
+            for hook in hooks:
+                hook.remove()
+    gate.exact(results[0], results[1])
+    assert all(torch.isfinite(value).all() for value in results[0]["gradients"].values())
+    assert all(f"layers.{i}.self_attn.k_proj.bias" in results[0]["gradients"] for i in range(2))
+    assert not torch.cuda.is_initialized()
