@@ -237,17 +237,16 @@ def test_training_preparation_splits_resume_and_integrity(tmp_path, processor_co
     assert (Path(cfg.output) / "tokens/train/00000.bin").exists()
     assert (Path(cfg.output) / "tokens/validation/00000.bin").exists()
     assert prep.launch(cfg) == bundle
-    # The GPU batch checker consumes this same train-only export; verify its file
-    # reference path on CPU without importing CUDA-dependent training modules.
-    import runpy
-
-    read_reference = runpy.run_path(str(Path(__file__).with_name("test_pretrain_data.py")))[
-        "read_text_reference"
+    # Check the real writer's token export independently of the training reader.
+    tokenizer = processor_config[0].tokenizer
+    documents = [
+        tokenizer.encode(f"Text for {name}.") + [tokenizer.eos_token_id] for name in ("one", "two")
     ]
-    inputs, labels, metadata = read_reference(cfg.output, 4)
-    assert len(inputs) > 0 and inputs.shape == labels.shape
-    torch.testing.assert_close(inputs[:, 1:], labels[:, :-1])
-    assert metadata["vocab_size"] == processor_config[1].text_config.vocab_size
+    with (Path(cfg.output) / "tokens/train/00000.bin").open("rb") as stream:
+        tokens, ends = np.load(stream), np.load(stream)
+    assert tokens.dtype == np.uint32
+    np.testing.assert_array_equal(tokens, np.concatenate(documents))
+    np.testing.assert_array_equal(ends, np.cumsum([len(doc) for doc in documents]))
     processor, config = processor_config
     loader = create_omni_dataloader(cfg.output, processor, config, stage="text", split="validation")
     assert [sample_id for batch in loader for sample_id in batch.sample_ids] == ["three"]

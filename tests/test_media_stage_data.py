@@ -21,8 +21,6 @@ from pithtrain.modules.microbatch import Microbatch
 from pithtrain.modules.qwen3_omni_data import create_omni_dataloader
 from pithtrain.modules.training_data import OmniPretrainData
 from tests import test_omni_training as fixtures
-from tests.omni_media_audit import MediaAudit
-from tests.test_omni_training_acceptance import media_kind
 
 manifest = fixtures.manifest
 training_bundle = fixtures.training_bundle
@@ -42,7 +40,6 @@ def configs(root, kinds):
 
 def assert_batches(batches, expected, owns_media):
     for actual, reference in zip(batches, expected, strict=True):
-        media_kind(actual, 0 if owns_media else 1)
         assert actual.sample_ids == reference["sample_ids"]
         torch.testing.assert_close(actual.objective_inputs[0], reference["labels"], rtol=0, atol=0)
         all_inputs = reference["inputs"]
@@ -79,6 +76,7 @@ def _media_worker(rank, rendezvous, root, reference_file):
     counters = dict(verify=0, processor=0, loader=0, headers=0, tensors=0)
     original_object_broadcast = dist.broadcast_object_list
     original_tensor_broadcast = dist.broadcast
+    pending_specs = []
 
     def owner_only(name, function):
         def checked(*args, **kw):
@@ -98,6 +96,7 @@ def _media_worker(rank, rendezvous, root, reference_file):
                 no_tensors(item)
 
     def object_broadcast(message, **kw):
+        assert not pending_specs, "Previous batch did not broadcast every shared tensor"
         assert kw["group"] is group and kw["src"] == dp_rank
         no_tensors(message)
         original_object_broadcast(message, **kw)
@@ -106,10 +105,15 @@ def _media_worker(rank, rendezvous, root, reference_file):
         if error is None and isinstance(value, tuple) and isinstance(value[0], tuple):
             _, specs = value
             assert not PAYLOADS & {name for name, _, _ in specs}
+            assert specs and len({name for name, _, _ in specs}) == len(specs)
+            pending_specs.extend(specs)
         counters["headers"] += 1
 
     def tensor_broadcast(tensor, **kw):
         assert kw["group"] is group and kw["src"] == dp_rank
+        assert pending_specs, "Unexpected tensor broadcast outside the shared header"
+        _, shape, dtype = pending_specs.pop(0)
+        assert tuple(tensor.shape) == shape and tensor.dtype == dtype
         counters["tensors"] += 1
         return original_tensor_broadcast(tensor, **kw)
 
@@ -124,8 +128,6 @@ def _media_worker(rank, rendezvous, root, reference_file):
             )
         stack.enter_context(patch.object(dist, "broadcast_object_list", object_broadcast))
         stack.enter_context(patch.object(dist, "broadcast", tensor_broadcast))
-        audit = MediaAudit(pp_rank, 2, group)
-        audit.install(stack, OmniPretrainData, prepare_omni_data, qwen3_omni_data, dist)
         for mode, kinds in enumerate(MODES):
             cfg, tc = configs(root, kinds)
             data = OmniPretrainData(cfg, tc, **kwargs)
@@ -157,12 +159,6 @@ def _media_worker(rank, rendezvous, root, reference_file):
                 restored.commit_step(step)
             assert restored.state_dict() == data.state_dict()
 
-        audit_report = audit.finish_data(
-            providers=2 * len(MODES), validations=len(MODES), expected_batches=10 * len(MODES)
-        )
-        (Path(rendezvous).parent / f"media-audit-rank{rank}.json").write_text(
-            json.dumps(audit_report)
-        )
         cfg, tc = configs(root, ("image",))
         failed = OmniPretrainData(cfg, tc, **kwargs)
 
@@ -187,6 +183,7 @@ def _media_worker(rank, rendezvous, root, reference_file):
         with pytest.raises(RuntimeError, match="Dataset hash mismatch"):
             OmniPretrainData(cfg, tc, **kwargs)
 
+    assert not pending_specs
     assert all(counters[name] > 0 for name in ("headers", "tensors"))
     assert all((counters[name] > 0) == (pp_rank == 0) for name in ("verify", "processor", "loader"))
     assert not torch.cuda.is_initialized()

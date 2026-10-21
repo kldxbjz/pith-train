@@ -135,10 +135,13 @@ def test_task_routes_storage_format_with_identical_text_batches(text_bundle, mon
     root, training = text_bundle
     # Model-capability checking is exercised separately with real processor config.
     checks = []
+    group = object()
+    ranks = dict(dp_rank=1, dp_size=2, cp_rank=1, cp_size=2, pp_rank=1, pp_size=2, pp_group=group)
     monkeypatch.setattr(OmniPretrainData, "validate_model", lambda self, *args: checks.append(args))
     task = task_config(
         AutoConfig=SimpleNamespace(from_pretrained=lambda path: path),
         model_class_for_config=lambda cfg: "Model",
+        distributed=SimpleNamespace(**ranks),
     )
     cfg = task.PretrainLMCfg()
     cfg.training = training
@@ -149,6 +152,9 @@ def test_task_routes_storage_format_with_identical_text_batches(text_bundle, mon
     cfg.data.dataset, cfg.data.format = root, "prepared_bundle"
     prepared = task.setup_dataset(cfg)
     assert isinstance(prepared, OmniPretrainData) and checks == [("Model", "model-config")]
+    for key, value in ranks.items():
+        provider = prepared._dense if key.startswith("cp_") else prepared
+        assert getattr(provider, key) == value
     torch.testing.assert_close(
         text_fixtures.tensors(prepared.get_batch(0, "cpu")),
         text_fixtures.tensors(dense.get_batch(0, "cpu")),
@@ -240,31 +246,3 @@ def test_qwen_omni_example_cli_builds_one_data_config(
     assert cfg.data.dataset == tmp_path and cfg.data.format == format
     assert cfg.data.modalities == kinds
     cfg.data.validate()
-
-
-def test_task_passes_pipeline_ownership_to_prepared_provider(tmp_path):
-    group = object()
-    calls = []
-
-    class Provider:
-        def __init__(self, cfg, training, **ranks):
-            calls.append(ranks)
-
-        def validate_model(self, model, config):
-            assert model == "TestModel" and config == "native-config"
-
-    task = task_config(
-        OmniPretrainData=Provider,
-        distributed=SimpleNamespace(
-            dp_rank=1, dp_size=2, cp_rank=0, cp_size=1, pp_rank=1, pp_size=2, pp_group=group
-        ),
-        AutoConfig=SimpleNamespace(from_pretrained=lambda _: "native-config"),
-        model_class_for_config=lambda _: "TestModel",
-    )
-    cfg = task.PretrainLMCfg()
-    cfg.data.dataset, cfg.data.format = tmp_path, "prepared_bundle"
-    cfg.training.model = "model-path"
-    assert isinstance(task.setup_dataset(cfg), Provider)
-    assert calls == [
-        dict(dp_rank=1, dp_size=2, cp_rank=0, cp_size=1, pp_rank=1, pp_size=2, pp_group=group)
-    ]
