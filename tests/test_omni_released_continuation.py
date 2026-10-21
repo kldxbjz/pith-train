@@ -212,3 +212,29 @@ def test_actual_tiny_hf_public_converter_config(tmp_path):
     result = driver.inspect_initialization_dcp(converted, tiny.parameter_shapes(config))
     assert result["keys"] == len(tiny.parameter_shapes(config))
     assert not torch.cuda.is_initialized()
+
+
+@pytest.mark.parametrize("length", [512, 2048])
+def test_prepared_sequence_contract_preserves_original_recipe(tmp_path, length):
+    bundle = {"recipe": {"batch": {"max_length": 2048, "max_video_frames": 64}}}
+    path = tmp_path / "bundle.json"
+    before = json.dumps(bundle).encode()
+    path.write_bytes(before)
+    result = driver.validate_dataset_sequence_length(tmp_path, length)
+    assert result["prepared_max_length"] == 2048
+    assert result["requested_sequence_length"] == length
+    assert result["truncation"] is result["preprocessing_overrides"] is False
+    assert result["gpu_peak_memory"] == "NOT_ESTABLISHED_BY_SEQUENCE_CONTRACT"
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "declared,requested",
+    [(512, 513), (2048, 2049), (4096, 2048), (True, 1), (2048, True), (2048, 0), (2048, 2048.0)],
+)
+def test_prepared_sequence_contract_rejects_unbound_length(tmp_path, declared, requested):
+    (tmp_path / "bundle.json").write_text(
+        json.dumps({"recipe": {"batch": {"max_length": declared}}})
+    )
+    with pytest.raises(AssertionError):
+        driver.validate_dataset_sequence_length(tmp_path, requested)

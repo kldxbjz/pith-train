@@ -687,6 +687,7 @@ def run_gpu(args):
         global_batch=data.global_batch_size,
         micro_batch=data.micro_batch_size,
         sequence_length=data.sequence_length,
+        sequence_contract=validate_dataset_sequence_length(args.dataset, args.sequence_length),
         attention_dp=4,
         context_parallel=1,
         sample_ids="COMPLETE_PER_STEP_BATCH_RECORDS",
@@ -815,6 +816,25 @@ def run_gpu(args):
         )
 
 
+def validate_dataset_sequence_length(dataset, sequence_length):
+    """Honor the prepared corpus contract without truncating or resampling it.
+
+    The original public bundle allows 2048 tokens. Its complete native video
+    epoch exceeds the old fixed-first-fixture 512 limit. This is a data bound,
+    not evidence that the enlarged workload fits a GPU memory/time envelope.
+    """
+    declared = read_json(Path(dataset) / "bundle.json")["recipe"]["batch"]["max_length"]
+    assert type(declared) is int and 0 < declared <= 2048
+    assert type(sequence_length) is int and 0 < sequence_length <= declared
+    return dict(
+        prepared_max_length=declared,
+        requested_sequence_length=sequence_length,
+        preprocessing_overrides=False,
+        truncation=False,
+        gpu_peak_memory="NOT_ESTABLISHED_BY_SEQUENCE_CONTRACT",
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("phase", choices=("prepare", "produce", "restore"))
@@ -862,7 +882,7 @@ def main():
     else:
         assert args.modality and args.dataset and args.prepared and args.prepared_sha256
         assert args.data_epoch_policy is not None
-        assert 0 < args.sequence_length <= 512
+        validate_dataset_sequence_length(args.dataset, args.sequence_length)
         if args.phase == "restore":
             assert args.producer and args.producer_sha256
             assert args.phase_seconds >= args.initialization_seconds + args.load_seconds + 600
