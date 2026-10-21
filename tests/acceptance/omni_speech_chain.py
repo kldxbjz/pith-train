@@ -506,9 +506,10 @@ class HFChain(nn.Module):
             table(codes[..., i + 1])
             for i, table in enumerate(self.talker.code_predictor.model.codec_embedding)
         ]
-        previous = embeddings[0]
-        for value in embeddings[1:]:
-            previous = previous + value
+        # Official Talker.prepare_inputs_for_generation concatenates all
+        # codebook rows and reduces once. Sequential BF16 additions round at
+        # every group and alter the upstream Thinker/audio cotangent.
+        previous = torch.stack(embeddings, dim=-2).sum(dim=-2)
         trailing = torch.cat((tail, pad.expand(-1, frames, -1)), 1)[:, :frames]
         combined = torch.cat((prefix, previous + trailing), 1)
         extra = pos.amax().to(pos.dtype) + torch.arange(
