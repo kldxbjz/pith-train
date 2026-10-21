@@ -1,4 +1,4 @@
-"""Check production eager text stage5 and its explicit CPU fullgraph control.
+"""Check production compiled text stage5 and its eager arithmetic body.
 
 Extracting these pure methods avoids unrelated CUDA-only kernel imports. The
 production bodies are executed without replacement in both controls.
@@ -37,10 +37,11 @@ def test_text_stage5_fullgraph_output_and_all_gradients(is_moe, ep):
         expected = residual + output
     values = (residual, output, weights) if is_moe else (residual, output)
     expected_grads = torch.autograd.grad(expected.square().sum(), values)
-    compiled = torch.compile(
-        layer.forward_stage5, fullgraph=True, options={"emulate_precision_casts": True}
-    )
-    for call in (layer.forward_stage5, compiled):
+
+    def eager(*args):
+        return type(layer).forward_stage5.__wrapped__(layer, *args)
+
+    for call in (eager, layer.forward_stage5):
         actual = call(output, indexes if is_moe else None, weights, residual)
         torch.testing.assert_close(actual, expected, rtol=1e-5, atol=2e-6)
         actual_grads = torch.autograd.grad(actual.square().sum(), values)

@@ -238,15 +238,21 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
             config.hidden_size, config.rms_norm_eps
         )
 
-    # Preserve eager text forward/backward arithmetic. Compiled reductions can
-    # perturb gradients returned to the audio encoder despite retained BF16 casts.
-    def forward_stage1_compute(
-        self, hidden_states, rotary_posemb, cu_seqlens=None, replay_idx=None
-    ):
+    @torch.compile(fullgraph=True, options={"emulate_precision_casts": True})
+    def _forward_stage1_normalize(self, hidden_states, rotary_posemb, cu_seqlens=None):
         residual = hidden_states + self.self_attn(
             self.input_layernorm(hidden_states), rotary_posemb, cu_seqlens
         )
-        hidden_states = self.post_attention_layernorm(residual)
+        return self.post_attention_layernorm(residual), residual
+
+    def forward_stage1_compute(
+        self, hidden_states, rotary_posemb, cu_seqlens=None, replay_idx=None
+    ):
+        hidden_states, residual = self._forward_stage1_normalize(
+            hidden_states, rotary_posemb, cu_seqlens
+        )
+        # Keep routing outside the compiled region: fusing its BF16 probability
+        # boundary changed routes/VJPs in the retained seed739 regression.
         routing = self.mlp.gate(hidden_states, replay_idx) if self.is_moe else (None, None, None)
         return hidden_states, residual, *routing
 
@@ -273,7 +279,7 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
             distributed.ep_size,
             self.mlp.experts_per_rank,
             distributed.ep_group,
-            deterministic=True,
+            deterministic=training.deterministic_token_layout,
         )
         return tokens, residual, routing
 
@@ -283,7 +289,10 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
         if distributed.ep_size > 1:
             gathered_tokens = padded_index_gather(gathered_tokens, expand_idx)
         tokens, reverse, offs, ks, sizes = scatter_for_grouped_gemm(
-            gathered_tokens, expert_idxs, self.mlp.experts_per_rank, deterministic=True
+            gathered_tokens,
+            expert_idxs,
+            self.mlp.experts_per_rank,
+            deterministic=training.deterministic_token_layout,
         )
         return padded_index_gather(self.mlp.experts(tokens, offs, ks, sizes), reverse)
 
@@ -300,7 +309,7 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
         result.scatter_add_(0, token_indices[:, None].expand_as(weighted), weighted)
         return residual + result.view_as(residual)
 
-    # Keep the expert/residual boundary under the same eager precision policy.
+    @torch.compile(fullgraph=True, options={"emulate_precision_casts": True})
     def forward_stage5(self, moe_outs, moe_local_idxs, topk_weight, residual):
         return self._forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
 

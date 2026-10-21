@@ -204,7 +204,7 @@ class TrainingCfg(SlottedDefault):
     """
 
     deterministic: bool = False
-    """Request PyTorch/cuDNN and FA4 deterministic policies without checkpoint features.
+    """Request PyTorch/cuDNN, FA4 and stable Omni token-layout policies.
 
     This independent numerical setting lets baseline and strict-resume runs use
     identical compute policies. Strict resume also enables it implicitly.
@@ -589,6 +589,7 @@ def setup_training(cfg: object) -> None:
         getattr(cfg.training, "deterministic", False)
         or getattr(cfg.training, "strict_resume", False)
     )
+    training.deterministic_token_layout = training.deterministic_attention
     configure_deterministic_training(training.deterministic_attention)
     setup_model(cfg.training, cfg.distributed)
     training.optimizers = cfg.training.optimizer(cfg.training)

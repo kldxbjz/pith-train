@@ -1,4 +1,4 @@
-"""Production text eager stages and compiled controls preserve BF16 arithmetic.
+"""Production compiled regions and the eager router preserve BF16 arithmetic.
 
 Stage5 executes its complete original body. Stage1 fixes the attention output
 to isolate residual, norm and routing arithmetic; it is not FA4 acceptance.
@@ -46,12 +46,7 @@ def test_compiled_stage5_preserves_bf16_output_and_every_input_gradient(is_moe, 
     indexes = torch.arange(138) if is_moe else None
     production = type(layer).forward_stage5
     reference = reference_text_stage5
-    calls = [production]
-    # Retain the previous CPU compiled-operator coverage as a separate
-    # control; the production text entry itself now executes eagerly.
-    calls.append(
-        torch.compile(production, fullgraph=True, options={"emulate_precision_casts": True})
-    )
+    calls = [production.__wrapped__, production]
     expected, target_gradients = value_and_grads(reference, layer, sources, indexes, cotangent)
     for call in calls:
         actual, gradients = value_and_grads(call, layer, sources, indexes, cotangent)
@@ -70,7 +65,7 @@ def controlled_stage1_type():
     )
     load_definitions(
         path,
-        ("forward_stage1_compute",),
+        ("_forward_stage1_normalize", "forward_stage1_compute"),
         namespace,
         class_name="Qwen3OmniMoeThinkerTextDecoderLayer",
     )
@@ -100,6 +95,7 @@ def controlled_stage1_type():
             ).to(torch.bfloat16)
             nn.init.normal_(self.mlp.gate.weight, std=0.02)
 
+    ControlledLayer._forward_stage1_normalize = namespace["_forward_stage1_normalize"]
     ControlledLayer.forward_stage1_compute = namespace["forward_stage1_compute"]
     return ControlledLayer
 

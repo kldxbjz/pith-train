@@ -49,4 +49,5 @@ def runtime_determinism_snapshot() -> dict:
         float32_matmul_precision=torch.get_float32_matmul_precision(),
         cublas_workspace_config=os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
         fa4_deterministic=training.deterministic_attention,
+        token_layout_deterministic=training.deterministic_token_layout,
     )

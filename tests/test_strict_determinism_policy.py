@@ -130,6 +130,7 @@ def test_setup_training_applies_policy_before_constructing_model(
                 torch.backends.cudnn.benchmark,
                 torch.backends.cudnn.deterministic,
                 runtime.deterministic_attention,
+                runtime.deterministic_token_layout,
             )
         ),
         configure_deterministic_training,
@@ -140,13 +141,14 @@ def test_setup_training_applies_policy_before_constructing_model(
         cfg.training.deterministic = deterministic
     setup(cfg)
     enabled = bool(strict or deterministic)
-    assert seen == [(enabled, not enabled, enabled, enabled)]
+    assert seen == [(enabled, not enabled, enabled, enabled, enabled)]
 
 
 def test_rank_snapshot_is_whitelisted_read_only_and_json_serializable(monkeypatch):
     monkeypatch.setenv("UNRELATED_TEST_SECRET", "must-not-appear")
     monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     monkeypatch.setattr(training, "deterministic_attention", True)
+    monkeypatch.setattr(training, "deterministic_token_layout", True)
     actual = runtime_determinism_snapshot()
     assert set(actual) == {
         "deterministic_algorithms",
@@ -158,9 +160,11 @@ def test_rank_snapshot_is_whitelisted_read_only_and_json_serializable(monkeypatc
         "float32_matmul_precision",
         "cublas_workspace_config",
         "fa4_deterministic",
+        "token_layout_deterministic",
     }
     assert actual["cublas_workspace_config"] == ":4096:8"
     assert actual["fa4_deterministic"] is True
+    assert actual["token_layout_deterministic"] is True
     assert "must-not-appear" not in json.dumps(actual)
     assert runtime_determinism_snapshot() == actual
 
