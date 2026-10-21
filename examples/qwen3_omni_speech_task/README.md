@@ -209,3 +209,48 @@ OMP_NUM_THREADS=1 python -m pytest -q \
   tests/test_omni_sft_task.py \
   tests/test_omni_speech_task.py
 ```
+
+
+## Independent generation from a native speech checkpoint
+
+`read_speech_generation_state` reads the complete native model from a committed
+DP-only speech task-v2 checkpoint. Run it in a separate generation process with
+the same model configuration, implementation and numerical attributes. Construct
+the complete native `Qwen3OmniMoeSpeechModel` on `meta`, with the same trainable
+component settings as the checkpoint, before reading. The caller supplies the
+manifest SHA from its completed checkpoint receipt and explicit host/file caps.
+
+```python
+from pithtrain.modules.omni_speech_generation_checkpoint import read_speech_generation_state
+
+# model is a fresh complete native meta model; no FSDP wrapping in this process.
+state, receipt = read_speech_generation_state(
+    model, committed_checkpoint_directory,
+    expected_manifest_sha256=completed_checkpoint_manifest_sha256,
+    max_state_bytes=planned_full_fp32_model_bytes,
+    max_rank_file_bytes=planned_largest_rank_file_bytes,
+)
+model.load_state_dict(state, strict=True, assign=True)
+del state
+model.to(device=device).eval()  # Retain FP32 masters and the existing BF16 compute path.
+result = model.generate(
+    input_ids, model_context, max_text_tokens=max_new_tokens,
+    max_codec_frames=max_codec_frames, do_sample=False,
+)
+```
+
+The reader validates every rank and all model tensor layouts/checksums before
+allocating the owned full CPU state. It checks the files again while assembling;
+it never mutates the target, optimizer, gradients or RNG. It uses mmap for rank
+payloads, but the caller still needs host capacity for the full FP32 state plus
+page-cache/transient overhead and device capacity for an unsharded model. The
+state cap is not a whole-process memory limit. Loading with `assign=True` is for
+a fresh generation model, before constructing any optimizer.
+
+This bridges a training checkpoint to independent generation. It does not resume
+training, restore a generation KV cache or continue an in-flight stream. The
+reader supports the native complete-model DP mesh with Shard(0), CP=EP=PP=1,
+HSDP replicas=1; other layouts reject. The generation implementation still
+recomputes prefixes and rejects FSDP-wrapped modules. The CPU regression uses a
+real two-rank FSDP/task-v2 checkpoint, exact full-parameter reconstruction and a
+real Code2Wav forward; it does not establish full-size or CUDA generation parity.
