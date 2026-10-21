@@ -90,7 +90,7 @@ class MediaAudit:
             return wrapped
 
         for module, name, counter in (
-            (prepare, "verify_bundle", "verify_calls"),
+            (prepare, "read_verified_bundle", "verify_calls"),
             (prepare, "processor_for", "processor_calls"),
             (reader, "create_omni_dataloader", "loader_calls"),
         ):

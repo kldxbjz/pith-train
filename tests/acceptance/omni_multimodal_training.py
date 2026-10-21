@@ -14,6 +14,7 @@ from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -31,7 +32,8 @@ from pithtrain.modules.data_config import DataCfg
 from pithtrain.modules.microbatch import Microbatch
 from pithtrain.modules.qwen3_omni_data import Qwen3OmniCollator, Qwen3OmniDataset
 from pithtrain.modules.training_data import OmniPretrainData, global_loss_mean, global_target_count
-from pithtrain.tasks.prepare_omni_data import processor_for, verify_bundle
+from pithtrain.tasks.prepare_omni_data import processor_for, verify_bundle, write_bundle, write_json
+from pithtrain.tasks.tokenize_corpus import Writer
 from tests.acceptance.omni_image_evidence import (
     module_update_evidence,
     training_groups,
@@ -174,7 +176,10 @@ def prepare(args):
         use_audio_in_video=True, min_pixels=4096, max_pixels=4096, max_length=2048
     )
     recipe["sampling_weights"] = {kind: 1 for kind in ("text", "image", "audio", "video")}
-    manifests, statistics, files = {}, {}, []
+    write_json(destination / "recipe.json", dict(recipe=recipe, stage="video", format_version=3))
+    (destination / "rejected.jsonl").write_text("")
+    processor, _ = processor_for(recipe, offline=True)
+    manifests, statistics, files = {}, {}, ["recipe.json", "rejected.jsonl"]
     for kind in ("text", "image", "audio", "video"):
         reader = Qwen3OmniDataset(
             [args.dataset / p for p in source["manifests"]["train"][kind]], media_root=args.dataset
@@ -187,6 +192,14 @@ def prepare(args):
             files.append(name)
             item["path"] = name
         rows = [row]
+        if kind == "text":
+            name = "tokens/train/00000.bin"
+            (destination / name).parent.mkdir(parents=True)
+            tokens = processor.tokenizer.encode(row["text"]) + [processor.tokenizer.eos_token_id]
+            writer = Writer(destination / name)
+            writer.append(np.asarray(tokens, dtype=np.uint32))
+            writer.flush()
+            files.append(name)
         if kind == "video":
             name = "media/controlled-av.mkv"
             write_av(destination / name)
@@ -210,11 +223,7 @@ def prepare(args):
         source_checksum=digest(args.dataset / "checksums.sha256"),
         purpose="Controlled mixed acceptance; selected real records plus synthetic timestamped AV",
     )
-    (destination / "bundle.json").write_text(json.dumps(bundle, indent=2) + "\n")
-    files.append("bundle.json")
-    (destination / "checksums.sha256").write_text(
-        "".join(f"{digest(destination / name)}  {name}\n" for name in sorted(files))
-    )
+    write_bundle(destination, bundle, files)
     _, _, batches, config = source_inputs(destination)
     config.save_pretrained(args.output / "model")
     audits = {}

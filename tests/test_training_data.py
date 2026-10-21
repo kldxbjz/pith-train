@@ -34,7 +34,7 @@ def text_corpus(tmp_path, monkeypatch, request):
     for shard, count in enumerate((17, 19)):
         tail = max(1, sequence_length // 2 - 1)
         tokens = np.arange(count * sequence_length + tail, dtype=np.uint32) + shard * 10000
-        with (token_root / f"{shard}.bin").open("wb") as stream:
+        with (token_root / f"{shard:05d}.bin").open("wb") as stream:
             np.save(stream, tokens)
             np.save(stream, np.array([len(tokens)], dtype=np.uint64))
         inputs.append(
@@ -62,19 +62,29 @@ def text_corpus(tmp_path, monkeypatch, request):
 def text_bundle(text_corpus):
     token_root, cfg, _, _ = text_corpus
     root = token_root.parent.parent
-    bundle = dict(
-        status="complete",
-        recipe=dict(stages={"text": ["text"]}, sampling_weights={"text": 1.0}, batch={}),
-        manifests={"train": {"text": []}},
-        statistics={"train": {"text": {"samples": 2}}},
-    )
-    (root / "bundle.json").write_text(json.dumps(bundle))
-    paths = [root / "bundle.json", *sorted(token_root.glob("*.bin"))]
-    (root / "checksums.sha256").write_text(
-        "".join(
-            f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.relative_to(root)}\n"
-            for path in paths
+    from pithtrain.tasks.prepare_omni_data import write_bundle, write_json
+
+    recipe = dict(stages={"text": ["text"]}, sampling_weights={"text": 1.0}, batch={})
+    write_json(root / "recipe.json", dict(recipe=recipe, stage="text", format_version=3))
+    (root / "rejected.jsonl").write_text("")
+    files, manifests = ["recipe.json", "rejected.jsonl"], []
+    for index, tokens in enumerate(sorted(token_root.glob("*.bin"))):
+        name = f"train/text-{index:05d}.jsonl"
+        (root / name).parent.mkdir(exist_ok=True)
+        (root / name).write_text(
+            json.dumps(dict(id=str(index), text="Fixture text.", media=[])) + "\n"
         )
+        manifests.append(name)
+        files.extend([name, tokens.relative_to(root).as_posix()])
+    write_bundle(
+        root,
+        dict(
+            status="complete",
+            recipe=recipe,
+            manifests={"train": {"text": manifests}},
+            statistics={"train": {"text": {"samples": 2}}},
+        ),
+        files,
     )
     return root, cfg
 

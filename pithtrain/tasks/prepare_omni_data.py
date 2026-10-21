@@ -221,17 +221,78 @@ def processor_for(recipe, offline=False):
     return processor, config
 
 
-def verify_bundle(root):
+def _content_id(checksums):
+    return hashlib.sha256(json.dumps(checksums, sort_keys=True).encode()).hexdigest()
+
+
+def read_verified_bundle(root):
+    """Return metadata and the hash of those same verified bytes for checkpoint identity."""
     root = Path(root).resolve()
-    bundle = json.loads((root / "bundle.json").read_text())
+    bundle_bytes = (root / "bundle.json").read_bytes()
+    bundle = json.loads(bundle_bytes)
+    bundle_sha256 = hashlib.sha256(bundle_bytes).hexdigest()
     if bundle["status"] != "complete":
         raise ValueError("Data preparation has not completed")
+    checksums = {}
     for line in (root / "checksums.sha256").read_text().splitlines():
-        expected, name = line.split("  ", 1)
+        fields = line.split("  ", 1)
+        if len(fields) != 2:
+            raise ValueError("Invalid dataset checksum inventory")
+        expected, name = fields
         path = (root / name).resolve()
-        if not path.is_relative_to(root) or sha256(path) != expected:
+        if (
+            name in checksums
+            or not name
+            or Path(name).as_posix() != name
+            or not path.is_relative_to(root)
+            or path.relative_to(root).as_posix() != name
+        ):
+            raise ValueError(f"Invalid dataset checksum inventory entry: {name}")
+        actual = bundle_sha256 if name == "bundle.json" else sha256(path)
+        if actual != expected:
             raise ValueError(f"Dataset hash mismatch: {name}")
-    return bundle
+        checksums[name] = actual
+    required = {"bundle.json", "recipe.json", "rejected.jsonl"}
+    token_files = set()
+    for split, modalities in bundle["manifests"].items():
+        for kind, manifests in modalities.items():
+            for index, name in enumerate(manifests):
+                if name not in checksums:
+                    raise ValueError(f"Missing dataset checksum inventory entry: {name}")
+                required.add(name)
+                with (root / name).open() as stream:
+                    for line in stream:
+                        if line.strip():
+                            required.update(item["path"] for item in json.loads(line)["media"])
+                if kind == "text":
+                    token_files.add(f"tokens/{split}/{index:05d}.bin")
+    # DensePretrainData recursively consumes every .bin, so an unlisted extra
+    # shard must fail even when all the listed hashes still match.
+    actual_tokens = {path.relative_to(root).as_posix() for path in (root / "tokens").rglob("*.bin")}
+    if actual_tokens != token_files or set(checksums) != required | token_files:
+        raise ValueError("Dataset checksum inventory differs from the prepared files")
+    checksums.pop("bundle.json")
+    if bundle.get("content_id") != _content_id(checksums):
+        raise ValueError("Dataset content_id does not match verified content")
+    return bundle, bundle_sha256
+
+
+def verify_bundle(root):
+    return read_verified_bundle(root)[0]
+
+
+def write_bundle(root, bundle, files):
+    """Seal prepared files with the canonical content identity, then verify the result."""
+    root = Path(root)
+    checksums = {name: sha256(root / name) for name in sorted(files)}
+    bundle = dict(bundle, content_id=_content_id(checksums))
+    write_json(root / "bundle.json", bundle)
+    checksums["bundle.json"] = sha256(root / "bundle.json")
+    atomic_write(
+        root / "checksums.sha256",
+        "".join(f"{digest}  {name}\n" for name, digest in checksums.items()).encode(),
+    )
+    return verify_bundle(root)
 
 
 @dataclass(init=False, slots=True)
@@ -407,13 +468,11 @@ def launch(cfg: PrepareOmniDataCfg):
                 )
                 print(f"Prepared {split}/{modality}: {accepted} samples", flush=True)
     files.add("rejected.jsonl")
-    checksums = {name: sha256(root / name) for name in sorted(files)}
-    content_id = hashlib.sha256(json.dumps(checksums, sort_keys=True).encode()).hexdigest()
     bundle = dict(
         status="complete",
         format_version=3,
         id=identity,
-        content_id=content_id,
+        content_id=None,  # Filled by write_bundle; retain the published metadata field order.
         stage=cfg.stage,
         recipe=recipe,
         manifests=manifests,
@@ -434,10 +493,4 @@ def launch(cfg: PrepareOmniDataCfg):
         },
         native_training_executed=False,
     )
-    write_json(root / "bundle.json", bundle)
-    checksums["bundle.json"] = sha256(root / "bundle.json")
-    atomic_write(
-        root / "checksums.sha256",
-        "".join(f"{digest}  {name}\n" for name, digest in checksums.items()).encode(),
-    )
-    return verify_bundle(root)
+    return write_bundle(root, bundle, files)
