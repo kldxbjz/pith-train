@@ -53,6 +53,17 @@ def _phase(label, function):
     return value
 
 
+def _rank_serialized_phase(label, function):
+    """Bound host tensor staging to one rank; keep only the small/device result."""
+    result = None
+    rank = dist.get_rank()
+    for owner in range(dist.get_world_size()):
+        value = _phase(label, lambda: function() if rank == owner else None)
+        if rank == owner:
+            result = value
+    return result
+
+
 def _agree(value, label):
     values = [None] * dist.get_world_size()
     dist.all_gather_object(values, value)
@@ -534,9 +545,17 @@ def save(root, step, *, data_state, config):
             layout=layout,
         ),
     )
-    payload = _phase(
-        "stage shards",
-        lambda: dict(
+    location = Path(root, "torch-dcp", f"{step:08d}")
+    _phase(
+        "reserve step",
+        lambda: location.mkdir(parents=True, exist_ok=False) if dist.get_rank() == 0 else None,
+    )
+    name = f"rank-{dist.get_rank():05d}.pt"
+
+    def write_shard():
+        # The payload dies before the next rank packs its tensors. Returning it
+        # from a collective phase would retain every rank's full CPU state.
+        payload = dict(
             header=header,
             state=_pack(
                 {k: v for k, v in values.items() if k != "rng" and (not task_mode or k != "data")}
@@ -544,16 +563,11 @@ def save(root, step, *, data_state, config):
             rng=values["rng"],
             **({"task": values["data"]} if task_mode else {}),
             **({"optimizer_schema": optimizer_schema} if conditional else {}),
-        ),
-    )
-    location = Path(root, "torch-dcp", f"{step:08d}")
-    _phase(
-        "reserve step",
-        lambda: location.mkdir(parents=True, exist_ok=False) if dist.get_rank() == 0 else None,
-    )
-    name = f"rank-{dist.get_rank():05d}.pt"
-    _phase("write shards", lambda: _write_tensor_file(location / name, payload))
-    checksum = _phase("hash shards", lambda: _hash(location / name))
+        )
+        _write_tensor_file(location / name, payload)
+        return _hash(location / name)
+
+    checksum = _rank_serialized_phase("write shards", write_shard)
     hashes = [None] * dist.get_world_size()
     dist.all_gather_object(hashes, checksum)
 
@@ -603,7 +617,7 @@ def load(root, step, *, data_state, config):
     _agree(contract, "load contract")
     location = Path(root, "torch-dcp", f"{step:08d}")
 
-    def read():
+    def read_manifest():
         manifest = json.loads((location / MANIFEST).read_text())
         if not isinstance(manifest, dict) or any(
             type(manifest.get(name)) is not int for name in ("version", "world_size", "step")
@@ -620,12 +634,24 @@ def load(root, step, *, data_state, config):
             raise DistributedCheckpointError("Incomplete or incompatible strict manifest")
         if {p.name for p in location.iterdir()} != names | {MANIFEST}:
             raise DistributedCheckpointError("Missing/unexpected rank files")
-        name = f"rank-{dist.get_rank():05d}.pt"
+        return manifest
+
+    manifest = _phase("read and verify files", read_manifest)
+    _agree(manifest, "checkpoint manifest")
+    name = f"rank-{dist.get_rank():05d}.pt"
+
+    def read():
+        # Pin the same complete checkpoint across both passes. A changed file,
+        # even with a rewritten manifest, must fail rather than become new input.
+        if read_manifest() != manifest:
+            raise DistributedCheckpointError("Checkpoint manifest changed during restore")
         if _hash(location / name) != manifest["files"][name]:
             raise DistributedCheckpointError("Rank shard checksum mismatch")
-        return torch.load(location / name, map_location="cpu", weights_only=True)
+        payload = torch.load(location / name, map_location="cpu", weights_only=True)
+        if _hash(location / name) != manifest["files"][name]:
+            raise DistributedCheckpointError("Rank shard changed while reading")
+        return payload
 
-    payload = _phase("read and verify files", read)
     before, layout = _phase(
         "capture live layout", lambda: _runtime(model, opts, scheds, data_state, device)
     )
@@ -645,10 +671,10 @@ def load(root, step, *, data_state, config):
         ),
     )
 
-    bounded_template = None
+    restore_template = None
 
-    def validate():
-        nonlocal bounded_template
+    def validate(payload):
+        nonlocal restore_template
         if not isinstance(payload, dict) or "header" not in payload:
             raise DistributedCheckpointError("Invalid rank payload")
         _check_schema(payload["header"], header, path="header")
@@ -680,30 +706,31 @@ def load(root, step, *, data_state, config):
         del template["rng"]
         if task_mode:
             del template["data"]
-        if bounded:
-            _validate_packed(payload["state"], template)
-            bounded_template = template
-            restored = dict(payload["state"])
-        else:
-            restored = _unpack(payload["state"], template)
-        if task_mode:
-            restored["data"] = copy.deepcopy(payload["task"])
-        else:
+        _validate_packed(payload["state"], template)
+        restore_template = template
+        restored_data = payload["task"] if task_mode else payload["state"]["data"]
+        if not task_mode:
             _validate_data(
-                restored["data"],
+                restored_data,
                 step=step,
                 global_batch_size=batch,
                 fingerprint=data["fingerprint"],
             )
         _check_training_state(
-            restored, expected_optimizers, updates, optimizer_steps=optimizer_steps, packed=bounded
+            payload["state"],
+            expected_optimizers,
+            updates,
+            optimizer_steps=optimizer_steps,
+            packed=True,
         )
         _check_schema(payload["rng"], before["rng"], path="app.resume.rng")
         _validate_rng(payload["rng"], device)
-        restored["rng"] = payload["rng"]
-        return restored
+        # No model/optimizer CPU tensor survives the preflight pass.
+        return dict(data=copy.deepcopy(restored_data), rng=copy.deepcopy(payload["rng"]))
 
-    restored = _phase("validate every rank before mutation", validate)
+    restored = _rank_serialized_phase(
+        "validate every rank before mutation", lambda: validate(read())
+    )
     if task_mode:
         restored_contract = _phase(
             "restored task contract",
@@ -725,16 +752,29 @@ def load(root, step, *, data_state, config):
         data_state.load_state_dict(values["data"])
         _restore_rng(values["rng"], device)
 
-    def apply_restored():
-        if not bounded:
-            return _apply(restored, model, opts, scheds, data_state, device)
-        values = _restore_packed_inplace(payload["state"], bounded_template, before)
-        values["data"] = restored["data"]
-        values["rng"] = restored["rng"]
-        return apply_bounded(values)
+    def stage_tensors():
+        payload = read()
+        metadata = validate(payload)
+        values = (
+            _restore_packed_inplace(payload["state"], restore_template, before)
+            if bounded
+            else _unpack(payload["state"], restore_template)
+        )
+        values.update(metadata)
+        return values
 
     try:
-        _phase("apply strict checkpoint", apply_restored)
+        # All ranks already passed full preflight. Bounded copies may now mutate
+        # live tensors, so second-read/copy failures use the same all-rank undo.
+        restored = _rank_serialized_phase("apply strict checkpoint", stage_tensors)
+        _phase(
+            "apply strict checkpoint",
+            lambda: (
+                apply_bounded(restored)
+                if bounded
+                else _apply(restored, model, opts, scheds, data_state, device)
+            ),
+        )
     except DistributedCheckpointError:
 
         def undo():
