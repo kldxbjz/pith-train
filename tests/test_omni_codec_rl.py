@@ -471,3 +471,64 @@ def test_training_storage_must_not_alias_rollout_or_reference(role):
             reward=trainer.reward,
         )
     assert not trainer.backend.optimizer.state
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_frozen_feature_dtype_matches_explicit_projection_cast(dtype):
+    policy, _, original = policy_and_prompt()
+    prompt = dict(original)
+    keys = ("thinker_embeddings", "thinker_hidden", "special_embeddings")
+    for key in keys:
+        prompt[key] = prompt[key].to(dtype)
+    before = codec._tensor_identity(prompt)
+    explicit = {key: value.float() if key in keys else value for key, value in prompt.items()}
+    reference = copy.deepcopy(policy)
+    actions, mask = codec.action_layout(
+        torch.arange(32).reshape(1, 2, 16) % 23,
+        torch.tensor([2]),
+        torch.tensor([False]),
+        max_frames=2,
+        vocab=23,
+    )
+    context = dict(lengths=torch.tensor([2]), reached_eos=torch.tensor([False]))
+    actual = policy(actions, **context, **prompt)
+    expected = reference(actions, **context, **explicit)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for result in (actual, expected):
+        (-result.gather(-1, actions[..., None]).squeeze(-1)[mask].sum()).backward()
+    for name, parameter in policy.named_parameters():
+        other = dict(reference.named_parameters())[name]
+        assert (parameter.grad is None) == (other.grad is None), name
+        if parameter.grad is not None:
+            torch.testing.assert_close(parameter.grad, other.grad, rtol=0, atol=0, msg=name)
+    assert codec._tensor_identity(prompt) == before
+    assert all(prompt[key].dtype == dtype for key in keys)
+
+
+def test_codec_rejects_stateless_reward_protocol_before_training():
+    class StatelessReward:
+        def score(self, request, batch):
+            return torch.zeros(batch.input_ids.shape[0])
+
+        def state_dict(self):
+            return {}
+
+        def validate_state_dict(self, state):
+            assert state == {}
+
+        def load_state_dict(self, state):
+            self.validate_state_dict(state)
+
+    trainer = trainer_fixture()
+    before = codec._tensor_identity(trainer.backend.model.state_dict())
+    for entry in (codec.create_trainer, codec.launch):
+        with pytest.raises(TypeError, match="ExactCodecReward"):
+            entry(
+                trainer.cfg,
+                contract=trainer.contract,
+                backend=trainer.backend,
+                rollout=trainer.rollout,
+                reward=StatelessReward(),
+            )
+    assert not trainer.backend.optimizer.state
+    assert codec._tensor_identity(trainer.backend.model.state_dict()) == before

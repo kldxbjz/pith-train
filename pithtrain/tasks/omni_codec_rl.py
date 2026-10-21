@@ -248,6 +248,9 @@ class CodecPolicy(nn.Module):
 
     def condition(self, prompt):
         self.validate_prompt(prompt)
+        # Frozen encoder outputs retain their source dtype/identity. Project
+        # using the admitted Talker dtype without mutating the sealed prompt.
+        dtype = next(self.talker.text_projection.parameters()).dtype
 
         def special_embeddings(ids):
             expected = ids.new_tensor(
@@ -261,12 +264,12 @@ class CodecPolicy(nn.Module):
             )
             if not torch.equal(ids, expected):
                 raise ValueError("Unexpected special embedding request")
-            return prompt["special_embeddings"]
+            return prompt["special_embeddings"].to(dtype=dtype)
 
         return prepare_talker_condition(
             self.talker,
-            prompt["thinker_embeddings"],
-            prompt["thinker_hidden"],
+            prompt["thinker_embeddings"].to(dtype=dtype),
+            prompt["thinker_hidden"].to(dtype=dtype),
             prompt["input_ids"],
             config=self.config,
             text_embedding=special_embeddings,
@@ -785,9 +788,11 @@ class ExactCodecReward:
         self.calls = state["calls"]
 
 
-def _validate_providers(cfg, backend, rollout):
+def _validate_providers(cfg, backend, rollout, reward):
     if not isinstance(backend, CodecPolicyAdapter) or not isinstance(rollout, LocalCodecRollout):
         raise TypeError("Codec task requires the explicit local codec adapter/provider")
+    if type(reward) is not ExactCodecReward:
+        raise TypeError("Codec task requires ExactCodecReward with its checkpoint cursor contract")
     if cfg.micro_batch_size != 1:
         raise ValueError("Codec policy supports micro_batch_size=1")
     if cfg.max_requests > len(rollout.prompts):
@@ -807,7 +812,7 @@ def _validate_providers(cfg, backend, rollout):
 
 def create_trainer(cfg, *, contract, backend, rollout, reward):
     """Validate codec ownership, then construct the existing GRPO transaction engine."""
-    _validate_providers(cfg, backend, rollout)
+    _validate_providers(cfg, backend, rollout, reward)
     return omni_rl.OmniRLTrainer(
         cfg, contract=contract, backend=backend, rollout=rollout, reward=reward
     )
@@ -815,7 +820,7 @@ def create_trainer(cfg, *, contract, backend, rollout, reward):
 
 def launch(cfg, *, contract, backend, rollout, reward, trainer=None):
     """Run the existing GRPO trainer with an actual codec policy adapter/provider."""
-    _validate_providers(cfg, backend, rollout)
+    _validate_providers(cfg, backend, rollout, reward)
     return omni_rl.launch(
         cfg, contract=contract, backend=backend, rollout=rollout, reward=reward, trainer=trainer
     )

@@ -58,7 +58,9 @@ records.append(record)
 
 Extraction preserves caller modes and RNG, returns detached CPU tensors before
 Talker projection, and binds actual Thinker weights/config, processed inputs and
-extraction implementation. Each prompt must contain a complete assistant
+extraction implementation. At conditioning, the three floating feature tensors
+are cast to the Talker projection dtype without modifying their sealed original
+values or source dtype. Each prompt must contain a complete assistant
 boundary plus fixed conditioning text. Feature extraction is not a replacement
 for Thinker text generation and does not jointly optimize the Thinker. The
 pure feature, EOS/cap and target tensors are hashed into provider/reward state;
@@ -68,8 +70,10 @@ weights, so the caller must admit its own model and host-memory requirements.
 The bundled reward is **exact supplied codec-sequence and EOS match** (1 or 0).
 It exercises an explicit supervised sequence-matching RL task. It is not an
 ASR, perceptual speech-quality, speaker-preference or audio-quality reward.
-Those goals require a separately specified, reviewed reward provider with its
-own immutable configuration identity. Sparse exact-match targets can give all
+Those goals require a separately specified, reviewed reward implementation.
+This codec task currently admits only `ExactCodecReward`, whose committed-request
+cursor is part of the strict checkpoint contract; the general text-RL reward
+protocol alone is insufficient. Sparse exact-match targets can give all
 members of a group the same reward; this is reported faithfully, not repaired
 by changing targets or sampling until a favorable group appears.
 
@@ -96,8 +100,7 @@ Every committed request is saved atomically. A failed transaction is not a
 checkpointable update and must be recovered from the previous committed file.
 
 For programmatic use, assemble `CodecPolicy`, `CodecPolicyAdapter`,
-`LocalCodecRollout`, `ExactCodecReward` (or an explicit protocol-compatible
-reward), `RolloutContract` and `OmniRLCfg`, then call
+`LocalCodecRollout`, `ExactCodecReward`, `RolloutContract` and `OmniRLCfg`, then call
 `omni_codec_rl.launch(cfg, contract=..., backend=..., rollout=..., reward=...)`.
 For explicit transactions, use `omni_codec_rl.create_trainer(...)`; it validates
 that training, rollout actor and fixed reference have independent parameter
