@@ -314,7 +314,7 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
 class Qwen3OmniMoeThinkerTextModel(nn.Module):
     input_modalities = ("text",)
 
-    def __init__(self, config: Qwen3OmniMoeTextConfig, phase: int):
+    def __init__(self, config: Qwen3OmniMoeTextConfig, phase: int, *, decoder_layer_factory=None):
         super().__init__()
         if training.fp8:
             raise NotImplementedError("Thinker fused experts currently support BF16 training only")
@@ -342,9 +342,13 @@ class Qwen3OmniMoeThinkerTextModel(nn.Module):
         if self.stage_index == self.stage_count - 1:
             self.norm = Qwen3OmniMoeThinkerTextRMSNorm(config.hidden_size, config.rms_norm_eps)
             self.lm_head = BF16Linear(config.hidden_size, config.vocab_size, bias=False)
+        # Media subclasses must choose their layer before allocation. Replacing
+        # an already-built stack temporarily retains two full decoder stacks.
+        if decoder_layer_factory is None:
+            decoder_layer_factory = Qwen3OmniMoeThinkerTextDecoderLayer
         self.layers = nn.ModuleDict(
             {
-                str(i): Qwen3OmniMoeThinkerTextDecoderLayer(config, i)
+                str(i): decoder_layer_factory(config, i)
                 for i in layer_partition(
                     config.num_hidden_layers, self.stage_count, self.stage_index
                 )
