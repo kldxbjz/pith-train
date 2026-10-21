@@ -24,6 +24,21 @@ The latter changes initialization RNG; final-source evidence must be refreshed.
 Targeted CPU regressions are development evidence, not a new GPU pass. PR receipts
 retain exact source identities and failed runs; test totals are not additive.
 
+At `023e5b549c5052f7559942fac2971d012a78f590`, the actual four-H100
+speech step-1 comparison checked all 351 parameter gradients: 349 PASS, 2 FAIL,
+0 missing. The eight previously missing expert gradients passed. The remaining
+`audio_tower.layers.0/1.self_attn.k_proj.bias` NSE values were 0.5059281896 and
+0.5779254232 against the unchanged strict <0.01 threshold. Small absolute errors
+do not turn those results into passes. All 20 forward, loss and six floating
+input-gradient checks passed, as did independent FP64 attention. The execution
+inventory was 5 PASS (including prerequisites), 1 FAIL, 22 NOT_RUN; it is not a
+count of all model requirements. Subsequent continuation, generation,
+posttraining and codec-policy GPU gates were not run. Released/full-size
+acceptance remains NOT_RUN. The instance was confirmed stopped at
+2026-10-21T07:35:26.326781Z. The sealed evidence archive SHA-256 is
+`0314269241987240301049cc353ca68356839fbc30e0b5c403591b00704db770`.
+This later evidence does not replace the failed historical-source receipts above.
+
 The preserved a8a1302d25140e5f75e9f9fb83d46fdcd891fb59 CPU receipt has
 1813 PASS / 0 FAIL / 0 SKIP and eight passing hooks. It predates the scheduler,
 RL model/forward contract and official full-generation-entry corrections.
@@ -43,6 +58,7 @@ new source freeze. Old CPU/GPU results are not transferred to the successor. No 
 | Speech codec/text/waveform training | omni_speech, local replicas and FSDP2 | Native numerical and next-update checkpoint gates |
 | SFT | Task/data/objective and native training entry | Final-source integration and resume |
 | GRPO text policy | Real native optimizer loop plus owned local HF worker, fixed reference, exact-answer reward and CPU/Gloo DP/PP/EP publication | Production-provider native integration, original independent numerical gates and released/full-size execution |
+| Codec policy RL (PR #124) | Single-device frozen-Thinker context, trainable Talker/residual predictor and discrete sequence/EOS reward | Native GPU numerical/update/resume gates and released/full-size execution |
 | Full text-to-speech generation | Native controller and complete HF reference entry | Natural nonempty output for each media, EOS/caps/multi-turn |
 | Strict continuation | Data/media/processor and model/forward/scheduler contracts | Final-source positive and pre-mutation negative gates |
 
@@ -57,8 +73,14 @@ continuation and Gloo shard/partition transport tests are distinct evidence.
 `omni_hf_provider.py` supplies the bounded w4/PP2/EP2 production CLI integration
 and strict fresh-process update gate; GPU execution is still NOT_RUN. The old
 `omni_posttraining.py` independent numerical oracle remains separately required.
-Released/full-size provider memory and execution are not established. RVQ/audio-
-policy RL and external reward/serving backends remain unsupported. Generation
+Released/full-size provider memory and execution are not established. The
+separate codec-policy path in PR #124 supports DP=CP=EP=PP=1 and one unpadded,
+frozen-Thinker context per microbatch. Talker projections/trunk/heads and the
+residual predictor are trainable; Code2Wav is outside the discrete policy gradient.
+Its sequence/EOS reward is a protocol reward, not perceptual or ASR quality.
+Raw-media end-to-end, multirank/FSDP codec RL, released/full-size execution and
+external reward/serving backends are not established; multirank/FSDP is rejected.
+Codec-policy GPU acceptance remains NOT_RUN. Generation
 has no serializable KV/in-flight stream resume. Training checkpoint recovery
 does not validate interrupted generation. Padding/packing, every precision or
 optimizer, and changed-topology strict restore require their own explicit
@@ -93,6 +115,11 @@ are terminal historical attempts, not queued work or passing acceptance.
   HSDP1 and supported AdamW state. Native media CP>1, changed-topology strict
   restore, Muon strict restore and quantized complete-Thinker conversion are
   unsupported. No FP8 or multi-node acceptance is inferred.
+- `omni_released_continuation.py` adds an explicitly bounded Thinker-only
+  released-payload prepare, public initialization, update/save and fresh-process
+  next-update entry. It preserves all-parameter checks and complete state/data
+  digests; its tiny CPU/Gloo protocol tests do not establish released/native GPU
+  acceptance. Full speech and full-size HF provider resource gaps remain separate.
 - `omni_full_size.py` is a separate resource-planned gate. Tiny numerical,
   header/schema and meta-model checks do not establish full-size correctness.
 
