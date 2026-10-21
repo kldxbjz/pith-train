@@ -253,10 +253,83 @@ def test_training_preparation_splits_resume_and_integrity(tmp_path, processor_co
     assert [sample_id for batch in loader for sample_id in batch.sample_ids] == ["three"]
     with pytest.raises(ValueError, match="not been prepared"):
         create_omni_dataloader(cfg.output, processor, config, stage="image", split="train")
-    manifest = Path(cfg.output) / bundle["manifests"]["train"]["text"][0]
-    manifest.write_text(manifest.read_text() + "\n")
+    # This is the real writer's bundle and reader/resume path. Only GPU shuffle
+    # placement/barrier are replaced so the memmap and checkpoint boundary run on CPU.
+    from types import SimpleNamespace
+
+    from pithtrain.modules.data_config import DataCfg
+    from pithtrain.modules.training_data import OmniPretrainData
+
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
+    monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
+    data_cfg = DataCfg()
+    root = data_cfg.dataset = Path(cfg.output)
+    data_cfg.format = "prepared_bundle"
+    training = SimpleNamespace(
+        global_batch_size=1, micro_batch_size=1, sequence_length=4, seed=431, max_steps=2
+    )
+
+    def reader():
+        return OmniPretrainData(data_cfg, training)
+
+    data = reader()
+    data.get_batch(0, "cpu")
+    data.commit_step(0)
+    saved = data.state_dict()
+    restored = reader()
+    restored.load_state_dict(saved)
+    torch.testing.assert_close(
+        restored.get_batch(1, "cpu")[0].model_inputs[0],
+        data.get_batch(1, "cpu")[0].model_inputs[0],
+        rtol=0,
+        atol=0,
+    )
+    checksum_path = root / "checksums.sha256"
+    original_checksums = checksum_path.read_text()
+    # A missing/empty/duplicate inventory cannot silently become a weaker check.
+    lines = original_checksums.splitlines(keepends=True)
+    missing_manifest = "".join(line for line in lines if "train/text-" not in line)
+    missing_token = "".join(line for line in lines if "tokens/train/" not in line)
+    for invalid in (
+        "",
+        "".join(lines[:-1]),
+        missing_manifest,
+        missing_token,
+        original_checksums + lines[0],
+    ):
+        checksum_path.write_text(invalid)
+        with pytest.raises(ValueError, match="checksum inventory"):
+            reader().load_state_dict(saved)
+    checksum_path.write_text(original_checksums)
+    extra = root / "tokens/train/unlisted.bin"
+    extra.write_bytes((root / "tokens/train/00000.bin").read_bytes())
+    with pytest.raises(ValueError, match="checksum inventory"):
+        reader().load_state_dict(saved)
+    extra.unlink()
+
+    name = bundle["manifests"]["train"]["text"][0]
+    manifest = root / name
+    previous_hash = prep.sha256(manifest)
+    manifest.write_text(manifest.read_text().replace("Text for one.", "Changed text."))
     with pytest.raises(ValueError, match="hash mismatch"):
-        prep.verify_bundle(cfg.output)
+        prep.verify_bundle(root)
+    checksum_path.write_text(original_checksums.replace(previous_hash, prep.sha256(manifest)))
+    # Updating both data and its checksum still cannot keep the old bundle identity.
+    with pytest.raises(ValueError, match="content_id"):
+        reader().load_state_dict(saved)
+    assert saved["consumed_samples"] == 1
+
+    # Deliberately publishing a NEW content identity is valid, but must not resume
+    # the old reader state. Use the same sealing path as preparation.
+    files = [line.split("  ", 1)[1] for line in original_checksums.splitlines()]
+    files.remove("bundle.json")
+    changed_bundle = prep.write_bundle(root, bundle, files)
+    assert changed_bundle["content_id"] != bundle["content_id"]
+    changed = reader()
+    with pytest.raises(ValueError, match="differs"):
+        changed.load_state_dict(saved)
+    assert changed.consumed_samples == 0
 
 
 def test_source_cache_detects_changes_and_offline_misses(tmp_path):
