@@ -18,6 +18,7 @@ from pithtrain.config import SlottedDefault
 from pithtrain.contexts import distributed, logging, training
 from pithtrain.modules.checkpoint import (
     find_checkpoint,
+    initialize_checkpoint,
     load_checkpoint,
     save_checkpoint,
 )
@@ -62,6 +63,16 @@ class PretrainLMCfg(SlottedDefault):
 
     data: DataCfg = field(default_factory=DataCfg)
     """Dataset location, storage format, modalities and sampling configuration."""
+
+    initialize_from: Path | None = None
+    """Canonical DCP root for model-only initialization of a new training run.
+
+    Independent of strict_resume: optimizer, scheduler, RNG and data start fresh.
+    Omit this when resuming an existing save_location; specifying both is an error.
+    """
+
+    initialize_step: int = 0
+    """Checkpoint identifier under initialize_from; the new training step is still zero."""
 
 
 def setup_dataset(cfg: PretrainLMCfg) -> PretrainData:
@@ -296,13 +307,21 @@ def launch(cfg: PretrainLMCfg) -> None:
     """
     Launch the pretraining of a language model.
     """
+    initialize_from = getattr(cfg, "initialize_from", None)
+    initialize_step = getattr(cfg, "initialize_step", 0)
+    if type(initialize_step) is not int or initialize_step < 0:
+        raise ValueError("initialize_step must be a nonnegative integer")
+    if initialize_from is None and initialize_step != 0:
+        raise ValueError("initialize_step requires initialize_from")
+    step = find_checkpoint(cfg.training.save_location)
+    if initialize_from is not None and step is not None:
+        raise ValueError("Model initialization requires a new output run; omit it to resume")
     setup_logging(cfg)
     setup_distributed(cfg)
     dataset = setup_dataset(cfg)
     setup_training(cfg)
     logger = logging.stdout
     logger.info("launch(cfg=%s)" % cfg)
-    step = find_checkpoint(cfg.training.save_location)
     if step is not None:
         load_checkpoint(
             cfg.training.save_location,
@@ -314,6 +333,8 @@ def launch(cfg: PretrainLMCfg) -> None:
                 else {}
             ),
         )
+    elif initialize_from is not None:
+        initialize_checkpoint(initialize_from, initialize_step)
     step = step or 0
     gc.disable()
     while step < cfg.training.max_steps:

@@ -33,6 +33,7 @@ import torch.nn as nn
 from torch.distributed.checkpoint import FileSystemReader
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
+    get_model_state_dict,
     get_state_dict,
     set_model_state_dict,
     set_state_dict,
@@ -47,6 +48,7 @@ from pithtrain.contexts import distributed, logging, training
 
 __all__ = [
     "find_checkpoint",
+    "initialize_checkpoint",
     "iter_canonical_parameters",
     "load_checkpoint",
     "save_checkpoint",
@@ -482,7 +484,9 @@ class CheckpointState(Stateful):
         missing optimizer keys.
         """
         if self.model_only:
-            model_state, _ = get_state_dict(self.model, self.optimizers)
+            # get_state_dict also initializes cold optimizer slots. Model-only
+            # initialization must leave the fresh optimizer untouched.
+            model_state = get_model_state_dict(self.model)
             return {"model": to_canonical_model(model_state, self.model)}
         model_state, optim_state = get_state_dict(self.model, self.optimizers)
         model_state = to_canonical_model(model_state, self.model)
@@ -574,6 +578,27 @@ def save_checkpoint(
     stdout.info("Save checkpoint: elapsed min=%.1fs, max=%.1fs" % (dt_min.item(), dt_max.item()))
 
 
+def initialize_checkpoint(root: Path, step: int = 0) -> None:
+    """Initialize only model tensors from a canonical DCP checkpoint.
+
+    Optimizer, scheduler, RNG, data position and the caller's step are untouched.
+    Call this after fresh training setup, with a separate output checkpoint root.
+    This is not resume: any non-model DCP entries and RNG sidecars are ignored.
+    Strict rank-local checkpoints require the strict loader or an explicit model
+    export; they cannot be treated as canonical initialization checkpoints.
+    """
+    if type(step) is not int or step < 0:
+        raise ValueError("Initialization checkpoint step must be a nonnegative integer")
+    location = Path(root, "torch-dcp", f"{step:08d}")
+    if (location / "strict-manifest.json").exists():
+        raise ValueError("Export strict checkpoint model weights before initialization")
+    logging.stdout.info("Initialize model weights: %s", location)
+    started = time.monotonic()
+    state = CheckpointState(training.model, (), (), model_only=True)
+    dcp.load({"app": state}, checkpoint_id=location)
+    logging.stdout.info("Initialize model weights: elapsed %.1fs", time.monotonic() - started)
+
+
 def load_checkpoint(
     root: Path,
     step: int,
@@ -604,7 +629,6 @@ def load_checkpoint(
     stdout.info("Load checkpoint: %s" % location)
 
     t0 = time.monotonic()
-    torch.cuda.empty_cache()
     metadata = FileSystemReader(str(location)).read_metadata()
     model_only = all(k.startswith("app.model.") for k in metadata.state_dict_metadata)
     model, optimizers, schedulers = training.model, training.optimizers, training.schedulers
@@ -612,6 +636,7 @@ def load_checkpoint(
         k.startswith("app.data.") for k in metadata.state_dict_metadata
     ):
         raise ValueError("This checkpoint has no data state; it cannot resume prepared Omni data")
+    torch.cuda.empty_cache()
     state = CheckpointState(
         model, optimizers, schedulers, model_only=model_only, data_state=data_state
     )

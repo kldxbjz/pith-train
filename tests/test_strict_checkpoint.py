@@ -9,6 +9,7 @@ import argparse
 import copy
 import hashlib
 import json
+import logging as std_logging
 import os
 import random
 import subprocess
@@ -22,8 +23,13 @@ import torch.distributed.checkpoint as dcp
 import torch.nn.functional as F
 from torch import nn
 
-from pithtrain.contexts import distributed
-from pithtrain.modules.checkpoint import CheckpointState, to_canonical_model, to_localized_model
+from pithtrain.contexts import distributed, logging, training
+from pithtrain.modules.checkpoint import (
+    CheckpointState,
+    initialize_checkpoint,
+    to_canonical_model,
+    to_localized_model,
+)
 from pithtrain.modules.dataset import MemmapDataset
 from pithtrain.modules.strict_checkpoint import (
     StrictResumeError,
@@ -406,7 +412,7 @@ def test_rejected_checkpoint_preserves_pristine_optimizer(data_path):
     assert_tree_equal(optimizer.state_dict(), optimizer_before)
 
 
-def test_weight_initialization_is_not_strict_resume(data_path):
+def test_weight_initialization_is_not_strict_resume(data_path, monkeypatch):
     state = linear_state(data_path, committed=False)
     root = data_path.parent / "weights-only"
     dcp.save(
@@ -416,10 +422,17 @@ def test_weight_initialization_is_not_strict_resume(data_path):
     )
     with pytest.raises(StrictResumeError, match="missing"):
         load_strict_checkpoint(root, state)
-    legacy = CheckpointState(
-        state.base.model, state.base.optimizers, state.base.schedulers, model_only=True
-    )
-    dcp.load({"app": legacy}, checkpoint_id=root / "torch-dcp/00000001", no_dist=True)
+    monkeypatch.setattr(training, "model", state.base.model, raising=False)
+    monkeypatch.setattr(logging, "stdout", std_logging.getLogger(__name__), raising=False)
+    initialize_checkpoint(root, 1)
+
+
+def test_initialization_rejects_strict_rank_local_format_before_model_access(tmp_path):
+    location = tmp_path / "torch-dcp/00000002"
+    location.mkdir(parents=True)
+    (location / "strict-manifest.json").write_text("{}")
+    with pytest.raises(ValueError, match="Export strict checkpoint model weights"):
+        initialize_checkpoint(tmp_path, 2)
 
 
 def test_python_cached_gaussian_is_valid_resume_state(data_path):
