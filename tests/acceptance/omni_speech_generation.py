@@ -605,7 +605,7 @@ def chunk_boundary(native, hf, speech):
 @torch.no_grad()
 def validate(args, config, samples, native, hf):
     native, hf = native.model, official_composite(hf.model)
-    cases, boundaries, text_context = {}, {}, None
+    cases, boundaries, text_context, eos_context = {}, {}, None, None
     with preserve_generation_state(native, hf) as preservation, hf_position_metadata(hf, config):
         for sample in samples:
             batch = prompt_sample(chain.move(sample, args.device))
@@ -618,6 +618,8 @@ def validate(args, config, samples, native, hf):
             chain.write_json(args.output / f"generation-{sample['media_kind']}.json", report)
             if sample["media_kind"] == "text":
                 text_context = batch, expected, actual
+            if sample["media_kind"] == "image":
+                eos_context = batch, expected
         if set(cases) != set(MEDIA):
             raise AssertionError("All five unforced media cases are mandatory")
         batch, previous, actual_text = text_context
@@ -643,21 +645,26 @@ def validate(args, config, samples, native, hf):
                 raise AssertionError("Natural cap control did not reach both original caps")
             boundaries[name] = report
             chain.write_json(args.output / f"generation-{name}.json", report)
-        generated = previous.sequences[0, batch["input_ids"].shape[1] :]
+        eos_batch, eos_previous = eos_context
+        generated = eos_previous.sequences[0, eos_batch["input_ids"].shape[1] :]
         if generated.numel() < 2 or generated[0] == generated[1]:
             raise AssertionError("Unforced fixture cannot supply a distinct delayed-EOS control")
         eos_id = int(generated[1])
-        actual, rows = compute(native, native_generate, batch, eos_id=eos_id)
-        expected = compute(hf, hf_generate, batch, eos_id=eos_id)
-        boundary = compare_generation(actual, rows, expected, batch["input_ids"].shape[1])
+        actual, rows = compute(native, native_generate, eos_batch, eos_id=eos_id)
+        expected = compute(hf, hf_generate, eos_batch, eos_id=eos_id)
+        boundary = compare_generation(actual, rows, expected, eos_batch["input_ids"].shape[1])
         if (
             not actual.text_reached_eos
-            or actual.sequences.shape[1] != batch["input_ids"].shape[1] + 2
+            or actual.sequences.shape[1] != eos_batch["input_ids"].shape[1] + 2
         ):
             raise AssertionError("Explicit delayed EOS did not stop after exactly two tokens")
         require_nonempty_case(boundary, "delayed_eos")
         boundary.update(
-            scope="explicit_delayed_text_eos_control", eos_id=eos_id, eos_generated_index=1
+            scope="explicit_delayed_text_eos_control",
+            source_media="image",
+            selection_policy="fixed_original_image_case",
+            eos_id=eos_id,
+            eos_generated_index=1,
         )
         boundaries["eos"] = boundary
         chain.write_json(args.output / "generation-eos.json", boundary)
