@@ -397,8 +397,8 @@ def canonical_to_native(state, config):
     return {key: fused[value] for key, value in native_key_map(config).items()}
 
 
-def read_hf(path, config, *, namespace="component"):
-    """Audit every index/header before loading any selected component's payload."""
+def read_hf_headers(path, config, *, namespace="component"):
+    """Audit all HF keys/shapes/dtypes without materializing any payload."""
     path = Path(path)
     index = path / "model.safetensors.index.json"
     weight_map = text.read_json(index).get("weight_map") if index.exists() else None
@@ -431,8 +431,16 @@ def read_hf(path, config, *, namespace="component"):
         "HF headers",
     )
     text.validate_dtypes({k: dtypes[k] for k in selected}, "HF headers")
+    return shapes, owners, dtypes, excluded, layouts
+
+
+def read_hf(path, config, *, namespace="component"):
+    """Audit every index/header before loading any selected component's payload."""
+    path = Path(path)
+    _, owners, _, excluded, layouts = read_hf_headers(path, config, namespace=namespace)
+    selected = set(owners) - set(excluded)
+    filenames = sorted(set(owners.values()))
     state = {}
-    selected = set(selected)
     for filename in filenames:
         with safe_open(path / filename, framework="pt", device="cpu") as handle:
             for key in handle.keys():
