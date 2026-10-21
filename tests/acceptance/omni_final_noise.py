@@ -25,9 +25,20 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 ENGINE_PATH = ROOT / "tests/acceptance/omni_noise_regression.py"
-BASE_SHA = "1611d085a7c244bb01a34caf8b58d19aef9eeeff"
+BASE_SHA = "5a50a7dc950ea2ca6d4066879ed6005aed62dab0"
+# The parent remains immutable; both noise arms include exactly these shared fixes.
+BASE_PROVENANCE = {
+    "parent": "1611d085a7c244bb01a34caf8b58d19aef9eeeff",
+    "tree": "1a556e76fed3d3edf52e46b76ffd18e0aae2b100",
+    "patch_sha256": "3630c0531d3375cde20177148f99e160e349f2d87e623eb90e8d143fdd05c52a",
+    "shared_repairs": {
+        "pithtrain/models/qwen3_omni_moe.py": "410fae6ea543d0412560524b6091cc06b41fdd61a975b9a022ef004305881a04",
+        "pithtrain/operators/grouped_linear.py": "f5f558a52340c8540e705357738872838d616252cf291081a645a1cf79a109d4",
+        "pithtrain/tasks/prepare_omni_data.py": "7ed3ecb5df09ab3c7357a239fe6a95dc140b55ea6bde7c19b4b1898e2e371373",
+    },
+}
 ENGINE_SHA256 = "2b1a8f231c4d1c6543697073f4961edf134aada924be90ffa271c49e080259ff"
-SCHEMA = "omni_final_text_noise_binding_v2"
+SCHEMA = "omni_final_text_noise_binding_v3"
 BINDING_ENV = "PITHTRAIN_OMNI_FINAL_NOISE_BINDING"
 SHA = re.compile(r"[0-9a-f]{40}")
 UNCHANGED_FILES = (
@@ -336,6 +347,7 @@ def create_binding(args):
     require(changed, "No production increment")
     payload = dict(
         schema=SCHEMA,
+        baseline_provenance=BASE_PROVENANCE,
         base=base_id,
         feature=feature_id,
         source_audit=audit,
@@ -347,7 +359,7 @@ def create_binding(args):
         bridge=engine.BRIDGE,
         arms=list(engine.ARMS),
         scope="Text training plus strict/HF/strict continuation under common-deterministic-v2",
-        scope_changed_declared="Both baseline arms and feature explicitly enable the same public deterministic policy; legacy results are not inherited",
+        scope_changed_declared="Both baseline arms and feature share the reviewed autograd, decoder-construction and bundle-identity repairs plus the same public deterministic policy; legacy results are not inherited",
         does_not_cover=EXCLUSIONS,
         created_utc=dt.datetime.now(dt.timezone.utc).isoformat(),
         numerical_execution="NOT_RUN",
@@ -373,6 +385,7 @@ def load_binding(path):
     require(b["adapter_sha256"] == digest(__file__), "Binding adapter changed")
     require(b["engine_sha256"] == ENGINE_SHA256 == digest(ENGINE_PATH), "Workload engine changed")
     require(b["base"]["commit"] == BASE_SHA, "Unreviewed base")
+    require(b.get("baseline_provenance") == BASE_PROVENANCE, "Baseline repair provenance changed")
     require(SHA.fullmatch(b["feature"]["commit"]), "Invalid feature SHA")
     engine = engine_module()
     require(

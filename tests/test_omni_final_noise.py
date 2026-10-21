@@ -77,6 +77,7 @@ def binding(tmp_path, monkeypatch):
 def test_reviewed_binding_captures_distinct_sources_and_exclusions(binding):
     args, bound = binding
     assert new.load_binding(args.output) == bound
+    assert bound["baseline_provenance"] == new.BASE_PROVENANCE
     assert bound["base"]["production_sha256"] != bound["feature"]["production_sha256"]
     assert bound["numerical_execution"] == "NOT_RUN"
     assert len(bound["profiles"]) == 5 and bound["arms"] == ["base0", "base1", "feat0"]
@@ -91,6 +92,7 @@ def test_reviewed_binding_captures_distinct_sources_and_exclusions(binding):
     "field,value",
     [
         ("schema", "legacy"),
+        ("baseline_provenance", {"parent": "unreviewed"}),
         ("engine_sha256", "0" * 64),
         ("adapter_sha256", "0" * 64),
         ("arms", ["base0", "feat0"]),

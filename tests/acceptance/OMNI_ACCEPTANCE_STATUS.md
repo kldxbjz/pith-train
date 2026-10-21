@@ -7,6 +7,23 @@ predictor, Code2Wav, multimodal input processing, conversion, speech training,
 SFT and project-relevant RL integration. It does not include Qwen2.5-Omni or
 other Omni families. An implemented interface is not end-to-end acceptance.
 
+The later `da5c47f4d92193e3d38a3e398b9f188d84e7f9d7` complete CPU
+artifacts record 1924 passes in 85 files, with the original executor exit still
+unknown; exact collection and file hashes were reconciled without rerunning the
+suite. At `ed95505a688feaae52c9f27bdedf3842db9805bc`, 132 affected CPU cases
+passed with native exit 0. Its actual 4-H100 run passed independent FP64 attention
+but failed speech step 1: eight expert gradients were missing and two audio
+key-bias NSE values exceeded 0.01. Outputs, loss and input gradients passing did
+not override those failures; subsequent 19 gates were not run. The instance was
+confirmed stopped at 2026-10-21T06:03:49.575919Z.
+
+The successor repairs eager expert autograd propagation and the official single
+BF16 codebook reduction in the reference, plus verified bundle identities,
+separate pretrained-weight initialization and one-pass image decoder allocation.
+The latter changes initialization RNG; final-source evidence must be refreshed.
+Targeted CPU regressions are development evidence, not a new GPU pass. PR receipts
+retain exact source identities and failed runs; test totals are not additive.
+
 The preserved a8a1302d25140e5f75e9f9fb83d46fdcd891fb59 CPU receipt has
 1813 PASS / 0 FAIL / 0 SKIP and eight passing hooks. It predates the scheduler,
 RL model/forward contract and official full-generation-entry corrections.
@@ -157,9 +174,15 @@ The historical `omni_noise_regression.py` keeps its original a0b14f7/d237e4c
 commit locks and workload hash. Use `omni_final_noise.py` for an explicitly
 reviewed newer feature SHA; do not edit the historical guards.
 
-The reviewed baseline is `1611d085a7c244bb01a34caf8b58d19aef9eeeff`, the exact
-`BASE_SHA` enforced by `omni_final_noise.py`. The obsolete d9c791d baseline
-is not accepted by that driver. Preserve its source-comparison checks. The common
+The reviewed baseline is `5a50a7dc950ea2ca6d4066879ed6005aed62dab0`, the exact
+`BASE_SHA` enforced by `omni_final_noise.py`. Its single parent is the preserved
+`1611d085a7c244bb01a34caf8b58d19aef9eeeff`. Only grouped-linear autograd,
+decoder construction and prepared-bundle identity repairs are shared into that
+derived baseline; all 33 common files still require equality against the feature.
+The adapter records the exact parent, tree, patch and three repaired file hashes.
+No old baseline arm is reused, and numerical equivalence to unrepaired 1611 is
+not claimed. These repairs also require their separate original GPU gates.
+The obsolete d9c791d baseline is not accepted. Preserve all source-comparison checks. The common
 ordering fix is excluded from this feature-vs-baseline noise comparison;
 it requires its own kernel/reference and strict-resume validation.
 The adapter checks identical numerical/model/data source and declares the
