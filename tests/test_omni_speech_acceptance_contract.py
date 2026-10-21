@@ -220,9 +220,12 @@ def test_canonical_map_preserves_complete_component_boundaries():
 def test_actual_hf_reference_cpu_forward_backward_and_sixteen_heads():
     from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeConfig
 
-    # This reduced metadata fixture tests the HF calling contract only. The
-    # executable prepare gate separately requires the exact released config SHA.
-    cfg = Qwen3OmniMoeConfig()
+    # Exercise the raw released schema used by GPU preparation, including its
+    # legacy rope_scaling fields; a default config hides migration conflicts.
+    released_path = gate.REPO / "tests/configs/qwen3_omni_full/released-config.json"
+    assert gate.sha(released_path) == gate.RELEASED_CONFIG_SHA256
+    released = json.loads(released_path.read_text())
+    cfg = Qwen3OmniMoeConfig(**copy.deepcopy(released))
     thinker = cfg.thinker_config
     thinker.vision_start_token_id = 210
     thinker.position_id_per_seconds = 13
@@ -250,7 +253,22 @@ def test_actual_hf_reference_cpu_forward_backward_and_sixteen_heads():
     audio.downsample_hidden_size, audio.output_dim = 8, 16
     cfg.im_start_token_id, cfg.user_token_id, cfg.assistant_token_id = 100, 101, 102
     cfg.tts_bos_token_id, cfg.tts_eos_token_id, cfg.tts_pad_token_id = 200, 201, 202
-    actual = gate.tiny_config(thinker, cfg.to_dict())
+    for name in (
+        "im_start_token_id",
+        "user_token_id",
+        "assistant_token_id",
+        "tts_bos_token_id",
+        "tts_eos_token_id",
+        "tts_pad_token_id",
+    ):
+        released[name] = getattr(cfg, name)
+    actual = gate.tiny_config(thinker, released)
+    # Preparation serializes and the GPU process reloads this exact config.
+    actual = Qwen3OmniMoeConfig(**json.loads(json.dumps(actual.to_dict())))
+    assert actual.talker_config.text_config.rope_parameters["mrope_section"] == [4, 2, 2]
+    from pithtrain.models.qwen3_omni_talker import Qwen3OmniMoeTalkerForConditionalGeneration
+
+    Qwen3OmniMoeTalkerForConditionalGeneration(actual.talker_config)
     model = gate.HFChain(actual)
     sample = gate.make_sample(
         SimpleNamespace(

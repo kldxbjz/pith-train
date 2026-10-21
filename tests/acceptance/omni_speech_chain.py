@@ -194,6 +194,9 @@ def tiny_config(thinker, released):
         rope_parameters=dict(rope_type="default", rope_theta=1000000),
     )
     for options in (text, predictor):
+        # HF 5.17 migrates legacy rope_scaling over rope_parameters. The
+        # released head_dim=128 sections must not override this tiny fixture.
+        options.pop("rope_scaling", None)
         if options.get("layer_types") is not None:
             options["layer_types"] = options["layer_types"][: options["num_hidden_layers"]]
     talker_options = copy.deepcopy(released["talker_config"])
