@@ -223,7 +223,9 @@ class MediaAudit:
     def finish_data(self, *, providers, validations, expected_batches):
         owner = int(self.pp_rank == 0)
         assert self.counts["failed_microbatches"] == 0
-        assert self.counts["verify_calls"] == providers * owner
+        # Provider construction and each standalone loader both enforce the
+        # shared bundle contract; neither read is allowed on nonowner ranks.
+        assert self.counts["verify_calls"] == providers * owner + self.counts["loader_calls"]
         assert self.counts["processor_calls"] == providers * owner
         assert self.counts["loader_calls"] >= providers * owner
         if not owner:
