@@ -269,6 +269,7 @@ def hf_generate(model, batch, *, eos_id=None, text_tokens=TEXT_TOKENS, codec_fra
         thinker_output_logits=True,
         talker_max_new_tokens=codec_frames + 1,
         talker_do_sample=False,
+        talker_use_audio_in_video=bool(batch["position_kwargs"].get("use_audio_in_video", False)),
         talker_temperature=1.0,
         talker_pad_token_id=model.config.talker_config.codec_pad_id,
         # Public override for the tiny RVQ vocabulary. The released default

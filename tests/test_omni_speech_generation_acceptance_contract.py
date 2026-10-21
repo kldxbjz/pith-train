@@ -604,3 +604,139 @@ def test_generation_attention_policy_restores_hooks_on_conflict():
         with gate.generation_attention_policy(model):
             model(torch.ones(1, 2), deterministic=False)
     assert dict(model._forward_pre_hooks) == prior
+
+
+@pytest.mark.parametrize("use_audio_in_video", [False, True])
+def test_official_composite_mixed_prefill_propagates_audio_video_flag(
+    official_full_cpu, monkeypatch, use_audio_in_video
+):
+    """Actual HF5.17 Thinker+Talker prefill, native counterpart, both AV layouts."""
+    model, _ = official_full_cpu
+    cfg, c = model.config, model.config.thinker_config
+    audio = [c.audio_start_token_id, c.audio_token_id, c.audio_token_id, c.audio_end_token_id]
+    image = [c.vision_start_token_id, c.image_token_id, c.vision_end_token_id]
+    if use_audio_in_video:
+        video = [
+            c.vision_start_token_id,
+            c.audio_start_token_id,
+            c.video_token_id,
+            c.audio_token_id,
+            c.audio_token_id,
+            c.video_token_id,
+            c.audio_end_token_id,
+            c.vision_end_token_id,
+        ]
+    else:
+        video = [
+            c.vision_start_token_id,
+            c.video_token_id,
+            c.video_token_id,
+            c.vision_end_token_id,
+            *audio,
+        ]
+    ids = torch.tensor(
+        [
+            [
+                cfg.im_start_token_id,
+                cfg.user_token_id,
+                198,
+                *audio,
+                *image,
+                *video,
+                cfg.im_start_token_id,
+                cfg.assistant_token_id,
+                198,
+            ]
+        ]
+    )
+    vision = c.vision_config
+    patch_width = vision.in_channels * vision.temporal_patch_size * vision.patch_size**2
+    context = dict(
+        input_ids=ids,
+        attention_mask=torch.ones_like(ids),
+        input_features=torch.linspace(-0.2, 0.2, 2 * c.audio_config.num_mel_bins * 16).reshape(
+            2, c.audio_config.num_mel_bins, 16
+        ),
+        feature_attention_mask=torch.ones(2, 16, dtype=torch.long),
+        pixel_values=torch.linspace(-0.1, 0.1, 4 * patch_width).reshape(4, patch_width),
+        pixel_values_videos=torch.linspace(-0.1, 0.1, 8 * patch_width).reshape(8, patch_width),
+        image_grid_thw=torch.tensor([[1, 2, 2]]),
+        video_grid_thw=torch.tensor([[2, 2, 2]]),
+        video_second_per_grid=torch.tensor([0.5]),
+        use_audio_in_video=use_audio_in_video,
+    )
+    batch = dict(
+        input_ids=ids,
+        model_context=context,
+        prompt_lengths=[ids.shape[1]],
+        position_kwargs=dict(
+            image_grid_thw=context["image_grid_thw"],
+            video_grid_thw=context["video_grid_thw"],
+            second_per_grids=context["video_second_per_grid"],
+            audio_seqlens=torch.tensor([16, 16]),
+            use_audio_in_video=use_audio_in_video,
+        ),
+    )
+    native, hf, batch = cpu_generation_pair((model, batch), monkeypatch)
+    captured = {}
+
+    class StopAfterFirstPrefill(Exception):
+        pass
+
+    def observe(side):
+        def hook(module, args, kwargs, output):
+            captured[side] = {
+                key: kwargs[key].detach().clone()
+                for key in ("inputs_embeds", "position_ids", "attention_mask")
+            }
+            captured[side]["parameter_dtypes"] = {p.dtype for p in module.parameters()}
+            raise StopAfterFirstPrefill
+
+        return hook
+
+    flags = {"thinker": [], "talker": []}
+
+    def flag(kind):
+        def hook(module, args, kwargs):
+            flags[kind].append(kwargs.get("use_audio_in_video", False))
+
+        return hook
+
+    with (
+        torch.no_grad(),
+        gate.preserve_generation_state(native, hf) as restored,
+        gate.hf_position_metadata(hf, hf.config),
+    ):
+        handles = [
+            hf.thinker.register_forward_pre_hook(flag("thinker"), with_kwargs=True),
+            hf.talker.register_forward_pre_hook(flag("talker"), with_kwargs=True),
+        ]
+        try:
+            for side, current, method in (
+                ("native", native, gate.native_generate),
+                ("hf", hf, gate.hf_generate),
+            ):
+                handle = current.talker.model.register_forward_hook(observe(side), with_kwargs=True)
+                try:
+                    with pytest.raises(StopAfterFirstPrefill):
+                        gate.compute(current, method, batch, text_tokens=4, codec_frames=8)
+                finally:
+                    handle.remove()
+        finally:
+            for handle in handles:
+                handle.remove()
+        assert flags["thinker"] and all(v is use_audio_in_video for v in flags["thinker"])
+        assert flags["talker"] == [use_audio_in_video]
+        for key in ("position_ids", "attention_mask"):
+            torch.testing.assert_close(captured["native"][key], captured["hf"][key], rtol=0, atol=0)
+        assert (
+            captured["native"]["inputs_embeds"].dtype
+            == captured["hf"]["inputs_embeds"].dtype
+            == torch.bfloat16
+        )
+        assert (
+            captured["native"]["parameter_dtypes"]
+            == captured["hf"]["parameter_dtypes"]
+            == {torch.bfloat16}
+        )
+    assert all(restored.values())
