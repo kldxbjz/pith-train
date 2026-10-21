@@ -41,6 +41,7 @@ def parse_args(argv=None):
     parser.add_argument("--sequence-length", type=int, default=256)
     parser.add_argument("--new-tokens", type=int, default=32)
     parser.add_argument("--hf-device", choices=("cpu", "cuda:0"), default="cpu")
+    parser.add_argument("--hf-sequential-models", action="store_true")
     parser.add_argument("--hf-compute-dtype", choices=("bfloat16",), default="bfloat16")
     parser.add_argument("--worker-timeout", type=float, default=120)
     parser.add_argument("--weight-limit-mib", type=int, default=512)
@@ -99,6 +100,7 @@ def main(argv=None, *, observer=None):
     raw = json.loads((args.model / "config.json").read_text())
     config = _config(raw, args.scope)
     cfg = LocalHFRolloutCfg(
+        sequential_models=args.hf_sequential_models,
         scope=args.scope,
         device=args.hf_device,
         compute_dtype=args.hf_compute_dtype,

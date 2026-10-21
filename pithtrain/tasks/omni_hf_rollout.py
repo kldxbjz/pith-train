@@ -50,8 +50,11 @@ class LocalHFRolloutCfg:
     max_host_weight_bytes: int | None = None
     max_device_weight_bytes: int | None = None
     cpu_threads: int = 1
+    sequential_models: bool = False
 
     def validate(self):
+        if type(self.sequential_models) is not bool:
+            raise ValueError("sequential_models must be a boolean")
         if (
             self.scope not in {"text", "thinker"}
             or self.device not in {"cpu", "cuda:0"}
@@ -108,7 +111,8 @@ def weight_memory_plan(config, cfg, *, local_reference_copy=False):
     The native producer owns reference + publication (2W). During synchronous
     installation its worker owns two FP32 models + one incoming payload (3W).
     The local convenience provider additionally owns a defensive reference copy.
-    Device execution retains two FP32 models; BF16 autocast is not BF16 storage.
+    Sequential execution parks the inactive model on CPU; host admission remains
+    conservative. BF16 autocast is not BF16 parameter storage.
     """
     cfg.validate()
     shapes = _converter(cfg.scope).parameter_shapes(config)
@@ -116,7 +120,8 @@ def weight_memory_plan(config, cfg, *, local_reference_copy=False):
     if weight > cfg.max_weight_bytes:
         raise ValueError("Canonical FP32 weight byte limit exceeded before allocation")
     host = (6 if local_reference_copy else 5) * weight
-    device = 2 * weight if cfg.device.startswith("cuda") else 0
+    device_models = 1 if cfg.sequential_models else 2
+    device = device_models * weight if cfg.device.startswith("cuda") else 0
     if weight > 512 << 20 and (
         cfg.max_host_weight_bytes is None or (device and cfg.max_device_weight_bytes is None)
     ):
@@ -126,12 +131,14 @@ def weight_memory_plan(config, cfg, *, local_reference_copy=False):
     if cfg.max_host_weight_bytes is not None and host > cfg.max_host_weight_bytes:
         raise ValueError("Provider peak host weight residency exceeds explicit budget")
     if cfg.max_device_weight_bytes is not None and device > cfg.max_device_weight_bytes:
-        raise ValueError("Two FP32 HF models exceed explicit device weight budget")
+        raise ValueError("FP32 HF model residency exceeds explicit device weight budget")
     return dict(
         canonical_fp32_bytes=weight,
         host_peak_weight_bytes=host,
         device_resident_weight_bytes=device,
         worker_models=2,
+        device_models=device_models if device else 0,
+        sequential_models=cfg.sequential_models,
         host_phase="parent reference/publication + worker models/incoming payload",
         local_reference_copy=local_reference_copy,
         transient_copy_chunk_bytes=4 << 20,
@@ -252,6 +259,7 @@ def worker_contract(raw, cfg):
         device=cfg.device,
         attention="eager",
         fp32_masters=True,
+        sequential_models=cfg.sequential_models,
         execution=execution_identity(),
     )
 
@@ -531,7 +539,7 @@ class _Engine:
         self.policy, _ = _new_hf(raw, cfg.scope)
         self.reference = copy.deepcopy(self.policy)
         self.reference_digest = _install_canonical(self.reference, reference, self.config, cfg)
-        self.reference.to(cfg.device)
+        self.reference.to("cpu" if cfg.sequential_models else cfg.device)
         self.policy.to(cfg.device)
         self.contract = worker_contract(self.config.to_dict(), cfg)
 
@@ -566,6 +574,14 @@ class _Engine:
         if not torch.isfinite(logits).all():
             raise ValueError("Nonfinite HF policy logits")
         return logits.float().cpu()
+
+    def _selected_logprobs(self, model, inputs, targets, prompt):
+        return (
+            self._logits(model, inputs, prompt)
+            .log_softmax(-1)
+            .gather(-1, targets.unsqueeze(-1))
+            .squeeze(-1)
+        )
 
     def generate(self, prompt, rng, eos_token_id):
         ids = prompt["input_ids"]
@@ -623,23 +639,13 @@ class _Engine:
                     {**prompt, "input_ids": inputs, "attention_mask": torch.ones_like(inputs)},
                     self.config,
                 )
-            old = (
-                self._logits(self.policy, inputs, prompt)
-                .log_softmax(-1)
-                .gather(-1, targets.unsqueeze(-1))
-                .squeeze(-1)
-            )
-            reference = (
-                self._logits(self.reference, inputs, prompt)
-                .log_softmax(-1)
-                .gather(-1, targets.unsqueeze(-1))
-                .squeeze(-1)
-            )
+            old = self._selected_logprobs(self.policy, inputs, targets, prompt)
+            if not self.cfg.sequential_models:
+                ref_values.append(self._selected_logprobs(self.reference, inputs, targets, prompt))
             all_ids.append(inputs)
             all_targets.append(targets)
             all_masks.append(valid)
             old_values.append(old)
-            ref_values.append(reference)
             context = {
                 k: v.clone()
                 for k, v in prompt.items()
@@ -662,6 +668,21 @@ class _Engine:
                 }
                 or None
             )
+        if self.cfg.sequential_models:
+            # Finish every policy sample before moving either model. Transfers
+            # preserve FP32 parameters/buffers and do not touch the CPU RNG.
+            self.policy.to("cpu")
+            try:
+                self.reference.to(self.cfg.device)
+                for inputs, targets in zip(all_ids, all_targets, strict=True):
+                    ref_values.append(
+                        self._selected_logprobs(self.reference, inputs, targets, prompt)
+                    )
+            finally:
+                # Restore policy placement even if reference scoring fails.
+                # The owned worker still fails closed on any request error.
+                self.reference.to("cpu")
+                self.policy.to(self.cfg.device)
         return dict(
             input_ids=torch.cat(all_ids),
             sampled_token_ids=torch.cat(all_targets),

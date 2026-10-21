@@ -65,6 +65,26 @@ Above that bound, an explicitly raised canonical limit also requires
 `--device-weight-limit-mib`. These are provider **weight-residency budgets**,
 not declarations that the entire native training job fits.
 
+`--hf-sequential-models` opts into a single resident device model. The worker
+finishes sampling and old-policy scoring for the entire group, moves the policy
+to CPU, moves the fixed reference to the selected device, then scores those same
+sequences. It parks the reference back on CPU and restores policy placement
+before returning, including after a scoring failure. Transfers preserve FP32
+parameters and buffers; the sampling generator, categorical distribution, EOS
+mask, compute dtype and reference weights are unchanged. No model is rebuilt or
+downloaded between phases. The option is bound into worker and resume identity;
+changing it is not a strict continuation of the previous provider contract.
+
+The CPU host budget is deliberately unchanged: two model objects still exist,
+and moving the inactive model to CPU does not remove parent/installation copies.
+Only device-resident parameter storage falls from two FP32 models to one. This
+is not an activation/cache/allocator peak bound or proof that the worker fits
+beside native training on the same GPU. The existing elapsed request deadline
+also includes transfers; no automatic retries or larger timeouts are introduced.
+CPU tests cover real HF text/media FP32/BF16-compute equality, phase order, RNG,
+fixed-reference preservation, and a spawned worker's exact next-update resume.
+Actual CUDA residency and full-size execution remain NOT_RUN.
+
 The pinned released Thinker configuration has 126,876,821,952 FP32 parameter
 bytes (118.163 GiB). The native recipe's conservative synchronous-installation
 phase contains the parent's reference/publication (2 copies), two worker HF
