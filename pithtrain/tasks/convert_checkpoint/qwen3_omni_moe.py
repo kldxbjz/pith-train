@@ -6,6 +6,7 @@ DCP stores those Parameters as indexed [out, in] slices, as checkpoint.py does.
 Media towers/Talker are excluded only by explicit opt-in, with every key reported.
 """
 
+import copy
 import json
 import re
 from collections.abc import Mapping
@@ -127,7 +128,8 @@ def text_config(raw: dict) -> Qwen3OmniMoeTextConfig:
             raise ConversionError(f"Invalid config dimension {key}={value!r}")
     if raw.get("quantization_config"):
         raise ConversionError("Quantized text checkpoints are unsupported")
-    config = Qwen3OmniMoeTextConfig(**raw)
+    # HF normalizes nested legacy RoPE dictionaries in place; preserve source JSON.
+    config = Qwen3OmniMoeTextConfig(**copy.deepcopy(raw))
     if config.tie_word_embeddings or config.attention_dropout or config.hidden_act != "silu":
         raise ConversionError("Native Thinker requires untied embeddings, zero dropout and SiLU")
     if config.decoder_sparse_step < 1:

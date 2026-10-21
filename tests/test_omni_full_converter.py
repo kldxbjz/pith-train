@@ -498,6 +498,29 @@ def test_roundtrip_reproduces_talker_predictor_and_waveform(source):
         assert torch.equal(actual, expected)
 
 
+def test_released_configuration_preserves_raw_json(tmp_path):
+    path = Path(__file__).parent / "configs/qwen3_omni_full/released-config.json"
+    raw = json.loads(path.read_text())
+    original = copy.deepcopy(raw)
+    config = full.configuration(raw, "all")
+    assert raw == original
+    assert config.raw == original
+    manifest = full._manifest(config, "component", {name: "split" for name in full.COMPONENTS}, [])
+    sidecar = tmp_path / full.SIDECAR
+    sidecar.write_text(json.dumps(manifest))
+    restored = full._read_manifest(sidecar, "all")
+    assert restored["source_config"] == restored["export_config"] == original
+    exported = tmp_path / "config.json"
+    exported.write_text(json.dumps(config.export_raw()))
+    again = full.configuration(json.loads(exported.read_text()), "all")
+    assert again.raw == original
+    assert all(
+        config.configs[name].to_dict() == again.configs[name].to_dict() for name in full.COMPONENTS
+    )
+    assert full.parameter_shapes(config) == full.parameter_shapes(again)
+    assert len(full.parameter_shapes(config)) == 19306
+
+
 def test_released_26291_complete_header_schema():
     path = Path(__file__).parent / "configs/qwen3_omni_full/released-config.json"
     assert hashlib.sha256(path.read_bytes()).hexdigest() == (
