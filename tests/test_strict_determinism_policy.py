@@ -13,6 +13,7 @@ from pithtrain.modules.reproducibility import (
     configure_deterministic_training,
     runtime_determinism_snapshot,
 )
+from tests.cpu_helpers import setup_training_fixture as setup_training_fixture
 
 ROOT = Path(__file__).parents[1]
 
@@ -115,36 +116,15 @@ def test_configuration_error_is_not_suppressed(monkeypatch):
 @pytest.mark.parametrize("strict", [None, False, True])
 @pytest.mark.parametrize("deterministic", [None, False, True])
 def test_setup_training_applies_policy_before_constructing_model(
-    monkeypatch, strict, deterministic
+    setup_training, monkeypatch, strict, deterministic
 ):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     torch.use_deterministic_algorithms(False)
     torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic = True, False
-    node = next(
-        item
-        for item in ast.parse((ROOT / "pithtrain/modules/training.py").read_text()).body
-        if isinstance(item, ast.FunctionDef) and item.name == "setup_training"
-    )
-    cfg = SimpleNamespace(
-        training=SimpleNamespace(seed=1234, optimizer=lambda _: (), scheduler=lambda _: ()),
-        distributed=SimpleNamespace(),
-    )
-    if strict is not None:
-        cfg.training.strict_resume = strict
-    if deterministic is not None:
-        cfg.training.deterministic = deterministic
     runtime, seen = SimpleNamespace(deterministic_attention=None), []
-    noop_seed = SimpleNamespace(seed=lambda _: None)
-    namespace = dict(
-        TrainingCfg=SimpleNamespace,
-        training=runtime,
-        random=noop_seed,
-        np=SimpleNamespace(random=noop_seed),
-        torch=SimpleNamespace(
-            manual_seed=lambda _: None, cuda=SimpleNamespace(manual_seed_all=lambda _: None)
-        ),
-        configure_deterministic_training=configure_deterministic_training,
-        setup_model=lambda *_: seen.append(
+    cfg, setup = setup_training(
+        runtime,
+        lambda *_: seen.append(
             (
                 torch.are_deterministic_algorithms_enabled(),
                 torch.backends.cudnn.benchmark,
@@ -152,9 +132,13 @@ def test_setup_training_applies_policy_before_constructing_model(
                 runtime.deterministic_attention,
             )
         ),
+        configure_deterministic_training,
     )
-    exec(compile(ast.Module(body=[node], type_ignores=[]), "<setup_training>", "exec"), namespace)
-    namespace["setup_training"](cfg)
+    if strict is not None:
+        cfg.training.strict_resume = strict
+    if deterministic is not None:
+        cfg.training.deterministic = deterministic
+    setup(cfg)
     enabled = bool(strict or deterministic)
     assert seen == [(enabled, not enabled, enabled, enabled)]
 

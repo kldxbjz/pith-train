@@ -4,28 +4,10 @@ Extracting these pure methods avoids unrelated CUDA-only kernel imports. The
 production bodies are executed without replacement in both controls.
 """
 
-import ast
-from pathlib import Path
-from types import SimpleNamespace
-
 import pytest
 import torch
 
-
-def layer_type(ep):
-    source = Path(__file__).parents[1] / "pithtrain/models/qwen3_omni_moe.py"
-    tree = ast.parse(source.read_text())
-    name = "Qwen3OmniMoeThinkerTextDecoderLayer"
-    definition = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name)
-    namespace = dict(torch=torch, distributed=SimpleNamespace(ep_size=ep))
-    cls = type(name, (torch.nn.Module,), {})
-    for method in ("_forward_stage5", "forward_stage5"):
-        node = next(
-            n for n in definition.body if isinstance(n, ast.FunctionDef) and n.name == method
-        )
-        exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), namespace)
-        setattr(cls, method, namespace[method])
-    return cls
+from tests.cpu_helpers import layer_type
 
 
 @pytest.mark.parametrize("is_moe,ep", [(False, 1), (True, 1), (True, 2)])

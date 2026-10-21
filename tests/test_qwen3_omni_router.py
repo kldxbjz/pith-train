@@ -5,8 +5,6 @@ model eagerly probes CUDA through its kernel imports. This does not exercise
 native attention, grouped GEMM, FSDP or the pipeline.
 """
 
-import ast
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -15,24 +13,19 @@ import torch.nn.functional as F
 from torch import nn
 
 from pithtrain.modules.load_balance import MoELoadBalanceLossInjector, replay_indices
+from tests.cpu_helpers import load_definitions
 
 
 def router_class():
-    source = Path(__file__).parents[1] / "pithtrain/models/qwen3_omni_moe.py"
-    tree = ast.parse(source.read_text())
-    node = next(
-        item
-        for item in tree.body
-        if isinstance(item, ast.ClassDef) and item.name == "Qwen3OmniMoeThinkerTextTopKRouter"
-    )
     namespace = {
         "torch": torch,
         "F": F,
         "nn": nn,
         "MoELoadBalanceLossInjector": MoELoadBalanceLossInjector,
     }
-    exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), namespace)
-    return namespace[node.name]
+    name = "Qwen3OmniMoeThinkerTextTopKRouter"
+    load_definitions("pithtrain/models/qwen3_omni_moe.py", (name,), namespace)
+    return namespace[name]
 
 
 @pytest.mark.parametrize("normalized", [False, True])

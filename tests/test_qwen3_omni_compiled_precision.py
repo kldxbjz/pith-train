@@ -4,8 +4,6 @@ Stage5 executes its complete original body. Stage1 fixes the attention output
 to isolate residual, norm and routing arithmetic; it is not FA4 acceptance.
 """
 
-import ast
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -13,9 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tests.test_qwen3_omni_stage5 import layer_type
-
-ROOT = Path(__file__).parents[1]
+from tests.cpu_helpers import layer_type, load_definitions
 
 
 def value_and_grads(call, layer, sources, indices, cotangent):
@@ -66,24 +62,18 @@ def test_compiled_stage5_preserves_bf16_output_and_every_input_gradient(is_moe, 
 
 def controlled_stage1_type():
     namespace = dict(torch=torch, nn=nn, F=F)
-    path = ROOT / "pithtrain/models/qwen3_omni_moe.py"
-    tree = ast.parse(path.read_text())
-    for name in ("Qwen3OmniMoeThinkerTextRMSNorm", "Qwen3OmniMoeThinkerTextTopKRouter"):
-        node = next(
-            node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == name
-        )
-        exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
-    decoder = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.ClassDef) and node.name == "Qwen3OmniMoeThinkerTextDecoderLayer"
+    path = "pithtrain/models/qwen3_omni_moe.py"
+    load_definitions(
+        path,
+        ("Qwen3OmniMoeThinkerTextRMSNorm", "Qwen3OmniMoeThinkerTextTopKRouter"),
+        namespace,
     )
-    method = next(
-        node
-        for node in decoder.body
-        if isinstance(node, ast.FunctionDef) and node.name == "forward_stage1_compute"
+    load_definitions(
+        path,
+        ("forward_stage1_compute",),
+        namespace,
+        class_name="Qwen3OmniMoeThinkerTextDecoderLayer",
     )
-    exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), namespace)
 
     class FixedAttention(nn.Module):
         def __init__(self, value):

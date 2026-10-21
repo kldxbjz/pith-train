@@ -4,7 +4,6 @@ The real torch.library schema, fake kernels and registered autograd run here.
 Only the external CUDA-only FA4 entry points are replaced with CPU test doubles.
 """
 
-import ast
 import sys
 import types
 import uuid
@@ -15,6 +14,7 @@ import pytest
 import torch
 
 from pithtrain.contexts import training
+from tests.cpu_helpers import setup_training_fixture as setup_training_fixture
 
 ROOT = Path(__file__).parents[1]
 
@@ -124,33 +124,14 @@ def test_fullgraph_aot_autograd_preserves_policy(wrapper, monkeypatch, packed, s
 
 
 @pytest.mark.parametrize("strict", [None, False, True])
-def test_setup_training_sets_policy_before_model_construction(strict):
-    path = ROOT / "pithtrain/modules/training.py"
-    tree = ast.parse(path.read_text())
-    node = next(
-        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "setup_training"
-    )
+def test_setup_training_sets_policy_before_model_construction(setup_training, strict):
     runtime = SimpleNamespace(deterministic_attention=not strict)
     observed = []
-    cfg = SimpleNamespace(
-        training=SimpleNamespace(seed=1234, optimizer=lambda _: (), scheduler=lambda _: ()),
-        distributed=SimpleNamespace(),
+    cfg, setup = setup_training(
+        runtime, lambda *_: observed.append(runtime.deterministic_attention), lambda _: None
     )
     if strict is not None:
         cfg.training.strict_resume = strict
-    noop_seed = SimpleNamespace(seed=lambda _: None)
-    namespace = dict(
-        TrainingCfg=SimpleNamespace,
-        training=runtime,
-        random=noop_seed,
-        np=SimpleNamespace(random=noop_seed),
-        torch=SimpleNamespace(
-            manual_seed=lambda _: None, cuda=SimpleNamespace(manual_seed_all=lambda _: None)
-        ),
-        setup_model=lambda *_: observed.append(runtime.deterministic_attention),
-        configure_deterministic_training=lambda _: None,
-    )
-    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
-    namespace["setup_training"](cfg)
+    setup(cfg)
     assert observed == [bool(strict)]
     assert runtime.deterministic_attention is bool(strict)
