@@ -301,6 +301,8 @@ def test_training_preparation_splits_resume_and_integrity(tmp_path, processor_co
         checksum_path.write_text(invalid)
         with pytest.raises(ValueError, match="checksum inventory"):
             reader().load_state_dict(saved)
+        with pytest.raises(ValueError, match="checksum inventory"):
+            create_omni_dataloader(root, processor, config, stage="text", split="train")
     checksum_path.write_text(original_checksums)
     extra = root / "tokens/train/unlisted.bin"
     extra.write_bytes((root / "tokens/train/00000.bin").read_bytes())
@@ -318,6 +320,9 @@ def test_training_preparation_splits_resume_and_integrity(tmp_path, processor_co
     # Updating both data and its checksum still cannot keep the old bundle identity.
     with pytest.raises(ValueError, match="content_id"):
         reader().load_state_dict(saved)
+    # The public standalone reader must enforce the same bundle identity.
+    with pytest.raises(ValueError, match="content_id"):
+        create_omni_dataloader(root, processor, config, stage="text", split="train")
     assert saved["consumed_samples"] == 1
 
     # Deliberately publishing a NEW content identity is valid, but must not resume

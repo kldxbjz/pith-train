@@ -5,7 +5,6 @@ inputs in a DualPipeV Microbatch; native Omni must consume the features and
 construct multimodal positions.
 """
 
-import hashlib
 import json
 import math
 import random
@@ -428,23 +427,10 @@ def create_omni_dataloader(
     in order; this initial evaluation reader is single-process (no DP padding).
     This returns data batches, not an already-connected DualPipeV training task.
     """
+    from pithtrain.tasks.prepare_omni_data import verify_bundle
+
     root = Path(root).resolve()
-    checksums = dict(
-        (name, digest)
-        for digest, name in (
-            line.split("  ", 1) for line in (root / "checksums.sha256").read_text().splitlines()
-        )
-    )
-
-    def verify_metadata(path):
-        name = str(path.relative_to(root))
-        with path.open("rb") as stream:
-            actual = hashlib.file_digest(stream, "sha256").hexdigest()
-        if checksums.get(name) != actual:
-            raise ValueError(f"Dataset metadata hash mismatch: {name}")
-
-    verify_metadata(root / "bundle.json")
-    bundle = json.loads((root / "bundle.json").read_text())
+    bundle = verify_bundle(root)
     if bundle["status"] != "complete" or split not in {"train", "validation"}:
         raise ValueError("Expected a completed bundle and train/validation split")
     recipe = bundle["recipe"]
@@ -463,8 +449,6 @@ def create_omni_dataloader(
     manifests = [(root / name).resolve() for kind in modalities for name in available[kind]]
     if any(not path.is_relative_to(root) for path in manifests):
         raise ValueError("Manifest outside the bundle directory")
-    for path in manifests:
-        verify_metadata(path)
     dataset = Qwen3OmniDataset(manifests, media_root=root, allowed_modalities=modalities)
     collator = Qwen3OmniCollator(
         processor, thinker_config, **(recipe["batch"] if batch_cfg is None else batch_cfg)
