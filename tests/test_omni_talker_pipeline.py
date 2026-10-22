@@ -14,12 +14,18 @@ import pytest
 import torch
 from torch import nn
 
+from tests.cpu_helpers import load_definitions
+
 ROOT = Path(__file__).parents[1]
 SOURCE = ROOT / "pithtrain/models/qwen3_omni_talker_pipeline.py"
 
 
 def method_namespace(ep=1):
-    return dict(torch=torch, nn=nn, distributed=SimpleNamespace(ep_size=ep))
+    return load_definitions(
+        "pithtrain/models/qwen3_omni_moe.py",
+        ("_combine_expert_order",),
+        dict(torch=torch, nn=nn, distributed=SimpleNamespace(ep_size=ep)),
+    )
 
 
 def extract_class_methods(name, methods, namespace):
@@ -95,7 +101,9 @@ def test_talker_stage1_computes_shared_expert_before_dispatch_without_folding_re
             return indexes, weights, None
 
     cls = extract_class_methods(
-        "Qwen3OmniMoeTalkerPipelineDecoderLayer", ("forward_stage1_compute",), method_namespace()
+        "Qwen3OmniMoeTalkerPipelineDecoderLayer",
+        ("_forward_shared_expert", "forward_stage1_compute"),
+        method_namespace(),
     )
     actual = cls()
     actual.self_attn = Attention()

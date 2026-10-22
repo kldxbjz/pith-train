@@ -63,6 +63,9 @@ class Qwen3OmniMoeTalkerPipelineDecoderLayer(Qwen3OmniMoeThinkerTextDecoderLayer
         )
 
     @torch.compile(fullgraph=True, options={"emulate_precision_casts": True})
+    def _forward_shared_expert(self, hidden_states):
+        return self.mlp.shared_forward(hidden_states)
+
     def forward_stage1_compute(
         self, hidden_states, rotary_posemb, cu_seqlens=None, replay_idx=None
     ):
@@ -70,7 +73,10 @@ class Qwen3OmniMoeTalkerPipelineDecoderLayer(Qwen3OmniMoeThinkerTextDecoderLayer
             self.input_layernorm(hidden_states), rotary_posemb, cu_seqlens
         )
         hidden_states = self.post_attention_layernorm(residual)
-        shared = self.mlp.shared_forward(hidden_states)
+        # Keep HF's norm and router boundaries: fusing the FP32 Q-norm
+        # reduction changed a BF16 value and later top-k decisions in G2.
+        # FA4/GEMMs remain native kernels; the shared MLP and stage5 stay compiled.
+        shared = self._forward_shared_expert(hidden_states)
         routing = self.mlp.gate(hidden_states, replay_idx)
         # Carry both tensors through the existing residual channel. Folding
         # shared into residual here would change HF's BF16 addition order.
