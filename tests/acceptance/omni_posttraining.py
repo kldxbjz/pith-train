@@ -815,7 +815,10 @@ def run_gpu(args):
                 "driver_gpu_uuid",
                 ["nvidia-smi", "--query-gpu=name,uuid,driver_version", "--format=csv,noheader"],
             ),
-            ("nvlink_topology", ["nvidia-smi", "topo", "-m"]),
+            # The CPU/PCI affinity query can be unavailable in a GPU container.
+            # Record it separately; the NVLink capability matrix is GPU-only.
+            ("host_topology", ["nvidia-smi", "topo", "-m"]),
+            ("nvlink_topology", ["nvidia-smi", "topo", "-p2p", "n"]),
         ):
             proc = subprocess.run(command, capture_output=True, text=True, timeout=5, check=False)
             hardware[key] = dict(returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
