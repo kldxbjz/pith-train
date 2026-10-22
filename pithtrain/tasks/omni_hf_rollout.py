@@ -220,6 +220,33 @@ def _new_hf(raw, scope):
     return model.float().eval().requires_grad_(False), config
 
 
+def _new_hf_from_canonical(raw, cfg, values):
+    """Construct a complete text policy for loading, never for random initialization.
+
+    Real CPU constructors retain nonpersistent RoPE buffers. Only initialization
+    of parameters that the strict installer replaces is skipped; no meta/to_empty
+    conversion can leave computed buffers uninitialized.
+    """
+    from transformers.initialization import no_init_weights
+
+    if cfg.scope != "text":
+        raise ValueError("Load-only HF construction supports the text scope only")
+    config = _config(raw, cfg.scope)
+    _check_weights(values, config, cfg)
+    with no_init_weights():
+        model, config = _new_hf(raw, cfg.scope)
+    canonical = _canonical(model.state_dict(), config, cfg.scope)
+    storage = lambda tensor: (tensor.device, tensor.untyped_storage().data_ptr())
+    if {storage(value) for value in canonical.values()} != {
+        storage(value) for value in model.parameters()
+    } or sum(value.numel() for value in canonical.values()) != sum(
+        value.numel() for value in model.parameters()
+    ):
+        raise ValueError("Load-only canonical weights must cover every HF parameter")
+    digest = _install_canonical(model, values, config, cfg)
+    return model, config, digest
+
+
 def _hf_implementation():
     from transformers import masking_utils, modeling_rope_utils
     from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
@@ -536,15 +563,34 @@ class _Engine:
         self.cfg = cfg
         self.config = _config(raw, cfg.scope)
         _check_weights(reference, self.config, cfg)
-        self.policy, _ = _new_hf(raw, cfg.scope)
-        self.reference = copy.deepcopy(self.policy)
-        self.reference_digest = _install_canonical(self.reference, reference, self.config, cfg)
+        self.raw = copy.deepcopy(raw)
+        if cfg.scope == "text":
+            self.reference, _, self.reference_digest = _new_hf_from_canonical(raw, cfg, reference)
+            # The policy's complete snapshot arrives in synchronize. Do not copy
+            # disposable initialized weights or transfer them to the device.
+            self.policy = None
+        else:
+            self.policy, _ = _new_hf(raw, cfg.scope)
+            self.reference = copy.deepcopy(self.policy)
+            self.reference_digest = _install_canonical(self.reference, reference, self.config, cfg)
         self.reference.to("cpu" if cfg.sequential_models else cfg.device)
-        self.policy.to(cfg.device)
+        if self.policy is not None:
+            self.policy.to(cfg.device)
         self.contract = worker_contract(self.config.to_dict(), cfg)
 
     def synchronize(self, values):
-        digest = _install_canonical(self.policy, values, self.config, self.cfg)
+        if self.policy is None:
+            policy, _, digest = _new_hf_from_canonical(self.raw, self.cfg, values)
+            policy.to(self.cfg.device)
+            # Keep the exact installed-device readback after the first transfer.
+            if (
+                _stream_weights_digest(_canonical(policy.state_dict(), self.config, self.cfg.scope))
+                != digest
+            ):
+                raise ValueError("HF installed policy changed during device transfer")
+            self.policy = policy
+        else:
+            digest = _install_canonical(self.policy, values, self.config, self.cfg)
         return dict(
             installed_weights_sha256=digest,
             reference_weights_sha256=self.reference_digest,
@@ -584,6 +630,8 @@ class _Engine:
         )
 
     def generate(self, prompt, rng, eos_token_id):
+        if self.policy is None:
+            raise ValueError("HF policy requires a complete synchronized snapshot")
         ids = prompt["input_ids"]
         length = ids.shape[1]
         if length + self.cfg.max_new_tokens > self.cfg.max_sequence_length:

@@ -455,6 +455,7 @@ def test_real_hf_installation_uses_live_views_without_fused_export_or_full_cpu_c
     monkeypatch.setattr(provider, "_cpu_tree", forbidden)
     monkeypatch.setattr(provider._converter("text"), "canonical_to_hf", forbidden)
     engine = provider._Engine(raw, cfg, values)
+    assert engine.synchronize(values)["installed_weights_sha256"] == _weights_digest(values)
     original = {name: value.data_ptr() for name, value in engine.policy.named_parameters()}
     changed = {name: value + 0.125 for name, value in values.items()}
     receipt = engine.synchronize(changed)
@@ -527,3 +528,158 @@ def test_released_provider_weight_admission_is_meta_only_and_explicit():
             config, replace(cfg, max_host_weight_bytes=640 << 30), local_reference_copy=True
         )
     assert not torch.cuda.is_initialized()
+
+
+def test_load_only_text_matches_all_parameters_buffers_logits_and_rng():
+    from pithtrain.tasks import omni_hf_rollout as provider
+
+    torch.set_num_threads(1)
+    torch.manual_seed(121)
+    before_default = torch.get_rng_state().clone()
+    original, config = _new_hf(raw_config(), "text")
+    assert not torch.equal(torch.get_rng_state(), before_default)
+    # Explicit finite fixture, independent of storage left by HF constructors.
+    with torch.no_grad():
+        for parameter in original.parameters():
+            parameter.normal_(0, 0.02)
+    values = _canonical(_cpu_tree(original.state_dict()), config, "text")
+    cfg = LocalHFRolloutCfg(max_sequence_length=10, max_new_tokens=2)
+    rng = torch.get_rng_state().clone()
+    loaded, loaded_config, digest = provider._new_hf_from_canonical(raw_config(), cfg, values)
+    assert torch.equal(torch.get_rng_state(), rng)
+    assert digest == _weights_digest(values)
+    assert loaded_config.to_dict() == config.to_dict()
+    tree_equal(dict(loaded.named_parameters()), dict(original.named_parameters()))
+    tree_equal(dict(loaded.named_buffers()), dict(original.named_buffers()))
+    original_modules = dict(original.named_modules())
+    assert dict(loaded.named_buffers())  # Includes computed, nonpersistent RoPE state.
+    for name, module in loaded.named_modules():
+        oracle = original_modules[name]
+        assert module._non_persistent_buffers_set == oracle._non_persistent_buffers_set
+        for key, value in vars(oracle).items():
+            if isinstance(value, torch.Tensor):
+                torch.testing.assert_close(getattr(module, key), value, rtol=0, atol=0)
+    ids = torch.tensor([[2, 3, 4, 5], [5, 4, 3, 2]])
+    torch.testing.assert_close(loaded(ids), original(ids), rtol=0, atol=0)
+    assert torch.isfinite(loaded(ids)).all()
+    assert not torch.cuda.is_initialized()
+
+
+@pytest.mark.parametrize("change", ["missing", "nonfinite", "dtype"])
+def test_load_only_rejects_invalid_source_before_model_allocation(monkeypatch, change):
+    from pithtrain.tasks import omni_hf_rollout as provider
+
+    original, config = _new_hf(raw_config(), "text")
+    values = _canonical(_cpu_tree(original.state_dict()), config, "text")
+    name = next(iter(values))
+    if change == "missing":
+        del values[name]
+    elif change == "nonfinite":
+        values[name].fill_(float("nan"))
+    else:
+        values[name] = values[name].to(torch.bfloat16)
+
+    def forbidden(*args):
+        raise AssertionError("Invalid source must be rejected before model construction")
+
+    monkeypatch.setattr(provider, "_new_hf", forbidden)
+    with pytest.raises(ValueError):
+        provider._new_hf_from_canonical(raw_config(), LocalHFRolloutCfg(), values)
+
+
+def test_real_load_only_public_snapshot_sync_generate_reward_and_cleanup(tmp_path):
+    from pithtrain.tasks import omni_hf_rollout as provider
+
+    torch.set_num_threads(1)
+    prompts, tokens = inputs(tmp_path)
+    torch.manual_seed(122)
+    original, config = _new_hf(raw_config(), "text")
+    with torch.no_grad():
+        for parameter in original.parameters():
+            parameter.normal_(0, 0.02)
+    values = _canonical(_cpu_tree(original.state_dict()), config, "text")
+    cfg = LocalHFRolloutCfg(max_sequence_length=10, max_new_tokens=2, sequential_models=True)
+    parent, _, digest = provider._new_hf_from_canonical(raw_config(), cfg, values)
+    parent.requires_grad_(True)
+    adapter = HFCanonicalPolicyAdapter(parent, torch.optim.AdamW(parent.parameters()))
+    reward = ExactAnswerReward(prompts, tokens)
+    rollout = LocalHFThinkerRollout(
+        cfg,
+        model_config=raw_config(),
+        prompts=prompts,
+        reference=values,
+        eos_token_id=tokens.eos_token_id,
+        reward_config=reward.config,
+    )
+    # Ordinary fully initialized HF models supply the independent loaded-value
+    # oracle; the unchanged generation arithmetic is evaluated directly on CPU.
+    oracle = _Engine.__new__(_Engine)
+    oracle.cfg, oracle.config = cfg, config
+    oracle.policy = original
+    oracle.reference, _ = _new_hf(raw_config(), "text")
+    provider._install_canonical(oracle.reference, values, config, cfg)
+    worker = None
+    try:
+        snapshot = adapter.snapshot(0, rollout.contract)
+        original.requires_grad_(True)
+        original_adapter = HFCanonicalPolicyAdapter(
+            original, torch.optim.AdamW(original.parameters())
+        )
+        original_snapshot = original_adapter.snapshot(0, rollout.contract)
+        assert snapshot.semantics == original_snapshot.semantics
+        assert snapshot.identity == original_snapshot.identity
+        rng = rollout.rng.clone()
+        expected = oracle.generate(prompts.payload(0), rng, tokens.eos_token_id)
+        assert rollout.synchronize(snapshot) == snapshot.identity
+        worker = rollout.worker
+        directory = Path(worker.directory.name)
+        assert rollout.installation_receipt["installed_weights_sha256"] == digest
+        assert rollout.installation_receipt["reference_weights_sha256"] == digest
+        assert not (directory / "reference.pt").exists()
+        assert not (directory / "request.pt").exists()
+        request = RolloutRequest(
+            snapshot.identity,
+            0,
+            0,
+            cfg.seed,
+            cfg.group_size,
+            cfg.group_size,
+            cfg.max_sequence_length,
+            0,
+            0,
+            True,
+        )
+        batch = rollout.generate(request)
+        for key in (
+            "input_ids",
+            "sampled_token_ids",
+            "token_mask",
+            "old_logprobs",
+            "reference_logprobs",
+        ):
+            torch.testing.assert_close(getattr(batch, key), expected[key], rtol=0, atol=0)
+        assert torch.equal(rollout.rng, expected["rng"])
+        scores = reward.score(request, batch)
+        decoded = torch.tensor(
+            [
+                float(
+                    tokens.decode(
+                        ids[mask].tolist(),
+                        skip_special_tokens=True,
+                        clean_up_tokenization_spaces=False,
+                    ).strip()
+                    == "red"
+                )
+                for ids, mask in zip(batch.sampled_token_ids, batch.token_mask, strict=True)
+            ]
+        )
+        assert torch.equal(scores, decoded)
+        assert rollout.requests == 1 and rollout.cursor == cfg.group_size and reward.calls == 1
+        assert not adapter.optimizer.state and all(p.grad is None for p in parent.parameters())
+        rollout.validate_state_dict(rollout.state_dict())
+        tree_equal(parent.state_dict(), original.state_dict())
+        assert not torch.cuda.is_initialized()
+    finally:
+        rollout.close()
+    assert worker is not None and worker.process is None and worker.connection is None
+    assert not directory.exists()
