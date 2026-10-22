@@ -33,6 +33,7 @@ def samples():
 @pytest.mark.parametrize("mode", gate.MODES)
 def test_plan_keeps_four_updates_and_distinguishes_true_zero(mode):
     report = gate.plan(mode)
+    assert report["reference_contract"] == "hf-prefix-v1"
     assert report["updates"] == 4
     assert report["topology"] == dict(dp=2, cp=1, ep=1, pp=1)
     assert report["checkpoint"]["save_scan"] == report["checkpoint"]["save_updates"] == 2
@@ -45,6 +46,24 @@ def test_plan_keeps_four_updates_and_distinguishes_true_zero(mode):
         "REQUIRED" if mode == "waveform" else "NOT_EXPRESSIBLE_EOS"
     )
     assert report["status"] == "NOT_RUN"
+
+
+@pytest.mark.parametrize("mode", ("codec_only", "text_and_codec"))
+def test_parallel_reference_changes_only_explicit_plan_identity(mode):
+    prefix = gate.plan(mode)
+    parallel = gate.plan(mode, residual_reference="hf-parallel-causal-v1")
+    assert prefix.pop("reference_contract") == "hf-prefix-v1"
+    assert parallel.pop("reference_contract") == "hf-parallel-causal-v1"
+    assert parallel == prefix
+
+
+@pytest.mark.parametrize(
+    "mode,reference",
+    (("waveform", "hf-parallel-causal-v1"), ("text_and_codec", "unknown")),
+)
+def test_inapplicable_or_unknown_reference_is_rejected(mode, reference):
+    with pytest.raises(ValueError):
+        gate.plan(mode, residual_reference=reference)
 
 
 def test_all_names_no_small_gradient_exemption_and_exact_boundary(monkeypatch):
@@ -220,6 +239,7 @@ def test_producer_cannot_be_self_different_runtime_or_failed(tmp_path):
         runtime_lock=lock,
         rank=0,
         hardware="CPU-contract-no-GPU",
+        residual_reference="hf-prefix-v1",
     )
     good = dict(
         schema=gate.SCHEMA,
@@ -230,6 +250,7 @@ def test_producer_cannot_be_self_different_runtime_or_failed(tmp_path):
         mode="produce",
         source=args.source,
         training_mode="waveform",
+        reference_contract="hf-prefix-v1",
         fixture_sha256="fixture",
         pid=os.getpid() + 1,
         runtime_lock_sha256=gate.chain.sha(lock),
@@ -239,6 +260,8 @@ def test_producer_cannot_be_self_different_runtime_or_failed(tmp_path):
         ("pid", os.getpid()),
         ("status", "FAIL"),
         ("runtime_lock_sha256", "bad"),
+        ("reference_contract", "hf-parallel-causal-v1"),
+        ("reference_contract", None),
         ("source", {}),
     ):
         with pytest.raises(gate.chain.PreconditionError):
@@ -468,7 +491,7 @@ def test_runtime_still_rejects_mandatory_preconditions(monkeypatch, dp2_runtime,
 
 @pytest.mark.parametrize("failure", ("hardware", "nccl", "numerical"))
 def test_main_runtime_keeps_hardware_nccl_and_numerical_gates(
-    monkeypatch, tmp_path, dp2_runtime, failure
+    monkeypatch, tmp_path, dp2_runtime, failure, reference="hf-prefix-v1"
 ):
     prepared = tmp_path / "prepared"
     prepared.mkdir()
@@ -481,7 +504,9 @@ def test_main_runtime_keeps_hardware_nccl_and_numerical_gates(
             "omni_speech_sharded",
             "produce",
             "--training-mode",
-            "waveform",
+            "text_and_codec" if reference == "hf-parallel-causal-v1" else "waveform",
+            "--residual-reference",
+            reference,
             "--expected-commit",
             "a" * 40,
             "--prepared",
@@ -499,7 +524,11 @@ def test_main_runtime_keeps_hardware_nccl_and_numerical_gates(
     init = Mock(side_effect=RuntimeError("NCCL sentinel") if failure == "nccl" else None)
     destroy = Mock()
     build = Mock(return_value=(SimpleNamespace(model=object()), object(), "CPU mock"))
-    numeric = Mock(side_effect=AssertionError("numerical sentinel"))
+    numeric = (
+        Mock(return_value=dict(status="PASS"))
+        if failure == "success"
+        else Mock(side_effect=AssertionError("numerical sentinel"))
+    )
     monkeypatch.setattr(gate.dist, "init_process_group", init)
     monkeypatch.setattr(
         gate.dist, "is_initialized", lambda: bool(init.call_count) and failure != "nccl"
@@ -507,13 +536,16 @@ def test_main_runtime_keeps_hardware_nccl_and_numerical_gates(
     monkeypatch.setattr(gate.dist, "destroy_process_group", destroy)
     monkeypatch.setattr(gate.chain, "build_pair", build)
     monkeypatch.setattr(gate, "run_gate", numeric)
-    error = {
-        "hardware": gate.chain.PreconditionError,
-        "nccl": RuntimeError,
-        "numerical": AssertionError,
-    }[failure]
-    with pytest.raises(error):
+    if failure == "success":
         gate.main()
+    else:
+        error = {
+            "hardware": gate.chain.PreconditionError,
+            "nccl": RuntimeError,
+            "numerical": AssertionError,
+        }[failure]
+        with pytest.raises(error):
+            gate.main()
     report = json.loads((output / "rank-0" / "result.json").read_text())
     if failure == "hardware":
         init.assert_not_called()
@@ -523,14 +555,76 @@ def test_main_runtime_keeps_hardware_nccl_and_numerical_gates(
             "nccl", timeout=timedelta(seconds=120), device_id=torch.device("cuda", 0)
         )
         assert report["runtime"]["nvlink_topology"]["status"] == "UNAVAILABLE"
-    if failure == "numerical":
-        build.assert_called_once_with({}, torch.device("cuda", 0))
+    if failure in ("numerical", "success"):
+        build.assert_called_once_with({}, torch.device("cuda", 0), residual_reference=reference)
         numeric.assert_called_once()
         destroy.assert_called_once()
-        assert report["status"] == "FAIL" and report["gpu_acceptance"] == "FAIL_THIS_GATE"
-        assert report["failure_phase"] == "numerical_and_native_resume"
+        if failure == "numerical":
+            assert report["status"] == "FAIL"
+            assert report["failure_phase"] == "numerical_and_native_resume"
+            if reference == "hf-prefix-v1":
+                assert report["gpu_acceptance"] == "FAIL_THIS_GATE"
+        else:
+            assert report["status"] == "DIAGNOSTIC_PARALLEL_REFERENCE_ONLY"
     else:
         build.assert_not_called()
         numeric.assert_not_called()
         destroy.assert_not_called()
-        assert report["status"] == "NOT_RUN_PRECONDITION" and report["gpu_acceptance"] == "NOT_RUN"
+        assert report["status"] == "NOT_RUN_PRECONDITION"
+        if reference == "hf-prefix-v1":
+            assert report["gpu_acceptance"] == "NOT_RUN"
+    if reference == "hf-parallel-causal-v1":
+        assert report["gpu_acceptance"] == "NOT_ASSESSED_DIAGNOSTIC_ONLY"
+        assert report["diagnostic_label"] == "DIAGNOSTIC_PARALLEL_REFERENCE_ONLY"
+        assert report["numerical_status"] == (
+            "PASS" if failure == "success" else "FAIL" if failure == "numerical" else "NOT_RUN"
+        )
+
+
+@pytest.mark.parametrize("failure", ("hardware", "nccl", "numerical", "success"))
+def test_parallel_main_is_diagnostic_even_after_numerical_success(
+    monkeypatch, tmp_path, dp2_runtime, failure
+):
+    # Mocked CPU control flow only; this never establishes actual CUDA success.
+    test_main_runtime_keeps_hardware_nccl_and_numerical_gates(
+        monkeypatch, tmp_path, dp2_runtime, failure, reference="hf-parallel-causal-v1"
+    )
+
+
+def test_parallel_restore_requires_matching_diagnostic_numerical_success(tmp_path):
+    lock = tmp_path / "lock.json"
+    lock.write_text("{}")
+    args = SimpleNamespace(
+        source=dict(commit="a" * 40, tree="b" * 40),
+        training_mode="text_and_codec",
+        runtime_lock=lock,
+        rank=0,
+        hardware="CPU-contract-no-GPU",
+        residual_reference="hf-parallel-causal-v1",
+    )
+    producer = dict(
+        schema=gate.SCHEMA,
+        status="DIAGNOSTIC_PARALLEL_REFERENCE_ONLY",
+        mode="produce",
+        numerical_status="PASS",
+        gpu_acceptance="NOT_ASSESSED_DIAGNOSTIC_ONLY",
+        source=args.source,
+        training_mode=args.training_mode,
+        reference_contract=args.residual_reference,
+        fixture_sha256="fixture",
+        runtime_lock_sha256=gate.chain.sha(lock),
+        rank=0,
+        pid=os.getpid() + 1,
+        topology=dict(dp=2, cp=1, ep=1, pp=1),
+        runtime=dict(hardware=args.hardware),
+    )
+    gate.validate_producer(producer, args, "fixture")
+    for key, value in (
+        ("status", "PASS"),
+        ("numerical_status", "FAIL"),
+        ("numerical_status", "NOT_RUN"),
+        ("reference_contract", "hf-prefix-v1"),
+        ("gpu_acceptance", "PASS_THIS_GATE_ONLY"),
+    ):
+        with pytest.raises(gate.chain.PreconditionError):
+            gate.validate_producer(dict(producer, **{key: value}), args, "fixture")

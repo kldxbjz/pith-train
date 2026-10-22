@@ -16,7 +16,7 @@ _CUBLAS_CONFIGS = {":4096:8", ":16:8"}
 def configure_deterministic_training(enabled: bool) -> None:
     """Initialize once before model construction, including standalone speech/generation.
 
-    Models capture the token-layout/combine choice at construction. This is not
+    Models capture the token-layout choice at construction. This is not
     a per-forward switch. False resets the two PithTrain runtime defaults without
     changing the caller's existing PyTorch/cuDNN policy.
 

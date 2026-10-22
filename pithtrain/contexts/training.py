@@ -34,11 +34,12 @@ It does not guarantee whole-model bitwise reproducibility on its own.
 
 deterministic_token_layout: bool = False
 """
-Opt into stable Omni dispatch and HF expert-order accumulation.
+Opt into stable Omni token dispatch/scatter layout.
 
-Ordinary production retains fused dispatch and fast sum/scatter. Initialize
-once before constructing models via configure_deterministic_training; each MoE
-captures this policy as a checkpoint-bound numerical attribute.
+Ordinary production retains fused dispatch/scatter. Both layouts use the same
+expert-ID BF16 accumulation. Initialize once before constructing models via
+configure_deterministic_training; each MoE captures the layout policy as a
+checkpoint-bound numerical attribute.
 """
 
 fp8: bool

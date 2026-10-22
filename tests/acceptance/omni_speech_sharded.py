@@ -58,12 +58,17 @@ def updates_at(mode, scan):
     return scan - int(mode == "waveform" and scan >= 3)
 
 
-def plan(mode):
+def plan(mode, *, residual_reference="hf-prefix-v1"):
     scans(mode)
+    if residual_reference not in chain.RESIDUAL_REFERENCES:
+        raise ValueError("Unknown residual training-reference contract")
+    if mode == "waveform" and residual_reference != "hf-prefix-v1":
+        raise ValueError("Waveform-only validation does not exercise the residual predictor")
     return dict(
         schema=SCHEMA,
         status="NOT_RUN",
         training_mode=mode,
+        reference_contract=residual_reference,
         topology=dict(dp=WORLD, cp=1, ep=1, pp=1),
         precision="FP32 sharded masters/AdamW; BF16 compute; FP32 SUM gradients",
         updates=4,
@@ -498,17 +503,21 @@ def evidence_load(path, digest):
 
 
 def validate_producer(producer, args, fixture_sha):
+    parallel = args.residual_reference == "hf-parallel-causal-v1"
     expected = dict(
         schema=SCHEMA,
-        status="PASS",
+        status="DIAGNOSTIC_PARALLEL_REFERENCE_ONLY" if parallel else "PASS",
         mode="produce",
         source=args.source,
         training_mode=args.training_mode,
+        reference_contract=args.residual_reference,
         fixture_sha256=fixture_sha,
         runtime_lock_sha256=chain.sha(args.runtime_lock),
         rank=args.rank,
         topology=dict(dp=WORLD, cp=1, ep=1, pp=1),
     )
+    if parallel:
+        expected.update(numerical_status="PASS", gpu_acceptance="NOT_ASSESSED_DIAGNOSTIC_ONLY")
     if producer.get("runtime", {}).get("hardware") != args.hardware:
         raise chain.PreconditionError("Producer hardware lock differs")
     if any(producer.get(k) != v for k, v in expected.items()) or producer.get("pid") == os.getpid():
@@ -547,6 +556,7 @@ def run_gate(args, samples, native, hf, fixture):
         source=args.source,
         fixture_sha256=chain.sha(args.prepared / "fixture.json"),
         training_mode=mode,
+        reference_contract=args.residual_reference,
         dp=WORLD,
         cp=1,
         ep=1,
@@ -816,6 +826,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("plan", "produce", "restore"))
     parser.add_argument("--training-mode", required=True, choices=MODES)
+    parser.add_argument(
+        "--residual-reference", choices=chain.RESIDUAL_REFERENCES, default="hf-prefix-v1"
+    )
     parser.add_argument("--expected-commit")
     parser.add_argument("--prepared", type=Path)
     parser.add_argument("--producer", type=Path)
@@ -824,7 +837,11 @@ def main():
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if args.mode == "plan":
-        print(json.dumps(plan(args.training_mode), indent=2))
+        print(
+            json.dumps(
+                plan(args.training_mode, residual_reference=args.residual_reference), indent=2
+            )
+        )
         return
     if (
         not args.expected_commit
@@ -842,12 +859,19 @@ def main():
     args.rank_output = args.output / f"rank-{rank}"
     args.rank_output.mkdir(parents=True, exist_ok=False)
     result = dict(
-        **plan(args.training_mode),
+        **plan(args.training_mode, residual_reference=args.residual_reference),
         mode=args.mode,
         pid=os.getpid(),
         rank=rank,
         gpu_acceptance="NOT_RUN",
     )
+    parallel = args.residual_reference == "hf-parallel-causal-v1"
+    if parallel:
+        result.update(
+            diagnostic_label="DIAGNOSTIC_PARALLEL_REFERENCE_ONLY",
+            numerical_status="NOT_RUN",
+            gpu_acceptance="NOT_ASSESSED_DIAGNOSTIC_ONLY",
+        )
     started, phase = time.monotonic(), "source_precondition"
     try:
         args.source = chain.source_identity(args.expected_commit)
@@ -858,13 +882,23 @@ def main():
         result["fixture_sha256"] = chain.sha(args.prepared / "fixture.json")
         dist.init_process_group("nccl", timeout=timedelta(seconds=120), device_id=args.device)
         phase = "model_setup"
-        native, hf, attention = chain.build_pair(config, args.device)
+        native, hf, attention = chain.build_pair(
+            config, args.device, residual_reference=args.residual_reference
+        )
         result["reference_attention"] = attention
         phase = "numerical_and_native_resume"
         result.update(run_gate(args, samples, native.model, hf, fixture))
-        result["gpu_acceptance"] = "PASS_THIS_GATE_ONLY"
+        if parallel:
+            result["numerical_status"] = result["status"]
+            result["status"] = "DIAGNOSTIC_PARALLEL_REFERENCE_ONLY"
+        else:
+            result["gpu_acceptance"] = "PASS_THIS_GATE_ONLY"
     except Exception as exc:
         result.update(chain.failure_report(phase, exc))
+        if parallel:
+            result["gpu_acceptance"] = "NOT_ASSESSED_DIAGNOSTIC_ONLY"
+            if phase == "numerical_and_native_resume":
+                result["numerical_status"] = "FAIL"
         raise
     finally:
         result["elapsed_seconds"] = time.monotonic() - started

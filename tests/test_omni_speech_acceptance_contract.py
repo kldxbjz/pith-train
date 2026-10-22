@@ -217,7 +217,9 @@ def test_canonical_map_preserves_complete_component_boundaries():
         assert gate.canonical(name) == name
 
 
-def test_actual_hf_reference_cpu_forward_backward_and_sixteen_heads():
+def test_actual_hf_reference_cpu_forward_backward_and_sixteen_heads(
+    residual_reference="hf-prefix-v1",
+):
     from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeConfig
 
     # Exercise the raw released schema used by GPU preparation, including its
@@ -269,7 +271,7 @@ def test_actual_hf_reference_cpu_forward_backward_and_sixteen_heads():
     from pithtrain.models.qwen3_omni_talker import Qwen3OmniMoeTalkerForConditionalGeneration
 
     Qwen3OmniMoeTalkerForConditionalGeneration(actual.talker_config)
-    model = gate.HFChain(actual)
+    model = gate.HFChain(actual, residual_reference=residual_reference)
     sample = gate.make_sample(
         SimpleNamespace(
             model_inputs={
@@ -291,6 +293,12 @@ def test_actual_hf_reference_cpu_forward_backward_and_sixteen_heads():
         assert head.weight.grad is not None and torch.isfinite(head.weight.grad).all()
     assert all(p.grad is not None for p in model.code2wav.parameters())
     assert not torch.cuda.is_initialized()
+
+
+def test_actual_parallel_hf_reference_cpu_forward_backward_and_sixteen_heads():
+    test_actual_hf_reference_cpu_forward_backward_and_sixteen_heads(
+        residual_reference="hf-parallel-causal-v1"
+    )
 
 
 def cpu_restore_worker(root, mode):

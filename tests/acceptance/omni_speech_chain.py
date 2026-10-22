@@ -398,11 +398,17 @@ class ComputeModel(nn.Module):
         )
 
 
+RESIDUAL_REFERENCES = ("hf-prefix-v1", "hf-parallel-causal-v1")
+
+
 class HFChain(nn.Module):
     """Independent official HF component forwards and conditioning expressions."""
 
-    def __init__(self, config):
+    def __init__(self, config, *, residual_reference="hf-prefix-v1"):
         super().__init__()
+        if residual_reference not in RESIDUAL_REFERENCES:
+            raise ValueError("Unknown residual training-reference contract")
+        self.residual_reference = residual_reference
         from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
             Qwen3OmniMoeCode2Wav,
             Qwen3OmniMoeTalkerForConditionalGeneration,
@@ -524,15 +530,29 @@ class HFChain(nn.Module):
         ).last_hidden_state
         begin = prefix.shape[1] - 1
         first = self.talker.codec_head(trunk[:, begin:])
-        residual = []
-        for group in range(groups - 1):
-            sequence = torch.stack([trunk[:, begin : begin + frames], *embeddings[: group + 1]], 2)
+        if self.residual_reference == "hf-parallel-causal-v1":
+            # A separately named COMPOSED training reference, not an official
+            # HF combined-training entry. Use only official HF base/heads.
+            sequence = torch.stack([trunk[:, begin : begin + frames], *embeddings[:-1]], 2)
             values = self.talker.code_predictor.model(
                 inputs_embeds=sequence.flatten(0, 1), use_cache=False
             ).last_hidden_state
-            residual.append(
-                self.talker.code_predictor.lm_head[group](values[:, -1]).view(1, frames, -1)
-            )
+            residual = [
+                self.talker.code_predictor.lm_head[group](values[:, group + 1]).view(1, frames, -1)
+                for group in range(groups - 1)
+            ]
+        else:
+            residual = []
+            for group in range(groups - 1):
+                sequence = torch.stack(
+                    [trunk[:, begin : begin + frames], *embeddings[: group + 1]], 2
+                )
+                values = self.talker.code_predictor.model(
+                    inputs_embeds=sequence.flatten(0, 1), use_cache=False
+                ).last_hidden_state
+                residual.append(
+                    self.talker.code_predictor.lm_head[group](values[:, -1]).view(1, frames, -1)
+                )
         first_labels = torch.cat(
             (codes[..., 0], codes.new_full((1, 1), cfg.talker_config.codec_eos_token_id)), 1
         )
@@ -545,7 +565,7 @@ class HFChain(nn.Module):
         )
 
 
-def build_pair(config, device):
+def build_pair(config, device, *, residual_reference="hf-prefix-v1"):
     from pithtrain.contexts import distributed, training
     from pithtrain.models.qwen3_omni_code2wav import Qwen3OmniMoeCode2Wav
     from pithtrain.models.qwen3_omni_multimodal import Qwen3OmniMoeThinkerMultimodalModel
@@ -561,7 +581,7 @@ def build_pair(config, device):
     training.fp8, training.Linear, training.GroupedLinear = False, nn.Linear, GroupedLinear
     training.deterministic_attention = True
     torch.manual_seed(SEED)
-    hf = HFChain(config).to(device)
+    hf = HFChain(config, residual_reference=residual_reference).to(device)
     attention = configure_reference_attention(
         hf.thinker, config.thinker_config, "native-matched-v2"
     )
