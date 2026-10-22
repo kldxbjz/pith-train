@@ -7,6 +7,7 @@ import subprocess
 import sys
 from datetime import timedelta
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -337,3 +338,199 @@ def test_nonfinite_optimizer_counter_produces_json_failure_not_lost_report():
     assert rows["weight"]["status"] == "FAIL"
     assert rows["bias"]["status"] == "PASS"
     json.dumps(rows, allow_nan=False)
+
+
+@pytest.fixture
+def dp2_runtime(monkeypatch, tmp_path):
+    """Mock hardware/process probes, while executing runtime and its actual lock check."""
+    for key, value in dict(
+        WORLD_SIZE="2",
+        LOCAL_WORLD_SIZE="2",
+        RANK="0",
+        LOCAL_RANK="0",
+        CUBLAS_WORKSPACE_CONFIG=":4096:8",
+    ).items():
+        monkeypatch.setenv(key, value)
+    hardware = "NVIDIA H100 80GB HBM3"
+    args = SimpleNamespace(hardware=hardware, runtime_lock=tmp_path / "runtime-lock.json")
+    monkeypatch.setattr(gate.importlib.metadata, "version", lambda _: "5.17.0")
+    for name, value in dict(
+        is_available=True,
+        device_count=2,
+        get_device_name=hardware,
+        get_device_capability=(9, 0),
+        mem_get_info=(10, 20),
+        is_initialized=False,
+    ).items():
+        monkeypatch.setattr(torch.cuda, name, Mock(return_value=value))
+    monkeypatch.setattr(torch.cuda, "set_device", Mock())
+    monkeypatch.setattr(torch, "manual_seed", Mock())
+    monkeypatch.setattr(torch, "use_deterministic_algorithms", Mock())
+    monkeypatch.setattr(gate.random, "seed", Mock())
+    monkeypatch.setattr(gate.np.random, "seed", Mock())
+    monkeypatch.setattr(torch.backends.cudnn, "benchmark", False)
+    monkeypatch.setattr(torch.backends.cudnn, "deterministic", False)
+    packages = ["torch==cpu-test", "transformers==5.17.0"]
+    gate.chain.write_json(
+        args.runtime_lock,
+        dict(
+            torch=torch.__version__,
+            cuda=torch.version.cuda,
+            python=gate.platform.python_version(),
+            transformers="5.17.0",
+            packages=packages,
+        ),
+    )
+    monkeypatch.setattr(gate.subprocess, "check_output", Mock(return_value="\n".join(packages)))
+    probe = SimpleNamespace(args=args, commands=[], returncode=255)
+
+    def run(command, **kwargs):
+        assert kwargs["capture_output"] and kwargs["text"] and kwargs["timeout"] == 5
+        probe.commands.append(command)
+        if command == ["nvidia-smi", "topo", "-m"]:
+            result = subprocess.CompletedProcess(
+                command, probe.returncode, "partial topology\n", "topology diagnostic\n"
+            )
+        else:
+            assert command == [
+                "nvidia-smi",
+                "--query-gpu=name,uuid,driver_version,memory.total,memory.free",
+                "--format=csv",
+            ]
+            assert kwargs["check"] is True
+            result = subprocess.CompletedProcess(command, 0, "GPU inventory\n", "")
+        if kwargs.get("check") and result.returncode:
+            raise subprocess.CalledProcessError(
+                result.returncode, command, output=result.stdout, stderr=result.stderr
+            )
+        return result
+
+    monkeypatch.setattr(gate.subprocess, "run", run)
+    return probe
+
+
+@pytest.mark.parametrize("rank", (0, 1))
+@pytest.mark.parametrize("returncode", (0, 255))
+def test_runtime_records_topology_result_without_numeric_claim(
+    monkeypatch, dp2_runtime, rank, returncode
+):
+    monkeypatch.setenv("RANK", str(rank))
+    monkeypatch.setenv("LOCAL_RANK", str(rank))
+    dp2_runtime.returncode = returncode
+    report = gate.runtime(dp2_runtime.args)
+    assert report["nvlink_topology"] == dict(
+        status="AVAILABLE" if returncode == 0 else "UNAVAILABLE",
+        returncode=returncode,
+        stdout="partial topology\n",
+        stderr="topology diagnostic\n",
+    )
+    assert report["nvidia_smi"] == "GPU inventory\n"
+    assert report["hardware"] == dp2_runtime.args.hardware
+    assert report["runtime_lock_sha256"] == gate.chain.sha(dp2_runtime.args.runtime_lock)
+    assert report["free_total_bytes"] == [10, 20]
+    assert dp2_runtime.args.device == torch.device("cuda", rank)
+    torch.cuda.set_device.assert_called_once_with(rank)
+    assert len(dp2_runtime.commands) == 2  # The diagnostic is observed once, never retried.
+
+
+@pytest.mark.parametrize(
+    "fault",
+    (
+        "cuda",
+        "device_count",
+        "hardware",
+        "capability",
+        "transformers",
+        "lock",
+        "cublas",
+    ),
+)
+def test_runtime_still_rejects_mandatory_preconditions(monkeypatch, dp2_runtime, fault):
+    if fault == "cuda":
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    elif fault == "device_count":
+        monkeypatch.setattr(torch.cuda, "device_count", lambda: 1)
+    elif fault == "hardware":
+        dp2_runtime.args.hardware = "wrong hardware"
+    elif fault == "capability":
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: (8, 0))
+    elif fault == "transformers":
+        monkeypatch.setattr(gate.importlib.metadata, "version", lambda _: "5.18.0")
+    elif fault == "lock":
+        lock = json.loads(dp2_runtime.args.runtime_lock.read_text())
+        gate.chain.write_json(dp2_runtime.args.runtime_lock, dict(lock, packages=[]))
+    else:
+        monkeypatch.delenv("CUBLAS_WORKSPACE_CONFIG")
+    with pytest.raises(gate.chain.PreconditionError):
+        gate.runtime(dp2_runtime.args)
+    assert not dp2_runtime.commands
+
+
+@pytest.mark.parametrize("failure", ("hardware", "nccl", "numerical"))
+def test_main_runtime_keeps_hardware_nccl_and_numerical_gates(
+    monkeypatch, tmp_path, dp2_runtime, failure
+):
+    prepared = tmp_path / "prepared"
+    prepared.mkdir()
+    gate.chain.write_json(prepared / "fixture.json", {})
+    output = tmp_path / "output"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "omni_speech_sharded",
+            "produce",
+            "--training-mode",
+            "waveform",
+            "--expected-commit",
+            "a" * 40,
+            "--prepared",
+            str(prepared),
+            "--runtime-lock",
+            str(dp2_runtime.args.runtime_lock),
+            "--hardware",
+            "wrong hardware" if failure == "hardware" else dp2_runtime.args.hardware,
+            "--output",
+            str(output),
+        ],
+    )
+    monkeypatch.setattr(gate.chain, "source_identity", lambda _: dict(commit="a" * 40))
+    monkeypatch.setattr(gate.chain, "load_fixture", lambda *_: ({}, [], {}))
+    init = Mock(side_effect=RuntimeError("NCCL sentinel") if failure == "nccl" else None)
+    destroy = Mock()
+    build = Mock(return_value=(SimpleNamespace(model=object()), object(), "CPU mock"))
+    numeric = Mock(side_effect=AssertionError("numerical sentinel"))
+    monkeypatch.setattr(gate.dist, "init_process_group", init)
+    monkeypatch.setattr(
+        gate.dist, "is_initialized", lambda: bool(init.call_count) and failure != "nccl"
+    )
+    monkeypatch.setattr(gate.dist, "destroy_process_group", destroy)
+    monkeypatch.setattr(gate.chain, "build_pair", build)
+    monkeypatch.setattr(gate, "run_gate", numeric)
+    error = {
+        "hardware": gate.chain.PreconditionError,
+        "nccl": RuntimeError,
+        "numerical": AssertionError,
+    }[failure]
+    with pytest.raises(error):
+        gate.main()
+    report = json.loads((output / "rank-0" / "result.json").read_text())
+    if failure == "hardware":
+        init.assert_not_called()
+        assert not dp2_runtime.commands
+    else:
+        init.assert_called_once_with(
+            "nccl", timeout=timedelta(seconds=120), device_id=torch.device("cuda", 0)
+        )
+        assert report["runtime"]["nvlink_topology"]["status"] == "UNAVAILABLE"
+    if failure == "numerical":
+        build.assert_called_once_with({}, torch.device("cuda", 0))
+        numeric.assert_called_once()
+        destroy.assert_called_once()
+        assert report["status"] == "FAIL" and report["gpu_acceptance"] == "FAIL_THIS_GATE"
+        assert report["failure_phase"] == "numerical_and_native_resume"
+    else:
+        build.assert_not_called()
+        numeric.assert_not_called()
+        destroy.assert_not_called()
+        assert report["status"] == "NOT_RUN_PRECONDITION" and report["gpu_acceptance"] == "NOT_RUN"
