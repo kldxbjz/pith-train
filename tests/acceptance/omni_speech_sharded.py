@@ -793,15 +793,21 @@ def runtime(args):
         timeout=5,
         check=True,
     )
+    # Host/PCI topology is diagnostic and may be unavailable inside a GPU container.
     topology = subprocess.run(
-        ["nvidia-smi", "topo", "-m"], capture_output=True, text=True, timeout=5, check=True
+        ["nvidia-smi", "topo", "-m"], capture_output=True, text=True, timeout=5, check=False
     )
     return dict(
         **observed,
         runtime_lock_sha256=digest,
         hardware=args.hardware,
         nvidia_smi=smi.stdout,
-        nvlink_topology=topology.stdout,
+        nvlink_topology=dict(
+            status="AVAILABLE" if topology.returncode == 0 else "UNAVAILABLE",
+            returncode=topology.returncode,
+            stdout=topology.stdout,
+            stderr=topology.stderr,
+        ),
         free_total_bytes=list(torch.cuda.mem_get_info(rank)),
     )
 
