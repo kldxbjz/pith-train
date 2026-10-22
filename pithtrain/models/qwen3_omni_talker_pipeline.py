@@ -79,23 +79,12 @@ class Qwen3OmniMoeTalkerPipelineDecoderLayer(Qwen3OmniMoeThinkerTextDecoderLayer
     @torch.compile(fullgraph=True, options={"emulate_precision_casts": True})
     def forward_stage5(self, moe_outs, moe_local_idxs, topk_weight, residual):
         residual, shared = residual.chunk(2, dim=-1)
-        if self.mlp.deterministic_token_layout:
-            routed = _combine_expert_order(
-                moe_outs,
-                topk_weight,
-                moe_local_idxs if distributed.ep_size > 1 else None,
-                residual.dtype,
-            ).view_as(residual)
-        elif distributed.ep_size == 1:
-            weighted = moe_outs.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)
-            routed = weighted.sum(1).view_as(residual)
-        else:
-            probs = topk_weight.reshape(-1)[moe_local_idxs]
-            weighted = moe_outs * probs.unsqueeze(-1)
-            token_indices = moe_local_idxs // topk_weight.shape[1]
-            result = moe_outs.new_zeros(topk_weight.shape[0], moe_outs.shape[-1])
-            result.scatter_add_(0, token_indices[:, None].expand_as(weighted), weighted)
-            routed = result.view_as(residual)
+        routed = _combine_expert_order(
+            moe_outs,
+            topk_weight,
+            moe_local_idxs if distributed.ep_size > 1 else None,
+            residual.dtype,
+        ).view_as(residual)
         return residual + (routed + shared)
 
 

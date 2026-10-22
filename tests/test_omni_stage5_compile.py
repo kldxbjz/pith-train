@@ -81,11 +81,12 @@ def test_image_stage5_preserves_fullgraph_output_and_all_gradients(is_moe, ep):
 
 
 @pytest.mark.parametrize("ep", [1, 2])
-def test_image_opt_in_preserves_bf16_deepstack_and_all_gradients(ep):
+@pytest.mark.parametrize("deterministic_token_layout", [False, True])
+def test_image_preserves_bf16_deepstack_and_all_gradients(ep, deterministic_token_layout):
     torch.manual_seed(84)
     layer = layer_type(ep)()
     layer.is_moe, layer.idx, layer.text_hidden_size, layer.deepstack_count = True, 1, 8, 2
-    layer.mlp = SimpleNamespace(deterministic_token_layout=True)
+    layer.mlp = SimpleNamespace(deterministic_token_layout=deterministic_token_layout)
     residual = torch.randn(1, 3, 24, dtype=torch.bfloat16, requires_grad=True)
     weights = torch.randn(3, 8, dtype=torch.bfloat16, requires_grad=True)
     outputs = torch.randn(24, 8, dtype=torch.bfloat16, requires_grad=True)

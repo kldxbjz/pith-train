@@ -75,13 +75,14 @@ def test_text_stage5_fullgraph_output_and_all_gradients(is_moe, ep):
     "top_k,dtype",
     [(1, torch.bfloat16), (2, torch.bfloat16), (8, torch.bfloat16), (8, torch.float32)],
 )
-def test_opt_in_expert_order_matches_actual_hf_output_and_all_gradients(top_k, dtype, monkeypatch):
+@pytest.mark.parametrize("deterministic_token_layout", [False, True])
+def test_expert_order_matches_actual_hf_output_and_all_gradients(
+    top_k, dtype, deterministic_token_layout, monkeypatch
+):
     import transformers
     from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
         Qwen3OmniMoeThinkerTextExperts,
     )
-
-    from pithtrain.operators.stable_scatter import stable_dedup_prepare_dispatch
 
     assert transformers.__version__ == "5.17.0"
     torch.manual_seed(82)
@@ -123,6 +124,8 @@ def test_opt_in_expert_order_matches_actual_hf_output_and_all_gradients(top_k, d
         .view(n, top_k, hidden)
     )
     ordered_ids, order = ids.sort(dim=-1)
+    if top_k > 1:
+        assert not torch.equal(ids, ordered_ids)
     ordered_weights = weights.gather(1, order)
     ordered_outputs = slots.gather(1, order[..., None].expand(-1, -1, hidden))
     targets = (inputs, weights, hf.gate_up_proj, hf.down_proj)
@@ -131,12 +134,12 @@ def test_opt_in_expert_order_matches_actual_hf_output_and_all_gradients(top_k, d
     for ep in (1, 2):
         layer = layer_type(ep)()
         layer.is_moe = True
-        layer.mlp = SimpleNamespace(deterministic_token_layout=True)
-        returned_indices = (
-            stable_dedup_prepare_dispatch(ordered_ids, experts, 2, experts // 2)[3]
-            if ep == 2
-            else None
-        )
+        layer.mlp = SimpleNamespace(deterministic_token_layout=deterministic_token_layout)
+        # Any complete EP return permutation must restore the same token/slot values;
+        # this CPU check deliberately does not assume stable dispatch ordering.
+        returned_indices = torch.randperm(n * top_k) if ep == 2 else None
+        if returned_indices is not None:
+            assert not torch.equal(returned_indices, torch.arange(n * top_k))
         outputs = ordered_outputs.flatten(0, 1)
         if returned_indices is not None:
             outputs = outputs[returned_indices]
@@ -160,7 +163,8 @@ def test_opt_in_expert_order_matches_actual_hf_output_and_all_gradients(top_k, d
 
 
 @pytest.mark.parametrize("ep", [1, 2])
-def test_talker_opt_in_keeps_routed_shared_residual_addition_order(ep):
+@pytest.mark.parametrize("deterministic_token_layout", [False, True])
+def test_talker_keeps_routed_shared_residual_addition_order(ep, deterministic_token_layout):
     torch.manual_seed(83)
     source = Path(__file__).parents[1] / "pithtrain/models/qwen3_omni_talker_pipeline.py"
     cls = next(
@@ -174,7 +178,9 @@ def test_talker_opt_in_keeps_routed_shared_residual_addition_order(ep):
     parent = layer_type(ep)()
     namespace = dict(parent.forward_stage5.__globals__)
     exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"), namespace)
-    layer = SimpleNamespace(mlp=SimpleNamespace(deterministic_token_layout=True))
+    layer = SimpleNamespace(
+        mlp=SimpleNamespace(deterministic_token_layout=deterministic_token_layout)
+    )
     outputs = torch.randn(24, 8, dtype=torch.bfloat16, requires_grad=True)
     weights = torch.randn(3, 8, dtype=torch.bfloat16, requires_grad=True)
     residual = torch.randn(3, 8, dtype=torch.bfloat16, requires_grad=True)

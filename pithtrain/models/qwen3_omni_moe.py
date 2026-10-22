@@ -161,19 +161,16 @@ class Qwen3OmniMoeThinkerTextSparseMoeBlock(nn.Module):
         indices, weights, lb_loss = self.gate(hidden_states, replay_idx)
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
-        if self.deterministic_token_layout:
-            indices, order = indices.sort(dim=-1)
-            weights = weights.gather(-1, order)
+        # Expert-ID accumulation order is independent of dispatch row layout.
+        indices, order = indices.sort(dim=-1)
+        weights = weights.gather(-1, order)
         flat = hidden_states.reshape(-1, shape[-1])
         repeated = flat[:, None].expand(-1, self.num_experts_per_tok, -1).reshape(-1, shape[-1])
         tokens, reverse, offs, ks, sizes = scatter_for_grouped_gemm(
             repeated, indices.reshape(-1), self.experts_per_rank, deterministic=True
         )
         outputs = padded_index_gather(self.experts(tokens, offs, ks, sizes), reverse)
-        if self.deterministic_token_layout:
-            return _combine_expert_order(outputs, weights, None, hidden_states.dtype).view(shape)
-        weighted = outputs.view(*indices.shape, -1) * weights.unsqueeze(-1)
-        return weighted.sum(1).view(shape)
+        return _combine_expert_order(outputs, weights, None, hidden_states.dtype).view(shape)
 
 
 class Qwen3OmniMoeThinkerTextMLP(nn.Module):
@@ -291,9 +288,9 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
             return hidden_states, residual, None
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
-        if self.mlp.deterministic_token_layout:
-            indices, order = indices.sort(dim=-1)
-            weights = weights.gather(-1, order)
+        # Canonicalize only the K selected slots; retain the dispatch policy below.
+        indices, order = indices.sort(dim=-1)
+        weights = weights.gather(-1, order)
         tokens, routing = prepare_dispatch(
             hidden_states,
             indices,
@@ -322,23 +319,13 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
     def _forward_stage5(self, moe_outs, moe_local_idxs, topk_weight, residual):
         if not self.is_moe:
             return residual + moe_outs
-        if self.mlp.deterministic_token_layout:
-            combined = _combine_expert_order(
-                moe_outs,
-                topk_weight,
-                moe_local_idxs if distributed.ep_size > 1 else None,
-                residual.dtype,
-            )
-            return residual + combined.view_as(residual)
-        if distributed.ep_size == 1:
-            weighted = moe_outs.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)
-            return residual + weighted.sum(1).view_as(residual)
-        probs = topk_weight.reshape(-1)[moe_local_idxs]
-        weighted = moe_outs * probs.unsqueeze(-1)
-        token_indices = moe_local_idxs // topk_weight.shape[1]
-        result = moe_outs.new_zeros(topk_weight.shape[0], moe_outs.shape[-1])
-        result.scatter_add_(0, token_indices[:, None].expand_as(weighted), weighted)
-        return residual + result.view_as(residual)
+        combined = _combine_expert_order(
+            moe_outs,
+            topk_weight,
+            moe_local_idxs if distributed.ep_size > 1 else None,
+            residual.dtype,
+        )
+        return residual + combined.view_as(residual)
 
     # Keep the expert/residual boundary under the same eager precision policy.
     def forward_stage5(self, moe_outs, moe_local_idxs, topk_weight, residual):
