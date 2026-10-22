@@ -1498,3 +1498,138 @@ def test_speech_identical_lambda_resume_second_optimizer_update(tmp_path):
     assert sched.last_epoch == 2
     assert all(value["step"].item() == 2 for value in opt.state.values())
     assert_tree(expected, checkpoint_complete_snapshot((resumed, opt, sched, data, state)))
+
+
+def fsdp_waveform_microbatch_worker(rank, rendezvous):
+    from unittest.mock import patch
+
+    from torch.distributed.device_mesh import init_device_mesh
+
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo", init_method=rendezvous, rank=rank, world_size=2, timeout=timedelta(seconds=40)
+    )
+    # Reuse the real FSDP protocol fixture; only native batch admission is mocked.
+    validation = patch("pithtrain.modules.omni_speech_batch_contract.validate_speech_batch")
+    validation.start()
+    try:
+        mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("dp",))
+        torch.manual_seed(126)
+        model = sharded_protocol_model("waveform", mesh)
+        torch.manual_seed(126)
+        oracle = ToySpeech().float()
+        configure_trainable_components(oracle, "waveform")
+        optimizer = torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=1e-4,
+            weight_decay=0,
+            foreach=False,
+        )
+        oracle_opt = torch.optim.AdamW(
+            oracle.code2wav.parameters(), lr=1e-4, weight_decay=0, foreach=False
+        )
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1, gamma=1.0)
+
+        def batches(scan, worker_rank):
+            result = []
+            for microbatch in range(5):
+                batch = sample(zero=scan in (0, 2), rank=worker_rank)
+                batch["target_waveform"] += (microbatch + worker_rank) * 0.037
+                if scan not in (0, 2):
+                    batch["waveform_mask"][0, 1] = microbatch % 2 == 0
+                    if scan == 3 and worker_rank == 0:
+                        batch["waveform_mask"].zero_()
+                result.append(batch)
+            return result
+
+        data = Data([batches(scan, rank) for scan in range(4)])
+        expected_gradients = {}
+        optimizer_steps = []
+
+        def check_gradients(opt, _args, _kwargs):
+            optimizer_steps.append(1)
+            for name, parameter in model.named_parameters():
+                if parameter.requires_grad:
+                    assert parameter.grad.dtype == torch.float32
+                    torch.testing.assert_close(
+                        parameter.grad.full_tensor(), expected_gradients[name], rtol=0, atol=0
+                    )
+
+        hook = optimizer.register_step_pre_hook(check_gradients)
+        state = None
+        for scan in range(4):
+            oracle_opt.zero_grad(set_to_none=True)
+            global_batches = batches(scan, 0) + batches(scan, 1)
+            count = sum(int(batch["waveform_mask"].sum()) for batch in global_batches)
+            if count:
+                losses = []
+                for batch in global_batches:
+                    # Fresh casts give each microbatch its own BF16 compute leaf,
+                    # so contributions accumulate into the original FP32 masters.
+                    cast = {n: p.to(torch.bfloat16) for n, p in oracle.code2wav.named_parameters()}
+                    wave = torch.func.functional_call(
+                        oracle.code2wav, cast, (batch["codes"].to(torch.bfloat16),)
+                    ).squeeze(-1)
+                    losses.append(waveform_objective(wave, batch).loss_sum)
+                (sum(losses) / count).backward()
+                norm = sum(
+                    p.grad.double().square().sum() for p in oracle.code2wav.parameters()
+                ).sqrt()
+                coefficient = (0.2 / norm.clamp_min(1e-12)).clamp(max=1)
+                for name, parameter in oracle.named_parameters():
+                    if parameter.requires_grad:
+                        parameter.grad.mul_(coefficient.to(parameter.grad.dtype))
+                        expected_gradients[name] = parameter.grad.detach().clone()
+                oracle_opt.step()
+            before = {
+                name: parameter.to_local().detach().clone()
+                for name, parameter in model.named_parameters()
+            }
+            before_optimizer = copy.deepcopy(optimizer.state_dict())
+            before_rng = torch.get_rng_state().clone()
+            before_forwards = model.forwards.clone()
+            state = launch(
+                OmniSpeechCfg(
+                    mode="waveform",
+                    max_updates=2,
+                    max_batches=scan + 1,
+                    max_grad_norm=0.2,
+                    waveform_objective_id="cpu-mse-v1",
+                ),
+                data,
+                model=model,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                state=state,
+                device="cpu",
+                token_group=mesh.get_group(),
+                waveform_objective=waveform_objective,
+            )
+            if not count:
+                assert_tree(optimizer.state_dict(), before_optimizer)
+                assert_tree(torch.get_rng_state(), before_rng)
+                assert_tree(model.forwards, before_forwards)
+            for name, parameter in model.named_parameters():
+                assert parameter.grad is None
+                if not count:
+                    assert_tree(parameter.to_local(), before[name])
+                torch.testing.assert_close(
+                    parameter.full_tensor(), oracle.get_parameter(name), rtol=0, atol=0
+                )
+            assert state.scanned_batches == scan + 1
+            assert state.completed_updates == (scan + 1) // 2
+            assert scheduler.last_epoch == state.completed_updates
+        assert len(optimizer_steps) == 2 and model.forwards.item() == 10
+        hook.remove()
+    finally:
+        validation.stop()
+        dist.destroy_process_group()
+
+
+def test_real_fsdp_waveform_microbatch_fp32_accumulation(tmp_path):
+    mp.spawn(
+        fsdp_waveform_microbatch_worker,
+        args=((tmp_path / "waveform-fp32-gloo").as_uri(),),
+        nprocs=2,
+        join=True,
+    )
