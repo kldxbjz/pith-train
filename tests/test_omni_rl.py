@@ -1062,3 +1062,124 @@ def test_identical_lambda_factory_resume_next_two_updates_are_bitwise_equal(tmp_
     restored.backend.load(tmp_path / "policy", restored)
     assert [restored.train_step(), restored.train_step()] == expected
     tree_equal(snapshot, _contract_snapshot(restored))
+
+
+def heterogeneous_checkpoint_worker(rank, directory):
+    from pithtrain.contexts import distributed, training
+    from pithtrain.modules.distributed_checkpoint import DistributedCheckpointError
+    from pithtrain.tasks.omni_rl import PolicySnapshot, _weights_digest
+    from tests.test_distributed_strict_checkpoint import initialize_mesh
+
+    root = Path(directory)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{root / 'heterogeneous-rendezvous'}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        torch.set_num_threads(1)
+        initialize_mesh("fsdp-layout", rank)
+        group = distributed.attn_mesh["dp", "cp"]._flatten().get_group()
+        model = PipelineDouble(group)
+        original_eps = 1e-5 * (rank + 1)
+        model.policy = NormalizedPolicy(original_eps)
+        opt = torch.optim.AdamW(model.parameters(), lr=0.02, weight_decay=0, foreach=False)
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, _schedule_factory(0.9))
+        training.model, training.optimizers, training.schedulers = model, (opt,), (sched,)
+
+        def publish(version, contract, semantics):
+            weights = copy.deepcopy(model.policy.state_dict())
+            return PolicySnapshot(
+                PolicyIdentity(version, _weights_digest(weights), contract, semantics["sha256"]),
+                weights,
+                semantics,
+            )
+
+        backend = PithTrainPolicyAdapter(
+            model,
+            (opt,),
+            (sched,),
+            device=torch.device("cpu"),
+            token_group=group,
+            pp_group=None,
+            pp_rank=0,
+            pp_size=1,
+            dp_rank=rank,
+            export_policy=publish,
+            clip_grad=lambda maximum: torch.nn.utils.clip_grad_norm_(model.parameters(), maximum),
+        )
+        trainer = OmniRLTrainer(
+            config(),
+            contract=contract(),
+            backend=backend,
+            rollout=RewardingRollout(zero=True),
+            reward=SymbolReward(),
+        )
+        assert trainer.train_step()["status"] == "SKIPPED_GLOBAL_ZERO"
+        shared = backend.checkpoint_contract(trainer)
+        assert shared["ranks"][0]["semantics"] != shared["ranks"][1]["semantics"]
+        assert shared["ranks"][rank] == trainer.resume_config()
+        backend.save(root / "heterogeneous", trainer)
+        before = copy.deepcopy(
+            (
+                model.state_dict(),
+                opt.state_dict(),
+                sched.state_dict(),
+                trainer.state_dict(),
+                torch.get_rng_state(),
+            )
+        )
+        backend.load(root / "heterogeneous", trainer, request_index=1)
+        tree_equal(
+            before,
+            (
+                model.state_dict(),
+                opt.state_dict(),
+                sched.state_dict(),
+                trainer.state_dict(),
+                torch.get_rng_state(),
+            ),
+        )
+        if rank == 1:
+            model.policy.norm.eps = 1.0
+        drifted = copy.deepcopy(
+            (
+                model.state_dict(),
+                opt.state_dict(),
+                sched.state_dict(),
+                trainer.state_dict(),
+                torch.get_rng_state(),
+            )
+        )
+        with pytest.raises(DistributedCheckpointError):
+            backend.load(root / "heterogeneous", trainer, request_index=1)
+        tree_equal(
+            drifted,
+            (
+                model.state_dict(),
+                opt.state_dict(),
+                sched.state_dict(),
+                trainer.state_dict(),
+                torch.get_rng_state(),
+            ),
+        )
+        model.policy.norm.eps = original_eps
+        backend.load(root / "heterogeneous", trainer, request_index=1)
+        tree_equal(
+            before,
+            (
+                model.state_dict(),
+                opt.state_dict(),
+                sched.state_dict(),
+                trainer.state_dict(),
+                torch.get_rng_state(),
+            ),
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def test_native_checkpoint_binds_distinct_rank_semantics_and_rejects_drift(tmp_path):
+    mp.spawn(heterogeneous_checkpoint_worker, args=(str(tmp_path),), nprocs=2, join=True)

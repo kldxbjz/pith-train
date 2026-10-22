@@ -692,37 +692,59 @@ class PithTrainPolicyAdapter:
         _collective_error(error, self.validation_group)
         return float(norm)
 
+    def checkpoint_contract(self, state):
+        """Collect all rank-local numerical contracts at an explicit boundary.
+
+        PP/EP shards legitimately have different module/optimizer membership.
+        The shared manifest binds their ordered contracts; each payload still
+        validates its own local configuration without hidden collectives.
+        """
+        local, error = None, None
+        try:
+            if state.backend is not self:
+                raise ValueError("Checkpoint task belongs to another policy adapter")
+            local = state.resume_config()
+        except Exception as exc:
+            error = str(exc)
+        _collective_error(error)
+        ranks = [local]
+        if dist.is_initialized():
+            ranks = [None] * dist.get_world_size()
+            dist.all_gather_object(ranks, local)
+        return dict(schema=1, kind="native_grpo_rank_contracts", ranks=ranks)
+
     def save(self, path, state):
         from pithtrain.modules.checkpoint import save_checkpoint
 
+        contract = self.checkpoint_contract(state)
         save_checkpoint(
             Path(path),
             state.requests,
-            data_state=self._checkpoint_state(state),
+            data_state=self._checkpoint_state(state, contract=contract),
             strict=True,
-            resume_config=state.resume_config(),
+            resume_config=contract,
         )
 
     def load(self, path, state, *, request_index):
         from pithtrain.modules.checkpoint import load_checkpoint
 
+        contract = self.checkpoint_contract(state)
         load_checkpoint(
             Path(path),
             request_index,
-            data_state=self._checkpoint_state(state),
+            data_state=self._checkpoint_state(state, contract=contract),
             strict=True,
-            resume_config=state.resume_config(),
+            resume_config=contract,
         )
 
-    @staticmethod
-    def _checkpoint_state(state):
+    def _checkpoint_state(self, state, *, contract=None):
         from pithtrain.modules.task_checkpoint import TaskCheckpointState
 
         return TaskCheckpointState(
             state,
             task_kind="omni_grpo",
             task_schema=1,
-            contract=state.resume_config(),
+            contract=self.checkpoint_contract(state) if contract is None else contract,
             transaction_key="requests",
             update_key="updates",
             data_key="data_cursor",
