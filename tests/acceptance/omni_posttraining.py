@@ -1,9 +1,9 @@
-"""Tiny native DualPipeV SFT numerical and fresh-process resume acceptance.
+"""Tiny native DualPipeV SFT/GRPO numerical and fresh-process resume acceptance.
 
 prepare/plan are CPU-only. produce/restore require explicitly scheduled CUDA;
 this module allocates no cloud resources, downloads no weights and runs no child
-jobs. Synthetic ID records exercise the native supervised update and fresh-process
-resume path, not conversational quality. GRPO acceptance is added by the RL PR.
+jobs. Synthetic ID prompts exercise real autoregressive policy sampling, not
+conversational quality. An external rollout service remains NOT_INTEGRATED.
 """
 
 import argparse
@@ -78,6 +78,50 @@ def token_mask(request, dp_rank, topology):
         length = 2 + (row + dp_rank + request) % 3
         mask[row, PROMPT - 1 : PROMPT - 1 + length] = True
     return mask
+
+
+def reward_tokens(tokens, mask):
+    """Decidable reward: fraction of valid generated token IDs that are even."""
+    require(tokens.shape == mask.shape and mask.dtype == torch.bool, "Reward layout differs")
+    counts = mask.sum(-1)
+    return ((tokens.remainder(2) == 0) & mask).float().sum(-1) / counts.clamp(min=1)
+
+
+@torch.no_grad()
+def sample_autoregressive(policy, prompts, generator, completion_length):
+    """Sample from each newly extended prefix, retaining the full policy support."""
+    ids = prompts
+    for _ in range(completion_length):
+        probabilities = policy(ids)[:, -1].float().softmax(-1).cpu()
+        sampled = torch.multinomial(probabilities, 1, generator=generator)
+        ids = torch.cat((ids, sampled.to(ids.device)), dim=1)
+    return ids
+
+
+def independent_grpo(logits, tokens, old, reference, mask, rewards, *, clip=0.2, beta=0.02):
+    """Independent scalar objective; no task loss/advantage helper is called."""
+    require(rewards.ndim == 1 and rewards.numel() % 2 == 0, "Complete pairs required")
+    grouped = rewards.reshape(-1, 2)
+    advantages = (
+        (grouped - grouped.mean(-1, keepdim=True))
+        / (grouped.std(-1, correction=0, keepdim=True) + 1e-6)
+    ).reshape(-1)
+    return independent_token_objective(
+        logits, tokens, old, reference, mask, advantages, clip=clip, beta=beta
+    )
+
+
+def independent_token_objective(
+    logits, tokens, old, reference, mask, advantages, *, clip=0.2, beta=0.02
+):
+    if not mask.any():
+        return logits.sum() * 0
+    current = logits.float()[mask].log_softmax(-1).gather(-1, tokens[mask, None]).squeeze(-1)
+    ratio = (current - old[mask]).exp()
+    advantage = advantages[:, None].expand_as(mask)[mask]
+    surrogate = torch.minimum(ratio * advantage, ratio.clamp(1 - clip, 1 + clip) * advantage)
+    delta = reference[mask] - current
+    return (-surrogate + beta * (delta.exp() - delta - 1)).sum()
 
 
 def gradient_evidence(actual, expected, shapes):
@@ -382,6 +426,7 @@ class Reference:
         self.policy = self.policy.cuda().eval()
         self.attention = configure_reference_attention(self.policy, config, MATCHED)
         self.install(initial)
+        self.reference = copy.deepcopy(self.policy).eval()
         self.master = FP32GradientReference(self.policy)
         self.optimizer = torch.optim.AdamW(
             self.master.master_parameters.values(), lr=1e-5, weight_decay=0.1
@@ -392,6 +437,32 @@ class Reference:
         from pithtrain.tasks.convert_checkpoint.qwen3_omni_moe import canonical_to_hf
 
         self.policy.load_state_dict(canonical_to_hf(canonical, self.config, prefix=""), strict=True)
+
+    @torch.no_grad()
+    def rollout(self, request, topology):
+        count = topology["local_batch"]
+        generator = torch.Generator().manual_seed(request.seed + request.dp_rank * 100003)
+        prompts = torch.randint(
+            0, self.config.vocab_size, (count // 2, PROMPT), generator=generator
+        ).repeat_interleave(2, 0)
+        ids = sample_autoregressive(self.policy, prompts.cuda(), generator, SEQUENCE - PROMPT)
+        targets = torch.zeros_like(ids)
+        targets[:, :-1] = ids[:, 1:]
+        old = self.policy(ids).float().log_softmax(-1).gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+        ref = (
+            self.reference(ids)
+            .float()
+            .log_softmax(-1)
+            .gather(-1, targets.unsqueeze(-1))
+            .squeeze(-1)
+        )
+        return dict(
+            input_ids=ids.cpu(),
+            tokens=targets.cpu(),
+            mask=token_mask(request.request_index, request.dp_rank, topology),
+            old=old.cpu(),
+            reference=ref.cpu(),
+        )
 
     def gradient(self, canonical, records, task):
         from pithtrain.tasks.convert_checkpoint.qwen3_omni_moe import hf_to_canonical
@@ -406,16 +477,33 @@ class Reference:
         require(count > 0, "Reference gradient needs valid targets")
         total = 0.0
         for row in records:
+            rewards = reward_tokens(row["tokens"], row["mask"]).cuda()
+            # Complete groups are pairs; native executes one microbatch at a time.
+            grouped = rewards.reshape(-1, 2)
+            advantages = (
+                (grouped - grouped.mean(-1, keepdim=True))
+                / (grouped.std(-1, correction=0, keepdim=True) + 1e-6)
+            ).reshape(-1)
             for index in range(row["input_ids"].shape[0]):
                 ids, labels, mask = (
                     row[key][index : index + 1].cuda() for key in ("input_ids", "tokens", "mask")
                 )
                 logits = self.master(ids)
-                loss = F.cross_entropy(
-                    logits.float().flatten(0, 1),
-                    labels.masked_fill(~mask, -100).flatten(),
-                    reduction="sum",
-                )
+                if task == "sft":
+                    loss = F.cross_entropy(
+                        logits.float().flatten(0, 1),
+                        labels.masked_fill(~mask, -100).flatten(),
+                        reduction="sum",
+                    )
+                else:
+                    loss = independent_token_objective(
+                        logits,
+                        labels,
+                        row["old"][index : index + 1].cuda(),
+                        row["reference"][index : index + 1].cuda(),
+                        mask,
+                        advantages[index : index + 1],
+                    )
                 loss.backward()
                 total += float(loss.detach())
         self.master.normalize_gradients_(count)
@@ -440,6 +528,90 @@ class Reference:
             count=count,
             preclip_norm=float(norm),
         )
+
+
+class DecidableReward:
+    def __init__(self):
+        self.calls = 0
+
+    def score(self, request, batch):
+        self.calls += 1
+        return reward_tokens(batch.sampled_token_ids, batch.token_mask)
+
+    def state_dict(self):
+        return dict(calls=self.calls, contract="even-token-fraction-v1")
+
+    def validate_state_dict(self, state):
+        require(
+            set(state) == {"calls", "contract"}
+            and state["contract"] == "even-token-fraction-v1"
+            and type(state["calls"]) is int
+            and 0 <= state["calls"] <= REQUESTS,
+            "Reward state differs",
+        )
+
+    def load_state_dict(self, state):
+        self.validate_state_dict(state)
+        self.calls = state["calls"]
+
+
+class Rollout:
+    def __init__(self, reference, topology, observer):
+        self.reference, self.topology, self.observer = reference, topology, observer
+        self.calls = 0
+
+    def synchronize(self, snapshot):
+        self.identity = snapshot.identity
+        root_phase(lambda: self.reference.install(snapshot.payload))
+        return snapshot.identity
+
+    def generate(self, request):
+        from dataclasses import replace
+
+        from pithtrain.tasks.omni_rl import RolloutBatch
+
+        records = root_phase(
+            lambda: [
+                self.reference.rollout(
+                    replace(request, dp_rank=rank, rollout_leader=True), self.topology
+                )
+                for rank in range(self.topology["dp"])
+            ]
+        )
+        self.observer.prepare(request.request_index, records)
+        row = records[request.dp_rank]
+        local = self.topology["local_batch"]
+        self.calls += 1
+        return RolloutBatch(
+            request.identity,
+            request.request_index,
+            row["input_ids"],
+            row["tokens"],
+            row["mask"],
+            row["old"],
+            row["reference"],
+            tuple(f"dp{request.dp_rank}-g{i // 2}" for i in range(local)),
+            tuple(
+                f"request{request.request_index}-dp{request.dp_rank}-sample{i}"
+                for i in range(local)
+            ),
+        )
+
+    def state_dict(self):
+        return dict(calls=self.calls, sampler="cpu-multinomial-seed-request-dp-v1")
+
+    def validate_state_dict(self, state):
+        require(
+            set(state) == {"calls", "sampler"}
+            and state["sampler"] == "cpu-multinomial-seed-request-dp-v1"
+            and type(state["calls"]) is int
+            and 0 <= state["calls"] <= REQUESTS,
+            "Rollout state differs",
+        )
+
+    def load_state_dict(self, state):
+        self.validate_state_dict(state)
+        self.calls = state["calls"]
 
 
 class Observer:
@@ -608,19 +780,21 @@ def snapshot(task_state):
     return _pack(values)
 
 
-def _weights_digest(values):
-    digest = hashlib.sha256()
-    for name, value in sorted(values.items()):
-        digest.update(json.dumps([name, str(value.dtype), list(value.shape)]).encode())
-        digest.update(value.contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
-    return digest.hexdigest()
-
-
 def run_gpu(args):
     from pithtrain.modules.checkpoint import load_checkpoint, save_checkpoint
     from pithtrain.modules.microbatch import Microbatch
     from pithtrain.modules.task_checkpoint import TaskCheckpointState
     from pithtrain.tasks import sft_lm
+    from pithtrain.tasks.omni_rl import (
+        OmniRLCfg,
+        OmniRLTrainer,
+        PithTrainPolicyAdapter,
+        PolicyIdentity,
+        PolicySnapshot,
+        RolloutContract,
+        _weights_digest,
+        fingerprint,
+    )
     from tests.acceptance.omni_native_resume import equal, model_config
 
     cfg, prepared = setup(args)
@@ -687,18 +861,64 @@ def run_gpu(args):
         reference_weights=identity["digest"],
         max_grad_norm=1.0,
     )
-    sftcfg = sft_lm.SFTLMCfg()
-    sftcfg.max_updates, sftcfg.max_batches, sftcfg.max_grad_norm = UPDATES, REQUESTS, 1.0
-    state, data = sft_lm.SFTState(), SFTData()
-    task_state = TaskCheckpointState(
-        sft_lm.SFTCheckpointState(state, data),
-        task_kind="sft",
-        task_schema=1,
-        contract=resume_config,
-        transaction_key="scanned_batches",
-        update_key="completed_updates",
-        data_key="data_cursor",
-    )
+    if args.task == "grpo":
+        contract = RolloutContract(
+            fingerprint("synthetic-id-prompt-v1"),
+            fingerprint(
+                dict(
+                    vocabulary=config.vocab_size,
+                    official_revision=REVISION,
+                    source=args.expected_commit,
+                    tiny_config=prepared["tiny_config_sha256"],
+                    tokenizer_used=False,
+                )
+            ),
+            fingerprint(dict(text_positions="0..S-1", rope=config.rope_parameters)),
+            identity["digest"],
+            fingerprint("even-token-fraction-v1"),
+        )
+
+        def publish(version, active_contract, semantics):
+            canonical = gather_native(training.model, config)
+            digest = root_phase(lambda: _weights_digest(canonical))
+            return PolicySnapshot(
+                PolicyIdentity(version, digest, active_contract, semantics["sha256"]),
+                canonical,
+                semantics,
+            )
+
+        backend = PithTrainPolicyAdapter.from_training_context(
+            export_policy=publish, training_cfg=cfg.training
+        )
+        rlcfg = OmniRLCfg()
+        rlcfg.max_updates, rlcfg.max_requests, rlcfg.max_samples = (
+            UPDATES,
+            REQUESTS,
+            topology["local_batch"],
+        )
+        rlcfg.max_sequence_length, rlcfg.seed = SEQUENCE, SEED
+        trainer = OmniRLTrainer(
+            rlcfg,
+            contract=contract,
+            backend=backend,
+            rollout=Rollout(reference, topology, observer),
+            reward=DecidableReward(),
+        )
+        resume_config = backend.checkpoint_contract(trainer)
+        task_state = backend._checkpoint_state(trainer, contract=resume_config)
+    else:
+        sftcfg = sft_lm.SFTLMCfg()
+        sftcfg.max_updates, sftcfg.max_batches, sftcfg.max_grad_norm = UPDATES, REQUESTS, 1.0
+        state, data = sft_lm.SFTState(), SFTData()
+        task_state = TaskCheckpointState(
+            sft_lm.SFTCheckpointState(state, data),
+            task_kind="sft",
+            task_schema=1,
+            contract=resume_config,
+            transaction_key="scanned_batches",
+            update_key="completed_updates",
+            data_key="data_cursor",
+        )
     checkpoint = args.output / "checkpoints"
     expected_path = args.output / f"continuous-rank-{rank:05d}.pt"
     expected = None
@@ -724,33 +944,47 @@ def run_gpu(args):
         for request in range(start, REQUESTS):
             before_calls = observer.calls
             before_zero = snapshot(task_state) if request == 2 else None
-            records = sft_records(request, topology, config.vocab_size)
-            observer.prepare(request, records)
-            row = records[distributed.dp_rank]
-            batches = [
-                Microbatch(
-                    model_inputs=(row["input_ids"][i : i + 1].to(device),),
-                    cu_seqlens=None,
-                    objective_inputs=(
-                        row["tokens"][i : i + 1]
-                        .masked_fill(~row["mask"][i : i + 1], -100)
-                        .to(device),
-                    ),
+            if args.task == "grpo":
+                result = trainer.train_step()
+                loss = result.get("local_loss_sum", 0.0)
+                scalar = torch.tensor(
+                    loss if distributed.pp_rank == 0 else 0.0, device=device, dtype=torch.float64
                 )
-                for i in range(topology["local_batch"])
-            ]
-            result = sft_lm.train_step(sftcfg, batches, token_group=token_group)
-            updated = result.updated
-            native_loss = root_phase(lambda: None if result.loss is None else float(result.loss))
-            state.scanned_batches += 1
-            state.completed_updates += int(updated)
-            data.load_state_dict(state.state_dict())
-            result = dict(
-                updated=updated,
-                global_tokens=result.global_targets,
-                requests=state.scanned_batches,
-                updates=state.completed_updates,
-            )
+                dist.all_reduce(scalar)
+                native_loss = (
+                    None if not result["global_tokens"] else float(scalar) / result["global_tokens"]
+                )
+                updated = result["status"] == "UPDATED"
+            else:
+                records = sft_records(request, topology, config.vocab_size)
+                observer.prepare(request, records)
+                row = records[distributed.dp_rank]
+                batches = [
+                    Microbatch(
+                        model_inputs=(row["input_ids"][i : i + 1].to(device),),
+                        cu_seqlens=None,
+                        objective_inputs=(
+                            row["tokens"][i : i + 1]
+                            .masked_fill(~row["mask"][i : i + 1], -100)
+                            .to(device),
+                        ),
+                    )
+                    for i in range(topology["local_batch"])
+                ]
+                result = sft_lm.train_step(sftcfg, batches, token_group=token_group)
+                updated = result.updated
+                native_loss = root_phase(
+                    lambda: None if result.loss is None else float(result.loss)
+                )
+                state.scanned_batches += 1
+                state.completed_updates += int(updated)
+                data.load_state_dict(state.state_dict())
+                result = dict(
+                    updated=updated,
+                    global_tokens=result.global_targets,
+                    requests=state.scanned_batches,
+                    updates=state.completed_updates,
+                )
             require(
                 observer.calls - before_calls == int(updated),
                 "Optimizer step observer coverage differs",
@@ -814,10 +1048,17 @@ def run_gpu(args):
                 "fresh autoregressive samples/logprobs/masks",
             )
             equal(results, expected["results"], "fresh update metrics")
-        require(
-            state.completed_updates == UPDATES and state.scanned_batches == REQUESTS,
-            "Final SFT counters differ",
-        )
+        if args.task == "grpo":
+            require(
+                trainer.updates == trainer.policy_version == UPDATES
+                and trainer.requests == REQUESTS,
+                "Final policy counters differ",
+            )
+        else:
+            require(
+                state.completed_updates == UPDATES and state.scanned_batches == REQUESTS,
+                "Final SFT counters differ",
+            )
         require(
             all(
                 len(opt.state) == len([p for group in opt.param_groups for p in group["params"]])
@@ -859,7 +1100,7 @@ def run_gpu(args):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("plan", "prepare", "produce", "restore"))
-    parser.add_argument("--task", choices=("sft",), required=True)
+    parser.add_argument("--task", choices=("sft", "grpo"), required=True)
     parser.add_argument("--expected-commit", required=True)
     parser.add_argument("--hardware", required=True)
     parser.add_argument("--world", type=int, required=True)
