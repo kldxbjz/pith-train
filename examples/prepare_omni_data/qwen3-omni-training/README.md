@@ -176,17 +176,18 @@ Media requires micro-batch size 1, CP=1 and a registered model that declares sup
 for the selected modalities. Native Omni encoders/positions are not implemented;
 existing text-only models reject media stages before model allocation.
 
-The CPU data regressions check the real preparation writer's train-only token
-export, shuffled sample order, DP/CP partitioning and committed resume position:
+For the existing **text** distributed batch path, use the same bundle's train-only
+token export (requires GPUs and the small processor files cached by preparation):
 
 ```bash
-pytest tests/test_qwen3_omni_data.py tests/test_training_data.py
+torchrun --standalone --nproc-per-node=1 tests/test_pretrain_data.py \
+  --dataset workspace/datasets/omni-training
 ```
 
-These tests use small local fixtures and cached processor files. The
-[training integration check](../../pretrain_lm/qwen3-omni/README.md#integration-check)
-also exercises the GPU data/checkpoint boundary. The former one-off distributed
-batch checker is retained with the PR100 acceptance archive.
+The checker accepts `--sequence-length`, `--global-batch-size`, `--micro-batch-size`,
+`--steps`, and `--pp/--cp/--ep`. This only verifies data partitioning, not an Omni
+model update. The former text-only smoke and five-fixture download recipes have
+been consolidated here; unit-test media fixtures stay inside the tests.
 
 ## Orchard storage
 

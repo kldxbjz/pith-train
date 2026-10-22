@@ -33,6 +33,7 @@ import torch.nn as nn
 from torch.distributed.checkpoint import FileSystemReader
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
+    get_model_state_dict,
     get_state_dict,
     set_model_state_dict,
     set_state_dict,
@@ -47,6 +48,7 @@ from pithtrain.contexts import distributed, logging, training
 
 __all__ = [
     "find_checkpoint",
+    "initialize_checkpoint",
     "iter_canonical_parameters",
     "load_checkpoint",
     "save_checkpoint",
@@ -120,13 +122,12 @@ def unwrap_dtensor_experts(value: Any, expected_n: int) -> Optional[Tuple[Any, i
         if dt.placements[0].dim != 0:
             return None
         local = dt._local_tensor
-        if local.shape[0] >= expected_n:
-            return None
         dp_rank = dt.device_mesh.get_local_rank()
         dp_size = dt.device_mesh.size()
-        chunk, remainder = divmod(expected_n, dp_size)
-        dp_offset = dp_rank * chunk + min(dp_rank, remainder)
-        return local, local.shape[0], dp_offset
+        local_n, dp_offset = Shard.local_shard_size_and_offset(expected_n, dp_size, dp_rank)
+        if local.shape[0] != local_n:
+            raise ValueError("Expert local shard size disagrees with Shard(0) placement")
+        return local, local_n, dp_offset
 
     if isinstance(value, DTensor):
         return _info(value)
@@ -354,6 +355,8 @@ def rewrap_dtensor_experts(result: Dict[str, Any], model: nn.Module) -> None:
                 value,
                 device_mesh=param.device_mesh,
                 placements=param.placements,
+                shape=param.shape,
+                stride=param.stride(),
                 run_check=False,
             )
         elif isinstance(value, dict):
@@ -363,6 +366,8 @@ def rewrap_dtensor_experts(result: Dict[str, Any], model: nn.Module) -> None:
                         v,
                         device_mesh=param.device_mesh,
                         placements=param.placements,
+                        shape=param.shape,
+                        stride=param.stride(),
                         run_check=False,
                     )
 
@@ -377,6 +382,19 @@ def to_localized_model(
     model_keys = set(model.state_dict().keys())
     fqn_map = {strip_prefix(k): k for k in model_keys}
     result = repack(canonical, fqn_map, named_modules, restack_tensors)
+    # A rank with an empty expert shard has no canonical expert entries to
+    # restack. Recreate only that zero-element local tensor; never substitute
+    # live values for a missing nonempty checkpoint parameter.
+    for name, parameter in model.named_parameters():
+        if (
+            name not in result
+            and ".experts." in name
+            and isinstance(parameter, DTensor)
+            and len(parameter.placements) == 1
+            and parameter.placements[0] == Shard(0)
+            and parameter.to_local().shape[0] == 0
+        ):
+            result[name] = parameter.detach().clone()
     rewrap_dtensor_experts(result, model)
     return result
 
@@ -420,12 +438,19 @@ def find_checkpoint(root: Optional[Path]) -> Optional[int]:
     continues at exactly this number. With five steps done, the next one to run is five. Storing the
     count rather than the index is what keeps every caller free of offset arithmetic.
 
-    Only complete checkpoints count. DCP writes .metadata after every rank's data, so a step
-    directory without it is a save that was interrupted, and it is skipped.
+    Only complete checkpoints count: ordinary DCP publishes .metadata and strict
+    rank-local checkpoints publish strict-manifest.json after all ranks finish.
     """
     if root is None: return None  # fmt: skip
     steps = Path(root, "torch-dcp").glob("[0-9]" * 8)
-    latest = max((step for step in steps if Path(step, ".metadata").is_file()), default=None)
+    latest = max(
+        (
+            step
+            for step in steps
+            if Path(step, ".metadata").is_file() or Path(step, "strict-manifest.json").is_file()
+        ),
+        default=None,
+    )
     return int(latest.name) if latest is not None else None
 
 
@@ -459,7 +484,9 @@ class CheckpointState(Stateful):
         missing optimizer keys.
         """
         if self.model_only:
-            model_state, _ = get_state_dict(self.model, self.optimizers)
+            # get_state_dict also initializes cold optimizer slots. Model-only
+            # initialization must leave the fresh optimizer untouched.
+            model_state = get_model_state_dict(self.model)
             return {"model": to_canonical_model(model_state, self.model)}
         model_state, optim_state = get_state_dict(self.model, self.optimizers)
         model_state = to_canonical_model(model_state, self.model)
@@ -499,7 +526,14 @@ class CheckpointState(Stateful):
                 scheduler.load_state_dict(st)
 
 
-def save_checkpoint(root: Path, step: int, *, data_state: Stateful | None = None) -> None:
+def save_checkpoint(
+    root: Path,
+    step: int,
+    *,
+    data_state: Stateful | None = None,
+    strict: bool = False,
+    resume_config: dict | None = None,
+) -> None:
     """
     Save the runtime model, optimizers and schedulers as the step checkpoint under root. The step is
     a count of completed work, the same number find_checkpoint reports and load_checkpoint takes.
@@ -509,6 +543,11 @@ def save_checkpoint(root: Path, step: int, *, data_state: Stateful | None = None
     entries locally by unwrap_dtensor_experts, so each rank writes only the
     expert keys it owns. Non-expert DTensors stay as CPU DTensors and DCP saves each rank's shard.
     """
+    if strict:
+        from pithtrain.modules.distributed_checkpoint import save
+
+        save(root, step, data_state=data_state, config=resume_config)
+        return
     stdout = logging.stdout
     model, optimizers, schedulers = training.model, training.optimizers, training.schedulers
     location = Path(root, "torch-dcp", "%08d" % step)
@@ -539,7 +578,35 @@ def save_checkpoint(root: Path, step: int, *, data_state: Stateful | None = None
     stdout.info("Save checkpoint: elapsed min=%.1fs, max=%.1fs" % (dt_min.item(), dt_max.item()))
 
 
-def load_checkpoint(root: Path, step: int, *, data_state: Stateful | None = None) -> None:
+def initialize_checkpoint(root: Path, step: int = 0) -> None:
+    """Initialize only model tensors from a canonical DCP checkpoint.
+
+    Optimizer, scheduler, RNG, data position and the caller's step are untouched.
+    Call this after fresh training setup, with a separate output checkpoint root.
+    This is not resume: any non-model DCP entries and RNG sidecars are ignored.
+    Strict rank-local checkpoints require the strict loader or an explicit model
+    export; they cannot be treated as canonical initialization checkpoints.
+    """
+    if type(step) is not int or step < 0:
+        raise ValueError("Initialization checkpoint step must be a nonnegative integer")
+    location = Path(root, "torch-dcp", f"{step:08d}")
+    if (location / "strict-manifest.json").exists():
+        raise ValueError("Export strict checkpoint model weights before initialization")
+    logging.stdout.info("Initialize model weights: %s", location)
+    started = time.monotonic()
+    state = CheckpointState(training.model, (), (), model_only=True)
+    dcp.load({"app": state}, checkpoint_id=location)
+    logging.stdout.info("Initialize model weights: elapsed %.1fs", time.monotonic() - started)
+
+
+def load_checkpoint(
+    root: Path,
+    step: int,
+    *,
+    data_state: Stateful | None = None,
+    strict: bool = False,
+    resume_config: dict | None = None,
+) -> None:
     """
     Load the step checkpoint under root into the runtime state: the model, plus the optimizers and
     schedulers when the checkpoint carries them. One converted from HuggingFace carries model keys
@@ -550,12 +617,18 @@ def load_checkpoint(root: Path, step: int, *, data_state: Stateful | None = None
     the caller knows whether loading these weights means resuming its own run or filling a frozen
     slot such as an RL reference policy.
     """
+    if strict:
+        from pithtrain.modules.distributed_checkpoint import load
+
+        load(root, step, data_state=data_state, config=resume_config)
+        return
+    if Path(root, "torch-dcp", f"{step:08d}", "strict-manifest.json").exists():
+        raise ValueError("This checkpoint requires strict fixed-topology resume")
     stdout = logging.stdout
     location = Path(root, "torch-dcp", "%08d" % step)
     stdout.info("Load checkpoint: %s" % location)
 
     t0 = time.monotonic()
-    torch.cuda.empty_cache()
     metadata = FileSystemReader(str(location)).read_metadata()
     model_only = all(k.startswith("app.model.") for k in metadata.state_dict_metadata)
     model, optimizers, schedulers = training.model, training.optimizers, training.schedulers
@@ -563,6 +636,7 @@ def load_checkpoint(root: Path, step: int, *, data_state: Stateful | None = None
         k.startswith("app.data.") for k in metadata.state_dict_metadata
     ):
         raise ValueError("This checkpoint has no data state; it cannot resume prepared Omni data")
+    torch.cuda.empty_cache()
     state = CheckpointState(
         model, optimizers, schedulers, model_only=model_only, data_state=data_state
     )

@@ -117,7 +117,52 @@ its position comes from the training step, so legacy checkpoints need no data-st
 recipe identity. Adding a source with this interface does not require a type check in the
 training loop. This interface does not extend media support beyond CP1/microbatch1.
 
-## Target normalization check
+## Independent-process acceptance
+
+`tests/test_omni_training_acceptance.py` complements the short integration check.
+Run the same reduced Qwen3 config and data through two unchanged-base processes,
+one feature process, and a fourth process restoring the feature's checkpoint 1.
+Each process must have a separate output directory. The base arms use `--legacy`
+and import an immutable archive of the PR base via `PYTHONPATH`; the feature
+uses the prepared bundle through `OmniPretrainData`.
+
+```bash
+# Example feature arm; the base arms use --legacy and the base source archive.
+torchrun --standalone --nproc-per-node=1 tests/test_omni_training_acceptance.py \
+  --observation-protocol save_then_runtime_state_v1 \
+  --dataset /tmp/omni-training --output /tmp/feature --report /tmp/feature-report
+torchrun --standalone --nproc-per-node=1 tests/test_omni_training_acceptance.py \
+  --observation-protocol save_then_runtime_state_v1 \
+  --dataset /tmp/omni-training --output /tmp/resumed --report /tmp/resumed-report \
+  --restore /tmp/feature/checkpoints --expected /tmp/feature-report
+python tests/compare_omni_acceptance.py \
+  /tmp/base0-report /tmp/base1-report /tmp/feature-report \
+  --resume /tmp/resumed-report --output /tmp/comparison.json
+```
+
+The default 12 steps at sequence length 128 and global batch 8 consume 96 of the
+small bundle's 97 complete text sequences. LR warms from 1e-6 to 1e-5. The reports
+include full-precision CE, load-balancing loss and gradient norms. The comparator
+requires every expected step/rank and identical input hashes; it rejects feature
+or resume drift at or above 3 times the repeated-base drift. A zero baseline with
+nonzero feature drift requires investigation. This is a short regression check,
+not evidence about long-run convergence.
+
+Fresh-process recovery requires exact hashes for every model parameter, AdamW
+entry, scheduler entry, CUDA RNG and committed data state, then exact hashes for
+every subsequent input. Post-update parameter equivalence is not asserted by
+this test. Decoder view outputs are audited: their versions must remain unchanged
+and every registered backward hook must run. The conditional FSDP warning is not
+silenced.
+
+`--media --steps 4 --sequence-length 2048 --pp 2 --ep 2` reads real prepared
+image/audio/video features and uses a test-only GPU consumer to exercise prolog,
+normal/overlapped position calls and fresh-process data replay. All four modalities
+must be observed. The scalar media injection is deliberately a transport test,
+not an Omni encoder or model-correctness reference. Use the same sequence length
+for the producer and every recovery process. The default recipe accepts expanded
+media/text sequences up to 2048 tokens; a smaller training limit can reject an
+otherwise valid prepared sample. Media placeholders must not be truncated to fit.
 
 ```bash
 torchrun --standalone --nproc-per-node=4 tests/test_omni_target_gpu.py
@@ -129,11 +174,17 @@ globally empty batch. Two separate pipeline-stage groups catch accidental PP
 double-counting. Loss, gradients and an SGD update are compared with a global
 single-device reference.
 
+For recovery after the allocation ends, archive the completed checkpoint to
+durable storage, retain its SHA256 and per-rank expected reports, then stage it
+under a new local directory and run the same `--restore` command in a new job.
+The Orchard validation harness does this through personal GCS; local `/tmp`
+contents alone cannot survive node reclamation. A queued validation job is not
+a passing result; see the PR's current validation record before merging.
 
-The one-off 12-step repeated-base and fresh-process acceptance harness and its
-schema-3 reports are retained in the [PR100 validation record](https://github.com/mlc-ai/pith-train/pull/100).
-Those reports compare CE, load-balancing loss and gradient-norm drift against two
-unchanged baseline runs (ratio < 3); they do not assert elementwise post-update
-parameter equivalence. Historical results apply only to the recorded source,
-inputs, topology and harness. The ongoing regressions above cover the data and
-checkpoint contracts; they do not establish native Omni model correctness.
+Acceptance reports use schema 3. Every producer, including `--legacy`, saves one
+checkpoint and hashes its full runtime state after the configured checkpoint step.
+The historical base is called through its original two-argument checkpoint API.
+Restore arms independently assert exact restored state and subsequent inputs; they
+do not repeat the producer save. Reports from earlier schemas remain historical
+evidence and cannot serve as schema-3 restore references. This aligns the observation
+boundary and call counts, not the internal implementations or GPU timing.

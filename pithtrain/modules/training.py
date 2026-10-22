@@ -26,9 +26,15 @@ from pithtrain.contexts import distributed, training
 from pithtrain.models.deepseek_v2 import DeepSeekV2Model
 from pithtrain.models.gpt_oss import GptOssModel
 from pithtrain.models.qwen3_moe import Qwen3MoeModel
+from pithtrain.models.qwen3_omni_audio_model import Qwen3OmniMoeThinkerAudioModel
+from pithtrain.models.qwen3_omni_image import Qwen3OmniMoeThinkerImageModel
 from pithtrain.models.qwen3_omni_moe import Qwen3OmniMoeThinkerTextModel
+from pithtrain.models.qwen3_omni_multimodal import Qwen3OmniMoeThinkerMultimodalModel
+from pithtrain.models.qwen3_omni_talker_pipeline import Qwen3OmniMoeTalkerTextModel
+from pithtrain.models.qwen3_omni_video import Qwen3OmniMoeThinkerVideoModel
 from pithtrain.models.qwen35_moe import Qwen35MoeModel
 from pithtrain.modules.load_balance import force_balance, make_load_balance_loss_fn
+from pithtrain.modules.model_config import resolve_text_model_config
 from pithtrain.modules.optimizer import Muon
 from pithtrain.modules.reproducibility import configure_deterministic_training
 from pithtrain.operators.grouped_linear import FP8GroupedLinear, GroupedLinear
@@ -57,13 +63,19 @@ def is_muon_param(name: str, param: torch.Tensor) -> bool:
     norms, biases and sinks, the embeddings, the LM head, the MoE gate and router, and the 2D
     stacked expert biases.
     """
-    if param.ndim < 2:
+    if param.ndim < 2 or "visual." in name or "audio_tower." in name:
         return False
     if name.endswith(".bias") or name.endswith("_bias"):
         return False
-    if name.endswith("embed_tokens.weight") or name.endswith("lm_head.weight"):
+    if name.endswith(
+        ("embed_tokens.weight", "lm_head.weight", "codec_embedding.weight", "codec_head.weight")
+    ):
         return False
-    if ".gate.weight" in name or ".router.weight" in name:
+    if (
+        ".gate.weight" in name
+        or ".router.weight" in name
+        or (".model.layers." in "." + name and name.endswith("shared_expert_gate.weight"))
+    ):
         return False
     return True
 
@@ -132,14 +144,34 @@ def make_wsd_scheduler(
             case "linear":
                 return 1.0 + (final_factor - 1.0) * t
 
-    return tuple(LambdaLR(opt, lr_lambda) for opt in training.optimizers)
+    from pithtrain.modules.resume_semantics import bind_scheduler_factory
+
+    return bind_scheduler_factory(
+        tuple(LambdaLR(opt, lr_lambda) for opt in training.optimizers),
+        make_wsd_scheduler,
+        dict(
+            lr=cfg.lr,
+            max_steps=cfg.max_steps,
+            start_lr=start_lr,
+            warmup_ratio=warmup_ratio,
+            final_lr=final_lr,
+            decay_ratio=decay_ratio,
+            decay_shape=decay_shape,
+        ),
+    )
 
 
 def make_constant_scheduler(cfg: TrainingCfg) -> tuple[LRScheduler, ...]:
     """
     Hold lr constant for the whole run: no warmup, no decay.
     """
-    return tuple(LambdaLR(opt, lambda _: 1.0) for opt in training.optimizers)
+    from pithtrain.modules.resume_semantics import bind_scheduler_factory
+
+    return bind_scheduler_factory(
+        tuple(LambdaLR(opt, lambda _: 1.0) for opt in training.optimizers),
+        make_constant_scheduler,
+        dict(lr=cfg.lr, max_steps=cfg.max_steps),
+    )
 
 
 @dataclass(init=False, slots=True)
@@ -147,6 +179,18 @@ class TrainingCfg(SlottedDefault):
     """
     Configuration for the model and how it is trained.
     """
+
+    native_multimodal: bool = False
+    """Joint native text/image/audio/video Thinker with fixed encoder collectives."""
+
+    native_video: bool = False
+    """Opt into native video-only Thinker input with temporal RoPE and DeepStack."""
+
+    native_vision: bool = False
+    """Opt into native Omni image training using a composite Thinker config."""
+
+    native_audio: bool = False
+    """Opt into native Omni audio/text training using a composite Thinker config."""
 
     sequence_length: int
     """
@@ -204,11 +248,22 @@ class TrainingCfg(SlottedDefault):
     """
 
     deterministic: bool = False
-    """Request PyTorch/cuDNN, FA4 and stable Omni token-layout policies.
+    """Request PyTorch/cuDNN and FA4 deterministic policies without checkpoint features.
 
     This independent numerical setting lets baseline and strict-resume runs use
     identical compute policies. Strict resume also enables it implicitly.
     CUDA launches require CUBLAS_WORKSPACE_CONFIG=:4096:8 or :16:8 before Python.
+    """
+
+    strict_resume: bool = False
+    """Opt into fixed-topology transactional resume, including every rank's data/RNG.
+
+    Also requests PyTorch deterministic algorithms, fixed cuDNN policy and FA4
+    ordered backward reductions. CUDA launches require CUBLAS_WORKSPACE_CONFIG
+    set to :4096:8 or :16:8 before Python starts. These policies do not guarantee
+    whole-model bitwise reproducibility. Currently requires prepared data, AdamW
+    and StepLR/LambdaLR. Weight-only
+    initialization and changed-world-size resharding keep the legacy path.
     """
 
     save_interval: Optional[int] = None
@@ -315,6 +370,9 @@ def init_weights(model: nn.Module, num_layers: int, init_std: float = 0.02) -> N
     # Scale down residual-stream projections (o_proj, down_proj) to bound variance growth.
     output_std = init_std / math.sqrt(2.0 * num_layers)
     for name, param in model.named_parameters():
+        if name.startswith(("visual.", "audio_tower.")) and param.dim() == 1:
+            nn.init.zeros_(param) if name.endswith("bias") else nn.init.ones_(param)
+            continue
         if param.dim() < 2:
             continue  # skip biases, layer-norm weights, etc.
         if "o_proj" in name or "down_proj" in name:
@@ -367,11 +425,19 @@ def apply_fsdp(model, hsdp_replica: int = 1):
         assert isinstance(model[i], PIPELINE_STAGE_MODELS)
         # Stage-edge modules (embed / norm / lm_head): every non-"layers" child that
         # owns parameters. reshard_after_forward=True since each runs once per step.
-        for name, child in model[i].named_children():
-            if name != "layers" and next(child.parameters(), None) is not None:
-                fully_shard(
-                    child, mesh=attn_fsdp_mesh, reshard_after_forward=True, mp_policy=compute_mp
-                )
+        edges = (
+            model[i].fsdp_edge_modules()
+            if isinstance(model[i], Qwen3OmniMoeTalkerTextModel)
+            else tuple(
+                child
+                for name, child in model[i].named_children()
+                if name != "layers" and next(child.parameters(), None) is not None
+            )
+        )
+        for child in edges:
+            fully_shard(
+                child, mesh=attn_fsdp_mesh, reshard_after_forward=True, mp_policy=compute_mp
+            )
         for layer in model[i].layers.values():
             if hasattr(layer.mlp, "experts"):
                 fully_shard(
@@ -404,12 +470,34 @@ def apply_fsdp(model, hsdp_replica: int = 1):
     return model
 
 
-def model_class_for_config(module_config):
+def model_class_for_config(
+    module_config,
+    native_vision=False,
+    native_audio=False,
+    native_video=False,
+    native_multimodal=False,
+):
     """Resolve a registered pipeline model before allocating any parameters."""
+    if sum((native_vision, native_audio, native_video, native_multimodal)) > 1:
+        raise ValueError("Select one native mode; combined media uses native_multimodal")
+    if native_vision or native_audio or native_video or native_multimodal:
+        thinker = getattr(module_config, "thinker_config", module_config)
+        if getattr(thinker, "model_type", None) != "qwen3_omni_moe_thinker":
+            raise ValueError(
+                "native_vision/native_audio/native_video/native_multimodal requires a composite Omni Thinker config"
+            )
+        if native_multimodal:
+            return Qwen3OmniMoeThinkerMultimodalModel
+        if native_audio:
+            return Qwen3OmniMoeThinkerAudioModel
+        return Qwen3OmniMoeThinkerVideoModel if native_video else Qwen3OmniMoeThinkerImageModel
+    module_config = resolve_text_model_config(module_config)
     if module_config.model_type == "deepseek_v2":
         return DeepSeekV2Model
     elif module_config.model_type == "qwen3_moe":
         return Qwen3MoeModel
+    elif module_config.model_type == "qwen3_omni_moe_talker_text":
+        return Qwen3OmniMoeTalkerTextModel
     elif module_config.model_type == "qwen3_omni_moe_text":
         return Qwen3OmniMoeThinkerTextModel
     elif module_config.model_type == "gpt_oss":
@@ -432,7 +520,8 @@ def setup_model(
     cp_group = distributed.cp_group
 
     modules = []
-    module_config = AutoConfig.from_pretrained(cfg.model)
+    source_config = AutoConfig.from_pretrained(cfg.model)
+    module_config = resolve_text_model_config(source_config)
     module_config.max_position_embeddings = cfg.sequence_length
 
     assert hasattr(module_config, "hidden_size")
@@ -446,10 +535,20 @@ def setup_model(
         )
 
     # All models read their parallel groups from the distributed context directly.
-    ModelClass = model_class_for_config(module_config)
-
-    modules.append(ModelClass(module_config, phase=0))
-    modules.append(ModelClass(module_config, phase=1))
+    ModelClass = model_class_for_config(
+        source_config,
+        native_vision=cfg.native_vision,
+        native_audio=cfg.native_audio,
+        native_video=cfg.native_video,
+        native_multimodal=cfg.native_multimodal,
+    )
+    selected_config = (
+        getattr(source_config, "thinker_config", source_config)
+        if cfg.native_vision or cfg.native_audio or cfg.native_video or cfg.native_multimodal
+        else module_config
+    )
+    modules.append(ModelClass(selected_config, phase=0))
+    modules.append(ModelClass(selected_config, phase=1))
 
     # Apply scaled normal weight initialization before FSDP sharding.
     num_layers = module_config.num_hidden_layers
@@ -606,12 +705,12 @@ def setup_training(cfg: object) -> None:
     np.random.seed(cfg.training.seed)
     torch.manual_seed(cfg.training.seed)
     torch.cuda.manual_seed_all(cfg.training.seed)
-    training.deterministic_attention = bool(
-        getattr(cfg.training, "deterministic", False)
-        or getattr(cfg.training, "strict_resume", False)
+    configure_deterministic_training(
+        bool(
+            getattr(cfg.training, "deterministic", False)
+            or getattr(cfg.training, "strict_resume", False)
+        )
     )
-    training.deterministic_token_layout = training.deterministic_attention
-    configure_deterministic_training(training.deterministic_attention)
     setup_model(cfg.training, cfg.distributed)
     training.optimizers = cfg.training.optimizer(cfg.training)
     training.schedulers = cfg.training.scheduler(cfg.training)

@@ -27,6 +27,7 @@ from pithtrain.models.qwen3_omni_moe import (
     Qwen3OmniMoeThinkerTextModel,
     Qwen3OmniMoeThinkerTextTopKRouter,
 )
+from pithtrain.models.qwen3_omni_talker_pipeline import Qwen3OmniMoeTalkerTextModel
 from pithtrain.models.qwen35_moe import Qwen35MoeModel, Qwen35MoeTopKRouter
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.operators.cp_sequence import zigzag_varlen_index
@@ -268,6 +269,9 @@ def main(model_name: str):
     elif config.model_type == "qwen3_moe":
         ModelClass = Qwen3MoeModel
         config.num_hidden_layers = min(config.num_hidden_layers, 8)
+    elif config.model_type == "qwen3_omni_moe_talker_text":
+        ModelClass = Qwen3OmniMoeTalkerTextModel
+        config.num_hidden_layers = min(config.num_hidden_layers, 8)
     elif config.model_type == "qwen3_omni_moe_text":
         ModelClass = Qwen3OmniMoeThinkerTextModel
         config.num_hidden_layers = min(config.num_hidden_layers, 8)
@@ -373,14 +377,26 @@ def main(model_name: str):
         local_full_modules.append(ModelClass(config, phase=1))
 
     local_full_modules = nn.Sequential(*local_full_modules)
-    if pp_rank == 0:
-        local_full_modules[0].embed_tokens = full_modules.embed_tokens
-        local_full_modules[1].norm = full_modules.norm
-        local_full_modules[1].lm_head = full_modules.lm_head
-    local_full_modules[0].layers = shard_layers(full_modules.layers, pp_rank, num_stages, config)
-    local_full_modules[1].layers = shard_layers(
-        full_modules.layers, num_stages - 1 - pp_rank, num_stages, config
-    )
+    if isinstance(full_modules, Qwen3OmniMoeTalkerTextModel):
+        if pp_rank == 0:
+            local_full_modules[0].model.codec_embedding = full_modules.model.codec_embedding
+            local_full_modules[1].model.norm = full_modules.model.norm
+            local_full_modules[1].codec_head = full_modules.codec_head
+        for phase, stage in ((0, pp_rank), (1, num_stages - 1 - pp_rank)):
+            local_full_modules[phase].model.layers = shard_layers(
+                full_modules.layers, stage, num_stages, config
+            )
+    else:
+        if pp_rank == 0:
+            local_full_modules[0].embed_tokens = full_modules.embed_tokens
+            local_full_modules[1].norm = full_modules.norm
+            local_full_modules[1].lm_head = full_modules.lm_head
+        local_full_modules[0].layers = shard_layers(
+            full_modules.layers, pp_rank, num_stages, config
+        )
+        local_full_modules[1].layers = shard_layers(
+            full_modules.layers, num_stages - 1 - pp_rank, num_stages, config
+        )
     if ep_size > 1:
         with torch.device("cpu"):
             shard_experts(local_full_modules[0], ep_rank=ep_rank, ep_size=ep_size)
@@ -465,10 +481,7 @@ def main(model_name: str):
 
     for (n, p), p_ref in zip(local_modules.named_parameters(), local_full_modules.parameters()):
         assert p_ref.grad is not None, f"Reference parameter {n} has no gradient"
-        if p.grad is None:
-            print("[ERROR] rank-%d, Parameter %s has no gradient." % (distributed.rank, n))
-            failed = True
-            continue
+        assert p.grad is not None, f"rank-{distributed.rank}: pipeline lost gradient for {n}"
         # Both parameter classes reduce with a plain sum over their own replica group, and either
         # sum spans every global chunk exactly once: the attn group is the whole dp x cp stage,
         # and the expt replica group covers all the data too, since every member receives the
@@ -493,7 +506,11 @@ def main(model_name: str):
         # weights are exempt: their gradients scale as 1/num_experts, so a fixed floor drops
         # every one of them on a many-expert config and leaves the expert path unchecked.
         ref_max = p_ref.grad.abs().max().item()
-        if ref_max < 1e-5 and ".experts." not in n:
+        if (
+            ref_max < 1e-5
+            and ".experts." not in n
+            and config.model_type != "qwen3_omni_moe_talker_text"
+        ):
             print(
                 "[warn] rank-%d, Parameter %s grad max=%.2e at bf16 noise floor, skipping."
                 % (distributed.rank, n, ref_max)
@@ -548,6 +565,8 @@ def _entry() -> None:
     models.extend(
         [
             "tests/configs/qwen3_omni_text/tiny.json",
+            "tests/configs/qwen3_omni_talker_text/tiny.json",
+            "examples/pretrain_lm/qwen3-omni-talker-text/config.json",
             "examples/pretrain_lm/qwen3-omni-thinker-text/config.json",
         ]
     )

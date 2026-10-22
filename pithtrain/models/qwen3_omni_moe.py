@@ -38,18 +38,19 @@ class Qwen3OmniMoeThinkerTextRotaryEmbedding(nn.Module):
         if len(self.mrope_section) != 3 or sum(self.mrope_section) != self.head_dim // 2:
             raise ValueError("mrope_section must partition half of head_dim into T/H/W sections")
 
-    @torch.no_grad()
-    def forward(self, position_ids, dtype):
-        # HF's interleaved T/H/W recomposition; text gives all three axes the
-        # same positions. Recompute frequencies in FP32 so model.to(bfloat16)
-        # cannot round an inverse-frequency buffer before the trigonometry.
+        # Match HF's CPU FP32 construction even when this module is built on CUDA/meta.
+        # Plain constants keep dtype/device moves and strict buffer/checkpoint keys unchanged.
         inv_freq = 1.0 / (
             self.base
             ** (
-                torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=position_ids.device)
-                / self.head_dim
+                torch.arange(0, self.head_dim, 2, dtype=torch.float32, device="cpu") / self.head_dim
             )
         )
+        self.inv_freq = tuple(inv_freq.tolist())
+
+    @torch.no_grad()
+    def forward(self, position_ids, dtype):
+        inv_freq = torch.tensor(self.inv_freq, dtype=torch.float32, device=position_ids.device)
         freq = position_ids.float().unsqueeze(-1) * inv_freq
         outputs = []
         for values in (freq.cos(), freq.sin()):
@@ -123,11 +124,31 @@ class Qwen3OmniMoeThinkerTextTopKRouter(nn.Module):
         return indices, weights, lb_loss
 
 
+def _combine_expert_order(moe_outs, topk_weight, moe_local_idxs, output_dtype):
+    """Combine slots already ordered by increasing expert ID, matching HF eager.
+
+    The unique EP return indices restore token/slot order without a floating
+    scatter reduction. Round the weighted product before each serial addition;
+    a single sum over K (even sorted) has different BF16 arithmetic. Expert
+    GEMMs and dispatch remain grouped. Compiled callers preserve precision casts.
+    """
+    if moe_local_idxs is not None:
+        slots = moe_outs.new_zeros(topk_weight.numel(), moe_outs.shape[-1])
+        moe_outs = slots.index_copy(0, moe_local_idxs, moe_outs)
+    outputs = moe_outs.view(*topk_weight.shape, -1)
+    result = torch.zeros_like(outputs[:, 0], dtype=output_dtype)
+    for slot in range(topk_weight.shape[1]):
+        product = outputs[:, slot] * topk_weight[:, slot, None]
+        result = result + product.to(output_dtype)
+    return result
+
+
 class Qwen3OmniMoeThinkerTextSparseMoeBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
+        self.deterministic_token_layout = training.deterministic_token_layout
         if config.num_experts % distributed.ep_size:
             raise ValueError("num_experts must be divisible by expert_parallel_size")
         self.experts_per_rank = config.num_experts // distributed.ep_size
@@ -140,14 +161,16 @@ class Qwen3OmniMoeThinkerTextSparseMoeBlock(nn.Module):
         indices, weights, lb_loss = self.gate(hidden_states, replay_idx)
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
+        # Expert-ID accumulation order is independent of dispatch row layout.
+        indices, order = indices.sort(dim=-1)
+        weights = weights.gather(-1, order)
         flat = hidden_states.reshape(-1, shape[-1])
         repeated = flat[:, None].expand(-1, self.num_experts_per_tok, -1).reshape(-1, shape[-1])
         tokens, reverse, offs, ks, sizes = scatter_for_grouped_gemm(
             repeated, indices.reshape(-1), self.experts_per_rank, deterministic=True
         )
         outputs = padded_index_gather(self.experts(tokens, offs, ks, sizes), reverse)
-        weighted = outputs.view(*indices.shape, -1) * weights.unsqueeze(-1)
-        return weighted.sum(1).view(shape)
+        return _combine_expert_order(outputs, weights, None, hidden_states.dtype).view(shape)
 
 
 class Qwen3OmniMoeThinkerTextMLP(nn.Module):
@@ -271,6 +294,9 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
             return hidden_states, residual, None
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
+        # Canonicalize only the K selected slots; retain the dispatch policy below.
+        indices, order = indices.sort(dim=-1)
+        weights = weights.gather(-1, order)
         tokens, routing = prepare_dispatch(
             hidden_states,
             indices,
@@ -279,7 +305,7 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
             distributed.ep_size,
             self.mlp.experts_per_rank,
             distributed.ep_group,
-            deterministic=training.deterministic_token_layout,
+            deterministic=self.mlp.deterministic_token_layout,
         )
         return tokens, residual, routing
 
@@ -292,22 +318,20 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
             gathered_tokens,
             expert_idxs,
             self.mlp.experts_per_rank,
-            deterministic=training.deterministic_token_layout,
+            deterministic=self.mlp.deterministic_token_layout,
         )
         return padded_index_gather(self.mlp.experts(tokens, offs, ks, sizes), reverse)
 
     def _forward_stage5(self, moe_outs, moe_local_idxs, topk_weight, residual):
         if not self.is_moe:
             return residual + moe_outs
-        if distributed.ep_size == 1:
-            weighted = moe_outs.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)
-            return residual + weighted.sum(1).view_as(residual)
-        probs = topk_weight.reshape(-1)[moe_local_idxs]
-        weighted = moe_outs * probs.unsqueeze(-1)
-        token_indices = moe_local_idxs // topk_weight.shape[1]
-        result = moe_outs.new_zeros(topk_weight.shape[0], moe_outs.shape[-1])
-        result.scatter_add_(0, token_indices[:, None].expand_as(weighted), weighted)
-        return residual + result.view_as(residual)
+        combined = _combine_expert_order(
+            moe_outs,
+            topk_weight,
+            moe_local_idxs if distributed.ep_size > 1 else None,
+            residual.dtype,
+        )
+        return residual + combined.view_as(residual)
 
     @torch.compile(fullgraph=True, options={"emulate_precision_casts": True})
     def forward_stage5(self, moe_outs, moe_local_idxs, topk_weight, residual):
@@ -320,10 +344,27 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
         return residual + self.mlp.reference_forward(self.post_attention_layernorm(residual))
 
 
+class Qwen3OmniMoeThinkerMediaDecoderLayer(Qwen3OmniMoeThinkerTextDecoderLayer):
+    """Keep the validated media gradient boundaries while text uses compiled stages."""
+
+    def forward_stage1_compute(
+        self, hidden_states, rotary_posemb, cu_seqlens=None, replay_idx=None
+    ):
+        residual = hidden_states + self.self_attn(
+            self.input_layernorm(hidden_states), rotary_posemb, cu_seqlens
+        )
+        hidden_states = self.post_attention_layernorm(residual)
+        routing = self.mlp.gate(hidden_states, replay_idx) if self.is_moe else (None, None, None)
+        return hidden_states, residual, *routing
+
+    def forward_stage5(self, moe_outs, moe_local_idxs, topk_weight, residual):
+        return self._forward_stage5(moe_outs, moe_local_idxs, topk_weight, residual)
+
+
 class Qwen3OmniMoeThinkerTextModel(nn.Module):
     input_modalities = ("text",)
 
-    def __init__(self, config: Qwen3OmniMoeTextConfig, phase: int):
+    def __init__(self, config: Qwen3OmniMoeTextConfig, phase: int, *, decoder_layer_factory=None):
         super().__init__()
         if training.fp8:
             raise NotImplementedError("Thinker fused experts currently support BF16 training only")
@@ -351,9 +392,13 @@ class Qwen3OmniMoeThinkerTextModel(nn.Module):
         if self.stage_index == self.stage_count - 1:
             self.norm = Qwen3OmniMoeThinkerTextRMSNorm(config.hidden_size, config.rms_norm_eps)
             self.lm_head = BF16Linear(config.hidden_size, config.vocab_size, bias=False)
+        # Media subclasses must choose their layer before allocation. Replacing
+        # an already-built stack temporarily retains two full decoder stacks.
+        if decoder_layer_factory is None:
+            decoder_layer_factory = Qwen3OmniMoeThinkerTextDecoderLayer
         self.layers = nn.ModuleDict(
             {
-                str(i): Qwen3OmniMoeThinkerTextDecoderLayer(config, i)
+                str(i): decoder_layer_factory(config, i)
                 for i in layer_partition(
                     config.num_hidden_layers, self.stage_count, self.stage_index
                 )

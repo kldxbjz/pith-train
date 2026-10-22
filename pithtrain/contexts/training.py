@@ -34,11 +34,12 @@ It does not guarantee whole-model bitwise reproducibility on its own.
 
 deterministic_token_layout: bool = False
 """
-Use stable Omni expert/EP token order for the explicit deterministic policy.
+Opt into stable Omni token dispatch/scatter layout.
 
-Ordinary production uses fused dispatch. setup_training derives this and the
-FA4 policy from the same deterministic/strict_resume configuration. Stable
-reference_forward remains an independent oracle for either production mode.
+Ordinary production retains fused dispatch/scatter. Both layouts use the same
+expert-ID BF16 accumulation. Initialize once before constructing models via
+configure_deterministic_training; each MoE captures the layout policy as a
+checkpoint-bound numerical attribute.
 """
 
 fp8: bool

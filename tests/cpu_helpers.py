@@ -28,8 +28,13 @@ def layer_type(ep):
     methods = ("_forward_stage5", "forward_stage5")
     namespace = load_definitions(
         "pithtrain/models/qwen3_omni_moe.py",
-        methods,
+        ("_combine_expert_order",),
         dict(torch=torch, distributed=SimpleNamespace(ep_size=ep)),
+    )
+    namespace = load_definitions(
+        "pithtrain/models/qwen3_omni_moe.py",
+        methods,
+        namespace,
         class_name=name,
     )
     return type(name, (torch.nn.Module,), {method: namespace[method] for method in methods})

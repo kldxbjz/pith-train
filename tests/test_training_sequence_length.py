@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from pithtrain.modules.model_config import resolve_text_model_config
+
 
 class ModelConstructionReached(Exception):
     pass
@@ -37,7 +39,8 @@ def setup_entry(cp_size):
         FP8GroupedLinear=object(),
         GroupedLinear=object(),
         AutoConfig=SimpleNamespace(from_pretrained=lambda _: model_config),
-        model_class_for_config=lambda _: construct,
+        model_class_for_config=lambda _, **flags: construct,
+        resolve_text_model_config=resolve_text_model_config,
     )
     exec("from __future__ import annotations\n" + ast.unparse(function), namespace)
     return namespace["setup_model"], calls
@@ -49,7 +52,15 @@ def setup_entry(cp_size):
 )
 def test_model_entry_accepts_unsharded_and_valid_sharded_lengths(cp_size, length):
     setup_model, calls = setup_entry(cp_size)
-    cfg = SimpleNamespace(fp8=False, model="fixture-config", sequence_length=length)
+    cfg = SimpleNamespace(
+        fp8=False,
+        native_vision=False,
+        native_video=False,
+        native_audio=False,
+        native_multimodal=False,
+        model="fixture-config",
+        sequence_length=length,
+    )
     with pytest.raises(ModelConstructionReached):
         setup_model(cfg, SimpleNamespace())
     assert calls == [(length, 0)]
@@ -72,7 +83,15 @@ def test_model_entry_accepts_unsharded_and_valid_sharded_lengths(cp_size, length
 )
 def test_model_entry_rejects_uneven_multi_rank_cp_before_allocation(cp_size, length):
     setup_model, calls = setup_entry(cp_size)
-    cfg = SimpleNamespace(fp8=False, model="fixture-config", sequence_length=length)
+    cfg = SimpleNamespace(
+        fp8=False,
+        native_vision=False,
+        native_video=False,
+        native_audio=False,
+        native_multimodal=False,
+        model="fixture-config",
+        sequence_length=length,
+    )
     with pytest.raises(ValueError, match="must be divisible"):
         setup_model(cfg, SimpleNamespace())
     assert calls == []

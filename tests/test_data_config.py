@@ -39,7 +39,9 @@ def task_config(**overrides):
         SlottedDefault=SlottedDefault,
         DataCfg=DataCfg,
         DistributedCfg=SimpleNamespace,
-        TrainingCfg=SimpleNamespace,
+        TrainingCfg=lambda: SimpleNamespace(
+            native_vision=False, native_video=False, native_audio=False, native_multimodal=False
+        ),
         LoggingCfg=SimpleNamespace,
         DensePretrainData=DensePretrainData,
         OmniPretrainData=OmniPretrainData,
@@ -140,11 +142,13 @@ def test_task_routes_storage_format_with_identical_text_batches(text_bundle, mon
     monkeypatch.setattr(OmniPretrainData, "validate_model", lambda self, *args: checks.append(args))
     task = task_config(
         AutoConfig=SimpleNamespace(from_pretrained=lambda path: path),
-        model_class_for_config=lambda cfg: "Model",
+        model_class_for_config=lambda cfg, **flags: "Model",
         distributed=SimpleNamespace(**ranks),
     )
     cfg = task.PretrainLMCfg()
     cfg.training = training
+    cfg.training.native_vision = cfg.training.native_video = False
+    cfg.training.native_audio = cfg.training.native_multimodal = False
     cfg.training.model = "model-config"
     cfg.data.dataset = root / "tokens/train"
     dense = task.setup_dataset(cfg)
@@ -202,10 +206,12 @@ def test_existing_examples_use_shared_text_config(monkeypatch, model):
 
 
 @pytest.mark.parametrize(
-    "arguments,format,kinds",
+    "script,arguments,format,kinds",
     [
-        ([], "prepared_bundle", ("text",)),
+        ("qwen3-omni-thinker-text", [], "token_bin", ("text",)),
+        ("qwen3-omni", [], "prepared_bundle", ("text",)),
         (
+            "qwen3-omni",
             [
                 "--modalities",
                 "text",
@@ -218,14 +224,14 @@ def test_existing_examples_use_shared_text_config(monkeypatch, model):
             "prepared_bundle",
             ("text", "image"),
         ),
-        (["--data-format", "token_bin"], "token_bin", ("text",)),
+        ("qwen3-omni", ["--data-format", "token_bin"], "token_bin", ("text",)),
     ],
 )
 def test_qwen_omni_example_cli_builds_one_data_config(
-    monkeypatch, tmp_path, arguments, format, kinds
+    monkeypatch, tmp_path, script, arguments, format, kinds
 ):
     calls = example_modules(monkeypatch)
-    path = ROOT / "examples/pretrain_lm/qwen3-omni/script.py"
+    path = ROOT / f"examples/pretrain_lm/{script}/script.py"
     monkeypatch.setattr(
         sys,
         "argv",
@@ -235,7 +241,7 @@ def test_qwen_omni_example_cli_builds_one_data_config(
             str(tmp_path),
             "--model",
             "model-config",
-            "--checkpoint",
+            "--checkpoints" if script == "qwen3-omni-thinker-text" else "--checkpoint",
             str(tmp_path / "ckpt"),
             *arguments,
         ],
@@ -245,4 +251,5 @@ def test_qwen_omni_example_cli_builds_one_data_config(
     cfg = calls[0]
     assert cfg.data.dataset == tmp_path and cfg.data.format == format
     assert cfg.data.modalities == kinds
+    assert not hasattr(cfg, "__dict__") and not hasattr(cfg, "dataset")
     cfg.data.validate()

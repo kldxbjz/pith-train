@@ -14,7 +14,11 @@ _CUBLAS_CONFIGS = {":4096:8", ":16:8"}
 
 
 def configure_deterministic_training(enabled: bool) -> None:
-    """Set deterministic policy before model construction; ordinary runs are unchanged.
+    """Initialize once before model construction, including standalone speech/generation.
+
+    Models capture the token-layout choice at construction. This is not
+    a per-forward switch. False resets the two PithTrain runtime defaults without
+    changing the caller's existing PyTorch/cuDNN policy.
 
     For CUDA, launch Python/torchrun with CUBLAS_WORKSPACE_CONFIG=:4096:8
     (or :16:8) before CUDA/cuBLAS initialization. Do not attempt to repair that
@@ -22,6 +26,7 @@ def configure_deterministic_training(enabled: bool) -> None:
     Unsupported deterministic operations fail rather than silently falling back.
     """
     if not enabled:
+        training.deterministic_attention = training.deterministic_token_layout = False
         return
     if (
         torch.cuda.is_available()
@@ -35,6 +40,7 @@ def configure_deterministic_training(enabled: bool) -> None:
     torch.use_deterministic_algorithms(True, warn_only=False)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
+    training.deterministic_attention = training.deterministic_token_layout = True
 
 
 def runtime_determinism_snapshot() -> dict:

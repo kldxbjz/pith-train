@@ -18,11 +18,13 @@ from pithtrain.config import SlottedDefault
 from pithtrain.contexts import distributed, logging, training
 from pithtrain.modules.checkpoint import (
     find_checkpoint,
+    initialize_checkpoint,
     load_checkpoint,
     save_checkpoint,
 )
 from pithtrain.modules.data_config import DataCfg
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
+from pithtrain.modules.distributed_checkpoint import resume_contract
 from pithtrain.modules.load_balance import MoELoadBalanceLossTracker
 from pithtrain.modules.logging import LoggingCfg, activate_wandb, setup_logging
 from pithtrain.modules.optimizer import clip_grad_norm
@@ -62,6 +64,16 @@ class PretrainLMCfg(SlottedDefault):
     data: DataCfg = field(default_factory=DataCfg)
     """Dataset location, storage format, modalities and sampling configuration."""
 
+    initialize_from: Path | None = None
+    """Canonical DCP root for model-only initialization of a new training run.
+
+    Independent of strict_resume: optimizer, scheduler, RNG and data start fresh.
+    Omit this when resuming an existing save_location; specifying both is an error.
+    """
+
+    initialize_step: int = 0
+    """Checkpoint identifier under initialize_from; the new training step is still zero."""
+
 
 def setup_dataset(cfg: PretrainLMCfg) -> PretrainData:
     """Choose a data source once; the training loop uses the same interface for each."""
@@ -83,7 +95,16 @@ def setup_dataset(cfg: PretrainLMCfg) -> PretrainData:
         pp_group=distributed.pp_group,
     )
     config = AutoConfig.from_pretrained(cfg.training.model)
-    data.validate_model(model_class_for_config(config), config)
+    data.validate_model(
+        model_class_for_config(
+            config,
+            native_vision=cfg.training.native_vision,
+            native_video=cfg.training.native_video,
+            native_audio=cfg.training.native_audio,
+            native_multimodal=cfg.training.native_multimodal,
+        ),
+        config,
+    )
     return data
 
 
@@ -270,6 +291,11 @@ def train_step(cfg: PretrainLMCfg, dataset: PretrainData, step: int) -> None:
                 cfg.training.save_location,
                 completed,
                 data_state=dataset.checkpoint_state,
+                **(
+                    {"strict": True, "resume_config": resume_contract(cfg)}
+                    if getattr(cfg.training, "strict_resume", False)
+                    else {}
+                ),
             )
 
     # Run deferred GC here so cyclic collection never fires mid-forward/backward.
@@ -281,19 +307,34 @@ def launch(cfg: PretrainLMCfg) -> None:
     """
     Launch the pretraining of a language model.
     """
+    initialize_from = getattr(cfg, "initialize_from", None)
+    initialize_step = getattr(cfg, "initialize_step", 0)
+    if type(initialize_step) is not int or initialize_step < 0:
+        raise ValueError("initialize_step must be a nonnegative integer")
+    if initialize_from is None and initialize_step != 0:
+        raise ValueError("initialize_step requires initialize_from")
+    step = find_checkpoint(cfg.training.save_location)
+    if initialize_from is not None and step is not None:
+        raise ValueError("Model initialization requires a new output run; omit it to resume")
     setup_logging(cfg)
     setup_distributed(cfg)
     dataset = setup_dataset(cfg)
     setup_training(cfg)
     logger = logging.stdout
     logger.info("launch(cfg=%s)" % cfg)
-    step = find_checkpoint(cfg.training.save_location)
     if step is not None:
         load_checkpoint(
             cfg.training.save_location,
             step,
             data_state=dataset.checkpoint_state,
+            **(
+                {"strict": True, "resume_config": resume_contract(cfg)}
+                if getattr(cfg.training, "strict_resume", False)
+                else {}
+            ),
         )
+    elif initialize_from is not None:
+        initialize_checkpoint(initialize_from, initialize_step)
     step = step or 0
     gc.disable()
     while step < cfg.training.max_steps:

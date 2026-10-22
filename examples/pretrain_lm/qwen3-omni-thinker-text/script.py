@@ -25,7 +25,7 @@ def main():
     parser.add_argument("--checkpoints", type=Path)
     args = parser.parse_args()
     cfg = PretrainLMCfg()
-    cfg.dataset = args.dataset
+    cfg.data.dataset = args.dataset
     cfg.distributed.pipeline_parallel_size = args.pp
     cfg.distributed.expert_parallel_size = args.ep
     cfg.distributed.context_parallel_size = args.cp
