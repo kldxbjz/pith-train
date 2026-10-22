@@ -111,8 +111,9 @@ def objective(
     (labels,) = objective_inputs
     logits = logits.view(-1, logits.size(-1))
     labels = labels.view(-1)
-    n_tokens = (labels != -100).sum().clamp_min(1)
-    loss = cross_entropy(logits, labels, ignore_index=-100) * n_tokens
+    # Compute the sum before storing BF16 logit gradients. Multiplying a
+    # previously rounded BF16 mean by the token count loses information.
+    loss = cross_entropy(logits, labels, ignore_index=-100, reduction="sum")
     return loss, loss.detach()
 
 

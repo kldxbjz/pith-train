@@ -22,6 +22,11 @@ from pithtrain.contexts import distributed, training
 from pithtrain.models.deepseek_v2 import DeepSeekV2Model, DeepSeekV2MoEGate
 from pithtrain.models.gpt_oss import GptOssExperts, GptOssModel, GptOssTopKRouter
 from pithtrain.models.qwen3_moe import Qwen3MoeGate, Qwen3MoeModel
+from pithtrain.models.qwen3_omni_moe import (
+    Qwen3OmniMoeThinkerTextExperts,
+    Qwen3OmniMoeThinkerTextModel,
+    Qwen3OmniMoeThinkerTextTopKRouter,
+)
 from pithtrain.models.qwen35_moe import Qwen35MoeModel, Qwen35MoeTopKRouter
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.operators.cp_sequence import zigzag_varlen_index
@@ -38,12 +43,19 @@ def fill_weights(module: nn.Module):
             nn.init.zeros_(module.bias)
     elif isinstance(module, GroupedLinear):
         nn.init.xavier_uniform_(module.weight, gain=1.0)
-    elif isinstance(module, GptOssExperts):
+    elif isinstance(module, (GptOssExperts, Qwen3OmniMoeThinkerTextExperts)):
         # Raw nn.Parameter - the GroupedLinear branch above doesn't reach them.
         nn.init.xavier_uniform_(module.gate_up_proj, gain=1.0)
         nn.init.xavier_uniform_(module.down_proj, gain=1.0)
     elif isinstance(
-        module, (DeepSeekV2MoEGate, Qwen3MoeGate, GptOssTopKRouter, Qwen35MoeTopKRouter)
+        module,
+        (
+            DeepSeekV2MoEGate,
+            Qwen3MoeGate,
+            GptOssTopKRouter,
+            Qwen35MoeTopKRouter,
+            Qwen3OmniMoeThinkerTextTopKRouter,
+        ),
     ):
         nn.init.xavier_uniform_(module.weight, gain=1.0)
         if getattr(module, "bias", None) is not None:
@@ -256,6 +268,9 @@ def main(model_name: str):
     elif config.model_type == "qwen3_moe":
         ModelClass = Qwen3MoeModel
         config.num_hidden_layers = min(config.num_hidden_layers, 8)
+    elif config.model_type == "qwen3_omni_moe_text":
+        ModelClass = Qwen3OmniMoeThinkerTextModel
+        config.num_hidden_layers = min(config.num_hidden_layers, 8)
     elif config.model_type == "gpt_oss":
         ModelClass = GptOssModel
         keep = min(config.num_hidden_layers, 8)
@@ -450,7 +465,10 @@ def main(model_name: str):
 
     for (n, p), p_ref in zip(local_modules.named_parameters(), local_full_modules.parameters()):
         assert p_ref.grad is not None, f"Reference parameter {n} has no gradient"
-        assert p.grad is not None, f"rank-{distributed.rank}: pipeline lost gradient for {n}"
+        if p.grad is None:
+            print("[ERROR] rank-%d, Parameter %s has no gradient." % (distributed.rank, n))
+            failed = True
+            continue
         # Both parameter classes reduce with a plain sum over their own replica group, and either
         # sum spans every global chunk exactly once: the attn group is the whole dp x cp stage,
         # and the expt replica group covers all the data too, since every member receives the
@@ -526,6 +544,13 @@ def _entry() -> None:
     models.append("examples/pretrain_lm/gpt-oss-20b/config.json")
     models.append("examples/pretrain_lm/gpt-oss-120b/config.json")
     models.append("examples/pretrain_lm/qwen3.5-35b-a3b/config.json")
+
+    models.extend(
+        [
+            "tests/configs/qwen3_omni_text/tiny.json",
+            "examples/pretrain_lm/qwen3-omni-thinker-text/config.json",
+        ]
+    )
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--pp-size", type=int, required=True)
