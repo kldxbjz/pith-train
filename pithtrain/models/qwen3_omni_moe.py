@@ -124,11 +124,31 @@ class Qwen3OmniMoeThinkerTextTopKRouter(nn.Module):
         return indices, weights, lb_loss
 
 
+def _combine_expert_order(moe_outs, topk_weight, moe_local_idxs, output_dtype):
+    """Combine slots already ordered by increasing expert ID, matching HF eager.
+
+    The unique EP return indices restore token/slot order without a floating
+    scatter reduction. Round the weighted product before each serial addition;
+    a single sum over K (even sorted) has different BF16 arithmetic. Expert
+    GEMMs and dispatch remain grouped. Compiled callers preserve precision casts.
+    """
+    if moe_local_idxs is not None:
+        slots = moe_outs.new_zeros(topk_weight.numel(), moe_outs.shape[-1])
+        moe_outs = slots.index_copy(0, moe_local_idxs, moe_outs)
+    outputs = moe_outs.view(*topk_weight.shape, -1)
+    result = torch.zeros_like(outputs[:, 0], dtype=output_dtype)
+    for slot in range(topk_weight.shape[1]):
+        product = outputs[:, slot] * topk_weight[:, slot, None]
+        result = result + product.to(output_dtype)
+    return result
+
+
 class Qwen3OmniMoeThinkerTextSparseMoeBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.num_experts = config.num_experts
         self.num_experts_per_tok = config.num_experts_per_tok
+        self.deterministic_token_layout = training.deterministic_token_layout
         if config.num_experts % distributed.ep_size:
             raise ValueError("num_experts must be divisible by expert_parallel_size")
         self.experts_per_rank = config.num_experts // distributed.ep_size
@@ -141,12 +161,17 @@ class Qwen3OmniMoeThinkerTextSparseMoeBlock(nn.Module):
         indices, weights, lb_loss = self.gate(hidden_states, replay_idx)
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
+        if self.deterministic_token_layout:
+            indices, order = indices.sort(dim=-1)
+            weights = weights.gather(-1, order)
         flat = hidden_states.reshape(-1, shape[-1])
         repeated = flat[:, None].expand(-1, self.num_experts_per_tok, -1).reshape(-1, shape[-1])
         tokens, reverse, offs, ks, sizes = scatter_for_grouped_gemm(
             repeated, indices.reshape(-1), self.experts_per_rank, deterministic=True
         )
         outputs = padded_index_gather(self.experts(tokens, offs, ks, sizes), reverse)
+        if self.deterministic_token_layout:
+            return _combine_expert_order(outputs, weights, None, hidden_states.dtype).view(shape)
         weighted = outputs.view(*indices.shape, -1) * weights.unsqueeze(-1)
         return weighted.sum(1).view(shape)
 
@@ -266,6 +291,9 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
             return hidden_states, residual, None
         if lb_loss is not None:
             MoELoadBalanceLossTracker.add(lb_loss)
+        if self.mlp.deterministic_token_layout:
+            indices, order = indices.sort(dim=-1)
+            weights = weights.gather(-1, order)
         tokens, routing = prepare_dispatch(
             hidden_states,
             indices,
@@ -274,7 +302,7 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
             distributed.ep_size,
             self.mlp.experts_per_rank,
             distributed.ep_group,
-            deterministic=True,
+            deterministic=self.mlp.deterministic_token_layout,
         )
         return tokens, residual, routing
 
@@ -284,13 +312,24 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
         if distributed.ep_size > 1:
             gathered_tokens = padded_index_gather(gathered_tokens, expand_idx)
         tokens, reverse, offs, ks, sizes = scatter_for_grouped_gemm(
-            gathered_tokens, expert_idxs, self.mlp.experts_per_rank, deterministic=True
+            gathered_tokens,
+            expert_idxs,
+            self.mlp.experts_per_rank,
+            deterministic=self.mlp.deterministic_token_layout,
         )
         return padded_index_gather(self.mlp.experts(tokens, offs, ks, sizes), reverse)
 
     def _forward_stage5(self, moe_outs, moe_local_idxs, topk_weight, residual):
         if not self.is_moe:
             return residual + moe_outs
+        if self.mlp.deterministic_token_layout:
+            combined = _combine_expert_order(
+                moe_outs,
+                topk_weight,
+                moe_local_idxs if distributed.ep_size > 1 else None,
+                residual.dtype,
+            )
+            return residual + combined.view_as(residual)
         if distributed.ep_size == 1:
             weighted = moe_outs.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)
             return residual + weighted.sum(1).view_as(residual)

@@ -233,6 +233,7 @@ _NUMERICAL_ATTRIBUTES = (
     "top_k",
     "num_experts_per_tok",
     "norm_topk_prob",
+    "deterministic_token_layout",
     "num_experts",
     "num_code_groups",
     "num_quantizers",

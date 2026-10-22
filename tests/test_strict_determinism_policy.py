@@ -19,12 +19,14 @@ ROOT = Path(__file__).parents[1]
 
 @pytest.fixture(autouse=True)
 def restore_policy():
+    runtime = training.deterministic_attention, training.deterministic_token_layout
     algorithms = torch.are_deterministic_algorithms_enabled()
     warn = torch.is_deterministic_algorithms_warn_only_enabled()
     benchmark, cudnn = torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic
     try:
         yield
     finally:
+        training.deterministic_attention, training.deterministic_token_layout = runtime
         torch.use_deterministic_algorithms(algorithms, warn_only=warn)
         torch.backends.cudnn.benchmark = benchmark
         torch.backends.cudnn.deterministic = cudnn
@@ -43,6 +45,8 @@ def test_ordinary_setup_preserves_caller_policy(monkeypatch, enabled, warn, benc
     torch.backends.cudnn.benchmark = benchmark
     torch.backends.cudnn.deterministic = cudnn
     monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", "caller-owned-incompatible")
+    monkeypatch.setattr(training, "deterministic_attention", False)
+    monkeypatch.setattr(training, "deterministic_token_layout", False)
     before = runtime_determinism_snapshot()
     monkeypatch.setattr(
         torch.cuda, "is_available", lambda: pytest.fail("Ordinary path probed CUDA")
@@ -76,6 +80,8 @@ def test_strict_policy_enables_errors_and_deterministic_convolutions(
     )
     configure_deterministic_training(True)
     actual = runtime_determinism_snapshot()
+    assert training.deterministic_attention is True
+    assert training.deterministic_token_layout is True
     assert actual["deterministic_algorithms"] is True
     assert actual["deterministic_warn_only"] is False
     assert actual["cudnn_benchmark"] is False
@@ -133,7 +139,11 @@ def test_setup_training_applies_policy_before_constructing_model(
         cfg.training.strict_resume = strict
     if deterministic is not None:
         cfg.training.deterministic = deterministic
-    runtime, seen = SimpleNamespace(deterministic_attention=None), []
+    runtime, seen = training, []
+    monkeypatch.setattr(training, "deterministic_attention", None)
+    monkeypatch.setattr(training, "deterministic_token_layout", None)
+    monkeypatch.setattr(training, "optimizers", None, raising=False)
+    monkeypatch.setattr(training, "schedulers", None, raising=False)
     noop_seed = SimpleNamespace(seed=lambda _: None)
     namespace = dict(
         TrainingCfg=SimpleNamespace,
@@ -150,13 +160,14 @@ def test_setup_training_applies_policy_before_constructing_model(
                 torch.backends.cudnn.benchmark,
                 torch.backends.cudnn.deterministic,
                 runtime.deterministic_attention,
+                runtime.deterministic_token_layout,
             )
         ),
     )
     exec(compile(ast.Module(body=[node], type_ignores=[]), "<setup_training>", "exec"), namespace)
     namespace["setup_training"](cfg)
     enabled = bool(strict or deterministic)
-    assert seen == [(enabled, not enabled, enabled, enabled)]
+    assert seen == [(enabled, not enabled, enabled, enabled, enabled)]
 
 
 def test_rank_snapshot_is_whitelisted_read_only_and_json_serializable(monkeypatch):
@@ -192,3 +203,50 @@ def test_deterministic_config_is_independent_and_opt_in():
         if isinstance(item, ast.AnnAssign) and item.target.id == "deterministic"
     )
     assert isinstance(field.value, ast.Constant) and field.value.value is False
+
+
+def test_public_initializer_freezes_model_mode_and_semantic_identity(monkeypatch):
+    from pithtrain.modules.resume_semantics import model_contract
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    path = ROOT / "pithtrain/models/qwen3_omni_moe.py"
+    names = {
+        "Qwen3OmniMoeThinkerTextExperts",
+        "Qwen3OmniMoeThinkerTextTopKRouter",
+        "Qwen3OmniMoeThinkerTextSparseMoeBlock",
+    }
+    nodes = [
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.ClassDef) and n.name in names
+    ]
+    namespace = dict(
+        __name__=__name__,
+        torch=torch,
+        nn=torch.nn,
+        training=training,
+        distributed=SimpleNamespace(ep_size=1),
+    )
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
+    block = namespace["Qwen3OmniMoeThinkerTextSparseMoeBlock"]
+    cfg = SimpleNamespace(
+        num_experts=4,
+        num_experts_per_tok=2,
+        hidden_size=8,
+        moe_intermediate_size=8,
+        norm_topk_prob=True,
+    )
+    configure_deterministic_training(False)
+    fast = block(cfg)
+    configure_deterministic_training(True)
+    compatible = block(cfg)
+    assert fast.deterministic_token_layout is False
+    assert compatible.deterministic_token_layout is True
+    left, right = model_contract(fast), model_contract(compatible)
+    assert left != right
+    assert (
+        left["identity"]["modules"][""]["numerical_attributes"]["deterministic_token_layout"]
+        is False
+    )
+    configure_deterministic_training(False)
+    assert model_contract(compatible) == right  # No global flip changes an existing model.

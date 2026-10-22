@@ -16,6 +16,7 @@ from pithtrain.models.qwen3_omni_moe import (
     Qwen3OmniMoeThinkerTextRMSNorm,
     Qwen3OmniMoeThinkerTextRotaryEmbedding,
     Qwen3OmniMoeThinkerTextSparseMoeBlock,
+    _combine_expert_order,
 )
 from pithtrain.operators.linear import BF16Linear
 from pithtrain.pipeline.dualpipev import layer_partition
@@ -78,7 +79,14 @@ class Qwen3OmniMoeTalkerPipelineDecoderLayer(Qwen3OmniMoeThinkerTextDecoderLayer
     @torch.compile(fullgraph=True, options={"emulate_precision_casts": True})
     def forward_stage5(self, moe_outs, moe_local_idxs, topk_weight, residual):
         residual, shared = residual.chunk(2, dim=-1)
-        if distributed.ep_size == 1:
+        if self.mlp.deterministic_token_layout:
+            routed = _combine_expert_order(
+                moe_outs,
+                topk_weight,
+                moe_local_idxs if distributed.ep_size > 1 else None,
+                residual.dtype,
+            ).view_as(residual)
+        elif distributed.ep_size == 1:
             weighted = moe_outs.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)
             routed = weighted.sum(1).view_as(residual)
         else:

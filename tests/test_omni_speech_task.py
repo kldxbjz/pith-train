@@ -1633,3 +1633,20 @@ def test_real_fsdp_waveform_microbatch_fp32_accumulation(tmp_path):
         nprocs=2,
         join=True,
     )
+
+
+def test_checkpoint_combine_mode_change_rejected_before_any_state_apply(tmp_path):
+    from pithtrain.tasks.omni_speech import save_checkpoint
+
+    producer = native_codec_checkpoint_parts()
+    resumed = native_codec_checkpoint_parts()
+    # model_contract binds the actual module attribute, not a caller config shell.
+    producer[0].thinker.deterministic_token_layout = False
+    resumed[0].thinker.deterministic_token_layout = True
+    target = tmp_path / "combine-mode.pt"
+    save_checkpoint(target, **checkpoint_call_options(producer))
+    before = checkpoint_complete_snapshot(resumed)
+    with pytest.raises(ValueError, match="preflight") as rejected:
+        load_checkpoint(target, **checkpoint_call_options(resumed))
+    assert "contract mismatch" in str(rejected.value.__cause__)
+    assert_tree(checkpoint_complete_snapshot(resumed), before)

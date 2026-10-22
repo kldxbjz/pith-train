@@ -32,6 +32,15 @@ PyTorch global deterministic-algorithm switch does not reach its CuTe kernels.
 It does not guarantee whole-model bitwise reproducibility on its own.
 """
 
+deterministic_token_layout: bool = False
+"""
+Opt into stable Omni dispatch and HF expert-order accumulation.
+
+Ordinary production retains fused dispatch and fast sum/scatter. Initialize
+once before constructing models via configure_deterministic_training; each MoE
+captures this policy as a checkpoint-bound numerical attribute.
+"""
+
 fp8: bool
 """
 Whether layers are built for FP8 compute, False for BF16.
