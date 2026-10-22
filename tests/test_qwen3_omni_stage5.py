@@ -126,13 +126,15 @@ def test_expert_order_matches_actual_hf_output_and_all_gradients(
         outputs = ordered_outputs.flatten(0, 1)
         if returned_indices is not None:
             outputs = outputs[returned_indices]
-        calls = [layer.forward_stage5]
+
+        # Preserve the original oracle/control matrix: eager for each dtype;
+        # compiled for the BF16 top-8 production geometry. Do not double-compile.
+        def eager(*args):
+            return type(layer).forward_stage5.__wrapped__(layer, *args)
+
+        calls = [eager]
         if top_k == 8 and dtype == torch.bfloat16:
-            calls.append(
-                torch.compile(
-                    layer.forward_stage5, fullgraph=True, options={"emulate_precision_casts": True}
-                )
-            )
+            calls.append(layer.forward_stage5)
         for call_index, call in enumerate(calls):
             actual = call(outputs, returned_indices, ordered_weights, torch.zeros_like(expected))
             assert torch.equal(actual, expected)

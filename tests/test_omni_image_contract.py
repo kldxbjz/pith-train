@@ -185,7 +185,7 @@ def constructor_namespace():
         partial=partial,
         math=math,
         distributed=SimpleNamespace(pp_size=2, pp_rank=0, ep_size=1, cp_size=1),
-        training=SimpleNamespace(fp8=False),
+        training=SimpleNamespace(fp8=False, deterministic_token_layout=False),
         Qwen3OmniMoeVisionEncoder=Qwen3OmniMoeVisionEncoder,
     )
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)

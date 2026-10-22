@@ -82,7 +82,7 @@ def test_image_stage5_preserves_fullgraph_output_and_all_gradients(is_moe, ep):
     expected = torch.cat((expected + residual[..., 16:24], residual[..., 8:]), dim=-1)
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=2e-6)
     values = (residual, output, weights) if is_moe else (residual, output)
-    actual_grads = torch.autograd.grad(actual.square().sum(), values, retain_graph=True)
+    actual_grads = torch.autograd.grad(actual.square().sum(), values)
     expected_grads = torch.autograd.grad(expected.square().sum(), values)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
         torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=2e-6)
