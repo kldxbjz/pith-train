@@ -312,3 +312,14 @@ def test_legacy_released_vision_position_count_uses_hf_default():
     raw["vision_config"]["num_position_embeddings"] = 0
     with pytest.raises(ConversionError, match="num_position_embeddings"):
         thinker_config(raw)
+
+
+def test_released_text_config_preserves_raw_rope_dictionary():
+    from pithtrain.tasks.convert_checkpoint.qwen3_omni_moe import text_config
+
+    path = Path(__file__).parent / "configs/qwen3_omni_thinker/released-config.json"
+    raw = json.loads(path.read_text())
+    original = copy.deepcopy(raw)
+    parsed = text_config(raw)
+    assert raw == original
+    assert parsed.to_dict() == text_config(copy.deepcopy(original)).to_dict()
