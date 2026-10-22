@@ -128,7 +128,9 @@ def test_setup_training_sets_policy_before_model_construction(setup_training, st
     runtime = SimpleNamespace(deterministic_attention=not strict)
     observed = []
     cfg, setup = setup_training(
-        runtime, lambda *_: observed.append(runtime.deterministic_attention), lambda _: None
+        runtime,
+        lambda *_: observed.append(runtime.deterministic_attention),
+        lambda enabled: setattr(runtime, "deterministic_attention", enabled),
     )
     if strict is not None:
         cfg.training.strict_resume = strict
