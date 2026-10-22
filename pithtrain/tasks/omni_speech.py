@@ -924,7 +924,19 @@ def _step(
     if plan is None and gradient_reduction == "mean":
         loss = loss * world
     optimizer.zero_grad(set_to_none=True)
-    loss.backward()
+    if plan is None:
+        loss.backward()
+    else:
+        # A single backward accumulates repeated BF16 compute leaves in BF16.
+        # Separate backwards reduce each contribution into the existing FP32
+        # sharded gradients, with the same global-target normalization.
+        for index, item in enumerate(codec):
+            micro_loss = normalized_loss(item.loss_sum, counts, weighting=cfg.codec_weighting)
+            if texts:
+                micro_loss = micro_loss + cfg.text_weight * normalized_loss(
+                    texts[index].loss_sum, text_count, weighting="combined"
+                )
+            micro_loss.backward()
     reject_nonfinite_gradients(base, device=device, group=token_group)
     if plan is None and dist.is_initialized() and not isinstance(model, DistributedDataParallel):
         for parameter in base.parameters():
