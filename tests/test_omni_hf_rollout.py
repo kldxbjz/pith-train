@@ -683,3 +683,47 @@ def test_real_load_only_public_snapshot_sync_generate_reward_and_cleanup(tmp_pat
         rollout.close()
     assert worker is not None and worker.process is None and worker.connection is None
     assert not directory.exists()
+
+
+@pytest.mark.parametrize("reap_seconds", [12, 31])
+def test_worker_cleanup_reaps_or_fails_closed_with_one_shared_deadline(
+    tmp_path, monkeypatch, reap_seconds
+):
+    """Simulate delayed OS reaping; actual spawned-worker coverage is separate."""
+    import tempfile
+    from types import SimpleNamespace
+
+    from pithtrain.tasks import omni_hf_rollout as provider
+
+    clock, joins, closed = [0.0], [], []
+    monkeypatch.setattr(provider, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+    def join(timeout):
+        joins.append(timeout)
+        clock[0] += min(timeout, max(0, reap_seconds - clock[0]))
+
+    process = provider._WorkerProcess.__new__(provider._WorkerProcess)
+    process.directory = tempfile.TemporaryDirectory(dir=tmp_path)
+    process.connection = SimpleNamespace(close=lambda: closed.append("pipe"))
+    process.process = SimpleNamespace(
+        is_alive=lambda: clock[0] < reap_seconds,
+        terminate=lambda: None,
+        kill=lambda: None,
+        join=join,
+        close=lambda: closed.append("process"),
+    )
+    if reap_seconds > 30:
+        with pytest.raises(RuntimeError, match="cleanup unverified"):
+            process.close()
+        assert clock[0] == 30 and not closed and Path(process.directory.name).exists()
+        with pytest.raises(RuntimeError, match="cleanup unverified"):
+            process.close()
+        assert clock[0] == 30 and joins[-2:] == [0, 0]
+        assert not closed and process.process is not None
+        clock[0] = reap_seconds  # A later readback can confirm eventual termination.
+    process.close()
+    assert clock[0] == reap_seconds and closed == ["process", "pipe"]
+    assert process.process is None and process.connection is None
+    assert not Path(process.directory.name).exists()
+    process.close()
+    assert closed == ["process", "pipe"]

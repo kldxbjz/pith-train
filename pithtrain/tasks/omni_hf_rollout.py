@@ -843,12 +843,16 @@ class _WorkerProcess:
 
     def close(self):
         if self.process is not None:
+            # Reaping a large CUDA process can outlast the signal itself. Nested
+            # error handlers share this deadline instead of restarting the wait.
+            if not hasattr(self, "_close_deadline"):
+                self._close_deadline = time.monotonic() + 30
             if self.process.is_alive():
                 self.process.terminate()
-            self.process.join(timeout=2)
+            self.process.join(timeout=min(2, max(0, self._close_deadline - time.monotonic())))
             if self.process.is_alive():
                 self.process.kill()
-                self.process.join(timeout=2)
+                self.process.join(timeout=max(0, self._close_deadline - time.monotonic()))
             if self.process.is_alive():
                 raise RuntimeError("Owned HF process cleanup unverified")
             self.process.close()
