@@ -1,11 +1,11 @@
 """
-Test DualPipeV against a single-device reference.
-The loss and gradients are compared with the reference implementation.
+Compare DualPipeV loss, gradients and canonical weight export with a single-device reference.
 """
 
 import argparse
 import math
 import os
+from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Tuple
@@ -29,6 +29,7 @@ from pithtrain.models.qwen3_omni_moe import (
 )
 from pithtrain.models.qwen3_omni_talker_pipeline import Qwen3OmniMoeTalkerTextModel
 from pithtrain.models.qwen35_moe import Qwen35MoeModel, Qwen35MoeTopKRouter
+from pithtrain.modules.checkpoint import iter_canonical_parameters
 from pithtrain.modules.distributed import DistributedCfg, setup_distributed
 from pithtrain.operators.cp_sequence import zigzag_varlen_index
 from pithtrain.operators.grouped_linear import GroupedLinear
@@ -95,6 +96,14 @@ def objective(
     (target,) = objective_inputs
     loss = criterion(output, target)
     return loss, loss.detach()
+
+
+def records_empty(model: DualPipeV) -> bool:
+    records = []
+    for chunk in model.chunk_records[0] + model.chunk_records[1]:
+        records += [chunk.prolog, chunk.epilog]
+        records += [getattr(layer, f.name) for layer in chunk.layers for f in fields(layer)]
+    return all(getattr(r, f.name) is None for r in records if r is not None for f in fields(r))
 
 
 def reference_step(chunks, model: DeepSeekV2Model):
@@ -169,6 +178,20 @@ def shard_experts(model, ep_rank, ep_size):
             setattr(model, name, new_mod)
         else:
             shard_experts(child, ep_rank, ep_size)
+
+
+def canonical_state_dict(model: nn.Module, ep_rank: int) -> dict:
+    """
+    Expand this EP rank's expert stacks under global indices, independently of checkpoint.unpack.
+    """
+    result = {}
+    for name, value in model.state_dict().items():
+        if ".experts." not in name:
+            result[name] = value
+            continue
+        for idx, expert in enumerate(value, start=ep_rank * value.shape[0]):
+            result[name.replace(".experts.", ".experts.%d." % idx, 1)] = expert
+    return result
 
 
 def apply_fsdp(model, dtype):
@@ -425,6 +448,12 @@ def main(model_name: str):
             return zigzag_shard(x, cp_rank, cp_size)
         return x[:, zigzag_varlen_index(cp_rank, cp_size, cu, x.shape[1])]
 
+    def collect(model_outputs, objective_inputs):
+        # Check before step cleanup can hide retained activations.
+        assert records_empty(dualpipev_model), "a forward-only step kept activations mid-step"
+        (output,), (target,) = model_outputs, objective_inputs
+        return None, criterion(output, target)
+
     # Run the DualPipeV step.
     for step_index, chunks in enumerate(chunk_steps):
         # Every pipeline rank builds the same micro-batches, so each derives its own P2P
@@ -444,7 +473,12 @@ def main(model_name: str):
             print("[INFO] Running DualPipeV step %d." % step_index, flush=True)
         torch.distributed.barrier()
 
+        # Training must safely reuse the forward-only step's records.
+        with torch.no_grad():
+            collected_outputs = dualpipev_model.step(microbatches, collect)
+        assert records_empty(dualpipev_model), "a forward-only step kept activations"
         objective_outputs = dualpipev_model.step(microbatches, objective)
+        assert records_empty(dualpipev_model), "a training step kept activations"
 
         if distributed.rank == 0:
             print("[INFO] Completed DualPipeV step %d." % step_index, flush=True)
@@ -453,6 +487,7 @@ def main(model_name: str):
         # Validate the loss.
         if pp_rank == 0:
             loss = torch.stack(objective_outputs)
+            torch.testing.assert_close(torch.stack(collected_outputs), loss, rtol=0, atol=5e-3)
             if cp_size > 1:
                 # Every rank takes the mean over its own S/cp tokens, so the mean over the
                 # whole sequence is the average of those.
@@ -466,7 +501,7 @@ def main(model_name: str):
             )
             assert torch.allclose(loss, loss_ref, rtol=1e-3, atol=1e-3)
         else:
-            assert objective_outputs == []
+            assert collected_outputs == objective_outputs == []
 
         if distributed.rank == 0:
             print("[INFO] Loss matches the reference at step %d." % step_index, flush=True)
@@ -551,6 +586,26 @@ def main(model_name: str):
     if distributed.rank == 0:
         print("[INFO] All gradients match the reference.", flush=True)
     torch.distributed.barrier()
+
+    # Export before and after changing the weights to reject caches retained across syncs.
+    training.model = dualpipev_model
+    for updated in (False, True):
+        if updated:
+            with torch.no_grad():
+                for p in dualpipev_model.parameters():
+                    w = p.to_local()
+                    w.neg_().masked_fill_(w == 0, 1)
+        reference = canonical_state_dict(local_full_modules[0], ep_rank)
+        reference.update(canonical_state_dict(local_full_modules[1], ep_rank))
+        for name, tensor in iter_canonical_parameters():
+            w = reference.pop(name)
+            if updated:
+                w = w.neg().masked_fill_(w == 0, 1)
+            assert torch.equal(tensor.cpu(), w), (distributed.rank, name, updated)
+        assert not reference, (distributed.rank, sorted(reference)[:5])
+    torch.distributed.barrier()
+    if distributed.rank == 0:
+        print("[INFO] All canonical parameters match the reference.", flush=True)
 
 
 @record
