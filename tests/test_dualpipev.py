@@ -566,7 +566,8 @@ def main(model_name: str):
             w = reference.pop(name)
             if updated:
                 w = w.neg().masked_fill_(w == 0, 1)
-            assert torch.equal(tensor, w), (distributed.rank, name, updated)
+            # The reference is offloaded to CPU; the exporter retains the training device.
+            assert torch.equal(tensor.cpu(), w), (distributed.rank, name, updated)
         assert not reference, (distributed.rank, sorted(reference)[:5])
     torch.distributed.barrier()
     if distributed.rank == 0:
