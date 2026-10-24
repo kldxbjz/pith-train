@@ -427,7 +427,9 @@ class Qwen3OmniMoeTalkerResizeMLP(nn.Module):
         self.act_fn = ACT2FN[config.text_config.hidden_act]
 
     def forward(self, hidden_states):
-        return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_states)))
+        # Payload slices may be strided. Keep the biased linear on the same
+        # fused path as compact HF conditioning, without an extra BF16 round.
+        return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_states.contiguous())))
 
 
 class Qwen3OmniMoeTalkerForConditionalGeneration(nn.Module):

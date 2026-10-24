@@ -375,3 +375,39 @@ def test_talker_packed_position_reset_preserves_document_isolation():
     torch.testing.assert_close(
         derivative[:, :3], torch.zeros_like(derivative[:, :3]), rtol=0, atol=0
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_projection_strided_payload_matches_contiguous_hf(dtype):
+    # Pipeline speech features are slices of a [embedding, hidden, logits]
+    # payload. Test learned (nonzero) biases, not just initialization.
+    torch.manual_seed(841)
+    torch.set_num_threads(1)
+    cfg = tiny_config()
+    hf = initialized_hf(copy.deepcopy(cfg)).text_projection
+    native = Qwen3OmniMoeTalkerForConditionalGeneration(cfg).text_projection
+    with torch.no_grad():
+        for parameter in hf.parameters():
+            parameter.normal_(std=0.02)
+    native.load_state_dict(hf.state_dict())
+    payload = torch.randn(2, 13, 3 * cfg.thinker_hidden_size, dtype=dtype, requires_grad=True)
+    strided = payload[..., : cfg.thinker_hidden_size]
+    compact = strided.detach().contiguous().requires_grad_()
+    assert not strided.is_contiguous()
+    outputs = []
+    for model, inputs in ((native, strided), (hf, compact)):
+        parameters = {name: value.to(dtype) for name, value in model.named_parameters()}
+        outputs.append(torch.func.functional_call(model, parameters, (inputs,)))
+    torch.testing.assert_close(*outputs, rtol=0, atol=0)
+    cotangent = torch.randn_like(outputs[0])
+    for output in outputs:
+        output.backward(cotangent)
+    torch.testing.assert_close(
+        payload.grad[..., : cfg.thinker_hidden_size], compact.grad, rtol=0, atol=0
+    )
+    assert torch.count_nonzero(payload.grad[..., cfg.thinker_hidden_size :]) == 0
+    for (name, parameter), (ref_name, reference) in zip(
+        native.named_parameters(), hf.named_parameters()
+    ):
+        assert name == ref_name and parameter.grad is not None
+        torch.testing.assert_close(parameter.grad, reference.grad, rtol=0, atol=0, msg=name)
