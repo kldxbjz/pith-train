@@ -494,7 +494,9 @@ class Qwen3OmniMoeTalkerCodePredictorModelForConditionalGeneration(nn.Module):
         sequence = torch.stack([hidden_states, first_code_embeddings, *embedded[:-1]], dim=2)
         batch, time, length, width = sequence.shape
         flat = sequence.reshape(batch * time, length, width)
-        if torch.is_grad_enabled():
+        # Preserve the existing FP32 activation graph, including autocast.
+        # Separate head derivatives only when activations themselves are BF16.
+        if torch.is_grad_enabled() and flat.dtype == torch.bfloat16:
             final = self.model._forward_per_head(flat, groups)
             logits = torch.stack(
                 [head(final[i, :, i + 1]) for i, head in enumerate(self.lm_head)], dim=1
