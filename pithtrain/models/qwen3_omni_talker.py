@@ -31,6 +31,73 @@ class TeacherForcedCodeOutput(NamedTuple):
     codec_embeddings: torch.Tensor
 
 
+def _sum_head_gradients(gradients):
+    result = gradients[-1].clone()
+    for index in range(len(gradients) - 2, -1, -1):
+        result = result + gradients[index]
+    return result
+
+
+class _HeadInputs(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, hidden_states, heads):
+        return hidden_states.unsqueeze(0).expand(heads, *hidden_states.shape)
+
+    @staticmethod
+    def backward(ctx, gradients):
+        return _sum_head_gradients(gradients), None
+
+
+def _headwise_backward(module, forward, hidden_states, *arguments):
+    """One forward per FSDP unit, independent first-order codec-head VJPs.
+
+    The leading axis carries derivatives, not repeated forward computation.
+    Keep BF16 rounding at each head's derivative before the shared parameter
+    sum, as in the independent causal-prefix graph. Parameters remain owned by
+    their existing FSDP units and keep their ordinary checkpoint names.
+    """
+    names, parameters = zip(*module.named_parameters())
+
+    class ForwardMethod(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.inner = module
+
+        def forward(self, value):
+            return forward(value, *arguments)
+
+    proxy = ForwardMethod()
+
+    class HeadwiseVJP(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, value, *weights):
+            with torch.enable_grad():
+                leaf = value[0].detach().requires_grad_()
+                leaves = [p.detach().requires_grad_(p.requires_grad) for p in weights]
+                replacements = {"inner." + name: p for name, p in zip(names, leaves)}
+                output = torch.func.functional_call(
+                    proxy, (replacements, dict(proxy.named_buffers())), (leaf,), strict=True
+                )
+            ctx.leaf, ctx.weights, ctx.output = leaf, leaves, output
+            return output.unsqueeze(0).expand(value.shape[0], *output.shape)
+
+        @staticmethod
+        @torch.autograd.function.once_differentiable
+        def backward(ctx, gradients):
+            active = [p for p in ctx.weights if p.requires_grad]
+            derivatives = torch.autograd.grad(
+                ctx.output, (ctx.leaf, *active), gradients, is_grads_batched=True
+            )
+            iterator = iter(derivatives[1:])
+            parameter_grads = [
+                _sum_head_gradients(next(iterator)) if p.requires_grad else None
+                for p in ctx.weights
+            ]
+            return derivatives[0], *parameter_grads
+
+    return HeadwiseVJP.apply(hidden_states, *parameters)
+
+
 class Qwen3OmniMoeTalkerRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps):
         super().__init__()
@@ -42,6 +109,9 @@ class Qwen3OmniMoeTalkerRMSNorm(nn.Module):
         value = value.float()
         value = value * torch.rsqrt(value.square().mean(-1, keepdim=True) + self.variance_epsilon)
         return self.weight * value.to(dtype)
+
+    def _forward_per_head(self, hidden_states):
+        return _headwise_backward(self, self.forward, hidden_states)
 
 
 class Qwen3OmniMoeTalkerRotaryEmbedding(nn.Module):
@@ -276,6 +346,9 @@ class Qwen3OmniMoeTalkerDecoderLayer(nn.Module):
         )
         return hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
 
+    def _forward_per_head(self, hidden_states, position_embeddings):
+        return _headwise_backward(self, self.forward, hidden_states, position_embeddings)
+
 
 class Qwen3OmniMoeTalkerModel(nn.Module):
     def __init__(self, config, *, predictor=False):
@@ -347,6 +420,17 @@ class Qwen3OmniMoeTalkerModel(nn.Module):
             hidden_states = layer(hidden_states, position_embeddings, attention_mask)
         return self.norm(hidden_states)
 
+    def _forward_per_head(self, inputs_embeds, heads):
+        if not self.predictor:
+            raise ValueError("Per-head derivatives are only used by the codec predictor")
+        positions = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device)
+        positions = positions[None].expand(inputs_embeds.shape[0], -1)
+        embeddings = self.rotary_emb(inputs_embeds, positions)
+        hidden_states = _HeadInputs.apply(inputs_embeds, heads)
+        for layer in self.layers:
+            hidden_states = layer._forward_per_head(hidden_states, embeddings)
+        return self.norm._forward_per_head(hidden_states)
+
 
 class Qwen3OmniMoeTalkerCodePredictorModelForConditionalGeneration(nn.Module):
     def __init__(self, config):
@@ -409,8 +493,17 @@ class Qwen3OmniMoeTalkerCodePredictorModelForConditionalGeneration(nn.Module):
         ]
         sequence = torch.stack([hidden_states, first_code_embeddings, *embedded[:-1]], dim=2)
         batch, time, length, width = sequence.shape
-        final = self.model(inputs_embeds=sequence.reshape(batch * time, length, width))
-        logits = torch.stack([head(final[:, i + 1]) for i, head in enumerate(self.lm_head)], dim=1)
+        flat = sequence.reshape(batch * time, length, width)
+        if torch.is_grad_enabled():
+            final = self.model._forward_per_head(flat, groups)
+            logits = torch.stack(
+                [head(final[i, :, i + 1]) for i, head in enumerate(self.lm_head)], dim=1
+            )
+        else:
+            final = self.model(inputs_embeds=flat)
+            logits = torch.stack(
+                [head(final[:, i + 1]) for i, head in enumerate(self.lm_head)], dim=1
+            )
         summed = torch.stack([first_code_embeddings, *embedded], dim=2).sum(dim=2)
         return TeacherForcedCodeOutput(logits.reshape(batch, time, groups, -1), summed)
 

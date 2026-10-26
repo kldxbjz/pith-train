@@ -411,3 +411,46 @@ def test_projection_strided_payload_matches_contiguous_hf(dtype):
     ):
         assert name == ref_name and parameter.grad is not None
         torch.testing.assert_close(parameter.grad, reference.grad, rtol=0, atol=0, msg=name)
+
+
+def test_headwise_boundary_preserves_frozen_weights_and_single_forward():
+    from pithtrain.models.qwen3_omni_talker import _headwise_backward
+
+    torch.manual_seed(194)
+    module = torch.nn.Linear(8, 8).bfloat16()
+    module.bias.requires_grad_(False)
+    initial = {name: value.clone() for name, value in module.state_dict().items()}
+    x = torch.randn(3, 8, dtype=torch.bfloat16, requires_grad=True)
+    directions = torch.randn(4, 3, 8, dtype=torch.bfloat16)
+    calls = []
+
+    def forward(value):
+        calls.append(value.shape)
+        return module(value)
+
+    heads = x.unsqueeze(0).expand(4, *x.shape)
+    y = _headwise_backward(module, forward, heads)
+    (y * directions).sum().backward()
+    assert calls == [x.shape]
+    assert module.bias.grad is None
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    assert module.weight.grad is not None and torch.isfinite(module.weight.grad).all()
+    assert initial.keys() == module.state_dict().keys()
+    for name, value in module.state_dict().items():
+        torch.testing.assert_close(value, initial[name], rtol=0, atol=0)
+    # Independent per-head graph; retain reverse BF16 accumulation exactly.
+    reference = torch.nn.Linear(8, 8).bfloat16()
+    reference.load_state_dict(initial)
+    reference.bias.requires_grad_(False)
+    weights, inputs = [], []
+    for direction in directions:
+        leaf = x.detach().clone().requires_grad_()
+        gradient = torch.autograd.grad(reference(leaf), (leaf, reference.weight), direction)
+        inputs.append(gradient[0])
+        weights.append(gradient[1])
+    expected = weights[-1]
+    for gradient in reversed(weights[:-1]):
+        expected = expected + gradient
+    torch.testing.assert_close(module.weight.grad, expected, rtol=0, atol=0)
+    # The outer expand uses its ordinary sum; this boundary keeps all lanes.
+    torch.testing.assert_close(x.grad, torch.stack(inputs).sum(0), rtol=0, atol=0)

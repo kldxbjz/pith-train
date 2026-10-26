@@ -82,11 +82,11 @@ def _shard_units(model):
         add(getattr(talker, name))
     predictor = talker.code_predictor
     for layer in _children(predictor.model.layers):
-        add(layer)
+        add(layer, ("_forward_per_head",))
     for embedding in predictor.model.codec_embedding:
         add(embedding)
-    add(predictor.model.norm)
-    add(predictor.model, container=True)
+    add(predictor.model.norm, ("_forward_per_head",))
+    add(predictor.model, ("_forward_per_head",), container=True)
     for head in predictor.lm_head:
         add(head)
     add(predictor, ("teacher_force",), container=True)

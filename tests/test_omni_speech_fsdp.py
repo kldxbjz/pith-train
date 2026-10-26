@@ -79,16 +79,29 @@ class Thinker(nn.Module):
         return self.lm_head(self.norm(hidden))
 
 
+class HeadwiseLinear(nn.Linear):
+    def _forward_per_head(self, x):
+        return self(x)
+
+
+class HeadwiseNorm(nn.LayerNorm):
+    def _forward_per_head(self, x):
+        return self(x)
+
+
 class Trunk(nn.Module):
     def __init__(self, predictor=False):
         super().__init__()
-        self.layers = nn.ModuleList([nn.Linear(4, 4)])
-        self.norm = nn.LayerNorm(4)
+        self.layers = nn.ModuleList([HeadwiseLinear(4, 4)])
+        self.norm = HeadwiseNorm(4)
         self.codec_embedding = (
             nn.ModuleList([nn.Embedding(8, 4), nn.Embedding(8, 4)])
             if predictor
             else nn.Embedding(8, 4)
         )
+
+    def _forward_per_head(self, x, heads):
+        return x.unsqueeze(0).expand(heads, *x.shape)
 
 
 class Predictor(nn.Module):
@@ -120,6 +133,9 @@ def test_bottom_up_units_preserve_single_direct_entry_and_repeated_edges():
     table = {id(module): methods for module, methods, _ in units}
     assert table[id(model.thinker.layers["0"])] == ("reference_forward_with_hidden",)
     assert table[id(model.talker.code_predictor)] == ("teacher_force",)
+    predictor = model.talker.code_predictor.model
+    for unit in (*predictor.layers, predictor.norm, predictor):
+        assert table[id(unit)] == ("_forward_per_head",)
     assert id(model.thinker.embed_tokens) in table
     assert id(model.talker.model.codec_embedding) in table
     assert all(id(m) in table for m in model.talker.code_predictor.model.codec_embedding)
