@@ -248,3 +248,49 @@ def test_shared_token_context_cannot_disagree_with_embedding_input():
 def test_empty_image_token_sequence_rejected():
     with pytest.raises(ValueError, match="nonempty"):
         validate_image_inputs(torch.empty(1, 0, dtype=torch.long), {}, thinker_config())
+
+
+@pytest.mark.parametrize("seed", [18, 33])
+def test_mixed_media_preserves_bf16_gradient_boundaries_in_one_call(seed):
+    from torch.func import functional_call
+
+    native, reference = paired(vision_config())
+    torch.manual_seed(seed)
+    grid = torch.tensor([[1, 4, 4]])
+    pixels = [torch.randn(16, 24).bfloat16() for _ in range(2)]
+
+    class SeparateMedia(torch.nn.Module):
+        def __init__(self, visual):
+            super().__init__()
+            self.visual = visual
+
+        def forward(self):
+            outputs = [self.visual(value, grid) for value in pixels]
+            return tuple(
+                torch.cat(values)
+                for values in zip(
+                    *[(v.pooler_output, *v.deepstack_features) for v in outputs], strict=True
+                )
+            )
+
+    oracle = SeparateMedia(reference)
+    expected = functional_call(oracle, {n: p.bfloat16() for n, p in oracle.named_parameters()}, ())
+    calls = []
+    hook = native.register_forward_hook(lambda *args: calls.append(1))
+    try:
+        output = functional_call(
+            native,
+            {n: p.bfloat16() for n, p in native.named_parameters()},
+            (torch.cat(pixels), torch.cat((grid, grid))),
+            {"grid_splits": (1, 1)},
+        )
+    finally:
+        hook.remove()
+    actual = (output.pooler_output, *output.deepstack_features)
+    assert calls == [1]
+    for left, right in zip(actual, expected, strict=True):
+        torch.testing.assert_close(left, right, rtol=0, atol=0)
+    probes = [torch.randn_like(value) for value in expected]
+    torch.autograd.backward(expected, probes)
+    torch.autograd.backward(actual, probes)
+    assert_gradients(native, reference, rtol=0, atol=0)

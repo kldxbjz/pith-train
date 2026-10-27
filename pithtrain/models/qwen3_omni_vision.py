@@ -261,7 +261,34 @@ class Qwen3OmniMoeVisionEncoder(nn.Module):
             [Qwen3OmniMoeVisionPatchMerger(config, use_postshuffle_norm=True) for _ in indexes]
         )
 
-    def forward(self, pixel_values, grid_thw):
+    def forward(self, pixel_values, grid_thw, *, grid_splits=None):
+        if grid_splits is None:
+            return self._forward(pixel_values, grid_thw)
+        if (
+            not isinstance(grid_splits, tuple)
+            or not grid_splits
+            or any(type(size) is not int or size <= 0 for size in grid_splits)
+            or sum(grid_splits) != len(grid_thw)
+        ):
+            raise ValueError("grid_splits must partition the vision grids")
+        # Preserve HF's image/video GEMM and BF16 gradient boundaries inside
+        # one FSDP call, so mixed modalities keep a single collective sequence.
+        grids = grid_thw.split(grid_splits)
+        sizes = [int(grid.prod(-1).sum()) for grid in grids]
+        outputs = [
+            self._forward(pixels, grid)
+            for pixels, grid in zip(pixel_values.split(sizes), grids, strict=True)
+        ]
+        return VisionOutput(
+            torch.cat([output.last_hidden_state for output in outputs]),
+            torch.cat([output.pooler_output for output in outputs]),
+            tuple(
+                torch.cat([output.deepstack_features[index] for output in outputs])
+                for index in range(len(self.deepstack_visual_indexes))
+            ),
+        )
+
+    def _forward(self, pixel_values, grid_thw):
         config = self.config
         grids = (video_grid if self.supports_video else image_grid)(
             grid_thw, config.spatial_merge_size

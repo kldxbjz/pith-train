@@ -294,7 +294,8 @@ def encode_multimodal(visual, audio_tower, embeddings, input_ids, context, confi
     # Zero dependencies impose the same backward order (audio -> visual ->
     # embedding) as well as the same forward order, even across absent modalities.
     vision_pixels = torch.cat(pixels) + embeddings.sum().to(pixels[0].dtype) * 0
-    output = visual(vision_pixels, torch.cat(grids))
+    kwargs = {"grid_splits": tuple(len(grid) for grid in grids)} if len(grids) > 1 else {}
+    output = visual(vision_pixels, torch.cat(grids), **kwargs)
     vision_anchor = output.pooler_output.sum()
     for values in output.deepstack_features:
         vision_anchor = vision_anchor + values.sum()
