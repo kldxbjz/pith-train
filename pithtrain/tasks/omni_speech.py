@@ -120,6 +120,7 @@ def _fsdp_plan(model):
         "require_backward",
         "owned_modules",
         "fixed_topology",
+        "thinker_sharding",
     }
     if (
         not isinstance(plan, dict)
@@ -132,6 +133,8 @@ def _fsdp_plan(model):
             or plan["param_dtype"] != torch.bfloat16
             or not plan["require_backward"]
             or not plan["fixed_topology"]
+            or not isinstance(plan["thinker_sharding"], str)
+            or not plan["thinker_sharding"]
         )
     ):
         raise ValueError("Invalid declared speech FSDP plan")
@@ -213,6 +216,7 @@ def _native_checkpoint(
                     waveform_objective_id=cfg.waveform_objective_id,
                     fsdp=dict(
                         schema=plan["schema"],
+                        thinker_sharding=plan["thinker_sharding"],
                         reduction="sum",
                         master_dtype="float32",
                         param_dtype="bfloat16",

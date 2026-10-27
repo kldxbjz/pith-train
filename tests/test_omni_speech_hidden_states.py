@@ -7,11 +7,15 @@ executed; this does not claim validation of native GPU kernels or DualPipeV.
 
 import ast
 import copy
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
 import torch
+import torch.distributed as dist
 from torch import nn
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import fully_shard
 from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeTextConfig,
 )
@@ -23,6 +27,7 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
 )
 
 from pithtrain.models.qwen3_omni_speech import thinker_speech_forward
+from pithtrain.modules.omni_speech_fsdp import _thinker_layer_units
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -34,6 +39,18 @@ class HFBase(nn.Module):
         super().__init__()
         self.idx = layer_id
         self.layer = HFLayer(config, layer_id)
+
+    @property
+    def input_layernorm(self):
+        return self.layer.input_layernorm
+
+    @property
+    def self_attn(self):
+        return self.layer.self_attn
+
+    @property
+    def post_attention_layernorm(self):
+        return self.layer.post_attention_layernorm
 
     @property
     def mlp(self):
@@ -234,7 +251,8 @@ def test_existing_payload_forward_and_gradients_are_unchanged(index):
         torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-7)
 
 
-def test_bf16_speech_branches_share_hf_hidden_gradient_boundaries():
+@pytest.mark.parametrize("sharded", [False, True])
+def test_bf16_speech_branches_share_hf_hidden_gradient_boundaries(sharded, tmp_path):
     native, hf, head, _, _ = pair()
     # No vision: keep the real packed native adapter, but no DeepStack addition
     # exists in HF. The extra packed/sliced edges must not regroup BF16 VJPs.
@@ -242,32 +260,69 @@ def test_bf16_speech_branches_share_hf_hidden_gradient_boundaries():
     native.visual_mask.zero_()
     native, hf, head = native.bfloat16(), hf.bfloat16(), head.bfloat16()
     ids = torch.tensor([[1, 2, 3, 4]])
-    actual = thinker_speech_forward(native, ids, {}, 2)
-    expected = hf(input_ids=ids, output_hidden_states=True, use_cache=False)
-    logits = head(expected.last_hidden_state)
-    for left, right in (
-        (actual.logits, logits),
-        (actual.hidden_states, expected.hidden_states[2]),
-        (actual.embeddings, expected.hidden_states[0]),
-    ):
-        torch.testing.assert_close(left, right, rtol=0, atol=0)
-    actual.hidden_states.retain_grad()
-    actual.embeddings.retain_grad()
-    expected.hidden_states[2].retain_grad()
-    expected.hidden_states[0].retain_grad()
+    try:
+        if sharded:
+            # Empty no-vision lanes are fixture placeholders, not trainable weights.
+            # CPU FSDP cannot reduce a zero-element parameter gradient.
+            del native.deepstack
+            native.deepstack = (torch.empty(0, 24, dtype=torch.bfloat16),) * 2
+            dist.init_process_group(
+                "gloo",
+                init_method=f"file://{tmp_path}/rdzv",
+                rank=0,
+                world_size=1,
+                timeout=timedelta(seconds=30),
+            )
+            mesh = init_device_mesh("cpu", (1,), mesh_dim_names=("dp",))
+            units = _thinker_layer_units(native.layers["2"])
+            fully_shard(list(units), mesh=mesh, reshard_after_forward=True)
+            for unit in units:
+                unit.set_gradient_divide_factor(1.0)
+                unit.set_force_sum_reduction_for_comms(True)
 
-    def objective(text, hidden, embeddings):
-        return (
-            text.float().square().sum()
-            + 0.17 * hidden.float().square().sum()
-            + 0.13 * embeddings.float().square().sum()
+            class Driver(nn.Module):
+                def __init__(self, model):
+                    super().__init__()
+                    self.model = model
+
+                def forward(self, ids):
+                    return thinker_speech_forward(self.model, ids, {}, 2)
+
+            driver = Driver(native)
+            fully_shard(driver, mesh=mesh, reshard_after_forward=True)
+            driver.set_gradient_divide_factor(1.0)
+            driver.set_force_sum_reduction_for_comms(True)
+            actual = driver(ids)
+        else:
+            actual = thinker_speech_forward(native, ids, {}, 2)
+        expected = hf(input_ids=ids, output_hidden_states=True, use_cache=False)
+        logits = head(expected.last_hidden_state)
+        for left, right in (
+            (actual.logits, logits),
+            (actual.hidden_states, expected.hidden_states[2]),
+            (actual.embeddings, expected.hidden_states[0]),
+        ):
+            torch.testing.assert_close(left, right, rtol=0, atol=0)
+        actual.hidden_states.retain_grad()
+        actual.embeddings.retain_grad()
+        expected.hidden_states[2].retain_grad()
+        expected.hidden_states[0].retain_grad()
+
+        def objective(text, hidden, embeddings):
+            return (
+                text.float().square().sum()
+                + 0.17 * hidden.float().square().sum()
+                + 0.13 * embeddings.float().square().sum()
+            )
+
+        objective(actual.logits, actual.hidden_states, actual.embeddings).backward()
+        objective(logits, expected.hidden_states[2], expected.hidden_states[0]).backward()
+        torch.testing.assert_close(
+            actual.hidden_states.grad, expected.hidden_states[2].grad, rtol=0, atol=0
         )
-
-    objective(actual.logits, actual.hidden_states, actual.embeddings).backward()
-    objective(logits, expected.hidden_states[2], expected.hidden_states[0]).backward()
-    torch.testing.assert_close(
-        actual.hidden_states.grad, expected.hidden_states[2].grad, rtol=0, atol=0
-    )
-    torch.testing.assert_close(
-        actual.embeddings.grad, expected.hidden_states[0].grad, rtol=0, atol=0
-    )
+        torch.testing.assert_close(
+            actual.embeddings.grad, expected.hidden_states[0].grad, rtol=0, atol=0
+        )
+    finally:
+        if sharded and dist.is_initialized():
+            dist.destroy_process_group()

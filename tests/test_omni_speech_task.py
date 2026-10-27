@@ -948,6 +948,7 @@ def sharded_protocol_model(mode, mesh):
         reduce_dtype=torch.float32,
         require_backward=True,
         fixed_topology=True,
+        thinker_sharding="protocol_fixture_v1",
         owned_modules=("thinker", "talker", "code2wav", ""),
         materialized=True,
         weights_initialized=True,
@@ -1224,31 +1225,42 @@ def fsdp_native_task_worker(rank, root_string):
         run(zero, 0, 1, resume_scan=1, **native)
         assert zero[4].state_dict() == dict(scanned_batches=1, completed_updates=0)
         assert not zero[1].state and zero[2].last_epoch == 0
-        # The same model/config identity is carried by the native strict adapter.
-        # A single rank's same-layout config drift must reject every rank before apply.
-        if rank == 1:
-            zero[0].config.same_shape_semantics = "changed"
-        before = snapshot(zero)
+        # Same-layout model or FSDP arithmetic-boundary drift must reject
+        # every rank before changing model, optimizer, reader or RNG state.
         from pithtrain.modules.distributed_checkpoint import DistributedCheckpointError
 
-        with pytest.raises(DistributedCheckpointError, match="^Ranks disagree on load contract$"):
-            _native_checkpoint(
-                "load",
-                root=root / "shards",
-                scan=2,
-                cfg=OmniSpeechCfg(mode="text_and_codec"),
-                model=zero[0],
-                optimizer=zero[1],
-                scheduler=zero[2],
-                data=zero[3],
-                state=zero[4],
-                contract=native["checkpoint_contract"],
-                token_group=mesh.get_group(),
-            )
-        assert_tree(snapshot(zero), before)
-        if rank == 1:
-            del zero[0].config.same_shape_semantics
-        dist.barrier()
+        missing = object()
+        for owner, key in (
+            (vars(zero[0].config), "same_shape_semantics"),
+            (zero[0]._omni_speech_fsdp_plan, "thinker_sharding"),
+        ):
+            previous = owner.get(key, missing)
+            if rank == 1:
+                owner[key] = "changed"
+            before = snapshot(zero)
+            with pytest.raises(
+                DistributedCheckpointError, match="^Ranks disagree on load contract$"
+            ):
+                _native_checkpoint(
+                    "load",
+                    root=root / "shards",
+                    scan=2,
+                    cfg=OmniSpeechCfg(mode="text_and_codec"),
+                    model=zero[0],
+                    optimizer=zero[1],
+                    scheduler=zero[2],
+                    data=zero[3],
+                    state=zero[4],
+                    contract=native["checkpoint_contract"],
+                    token_group=mesh.get_group(),
+                )
+            assert_tree(snapshot(zero), before)
+            if rank == 1:
+                if previous is missing:
+                    del owner[key]
+                else:
+                    owner[key] = previous
+            dist.barrier()
         # One rank's pending gradient must be rejected before native collectives;
         # temporary global training bindings must be restored on healthy peers.
         prior_model = getattr(training, "model", None)

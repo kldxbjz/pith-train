@@ -37,6 +37,13 @@ def _children(sequence):
     return tuple(sequence.values()) if isinstance(sequence, nn.ModuleDict) else tuple(sequence)
 
 
+def _thinker_layer_units(layer):
+    # Keep residual joins outside FSDP's input identity hook. Wrapping the whole
+    # decoder regroups the BF16 text and speech cotangents at a shared hidden
+    # state. These children still share one all-gather/reduce-scatter group.
+    return (layer.input_layernorm, layer.self_attn, layer.post_attention_layernorm, layer.mlp)
+
+
 def _shard_units(model):
     """Build a bottom-up plan without mutating modules or parameter identities."""
     _require(
@@ -64,13 +71,10 @@ def _shard_units(model):
         if getattr(thinker, name, None) is not None:
             add(getattr(thinker, name))
     for layer in _children(thinker.layers):
-        method = (
-            "reference_forward_with_hidden"
-            if hasattr(layer, "reference_forward_with_hidden")
-            else "reference_forward"
-        )
-        # Do not register both: reference_forward may call the other internally.
-        add(layer, (method,))
+        norm, attention, post_norm, mlp = _thinker_layer_units(layer)
+        for child in (norm, attention, post_norm):
+            add(child)
+        add(mlp, ("reference_forward",))
     add(thinker, ("forward_prolog", "forward_posemb", "forward_epilog"), container=True)
 
     for layer in _children(talker.model.layers):
@@ -161,13 +165,17 @@ def apply_speech_fsdp(model, mesh, *, mode, gradient_reduction="sum", param_dtyp
         output_dtype=None,
         cast_forward_inputs=False,
     )
+    layer_groups = [_thinker_layer_units(layer) for layer in _children(model.thinker.layers)]
+    group_starts = {id(group[0]): list(group) for group in layer_groups}
+    group_members = {id(child) for group in layer_groups for child in group[1:]}
     for module, methods, container in units:
-        fully_shard(
-            module,
-            mesh=mesh,
-            reshard_after_forward=True,
-            mp_policy=context if container else compute,
-        )
+        if id(module) not in group_members:
+            fully_shard(
+                group_starts.get(id(module), module),
+                mesh=mesh,
+                reshard_after_forward=True,
+                mp_policy=context if container else compute,
+            )
         for method in methods:
             register_fsdp_forward_method(module, method)
         module.set_gradient_divide_factor(1.0)
@@ -186,6 +194,7 @@ def apply_speech_fsdp(model, mesh, *, mode, gradient_reduction="sum", param_dtyp
         reduce_dtype=torch.float32,
         require_backward=True,
         fixed_topology=True,
+        thinker_sharding="grouped_residual_children_v1",
         owned_modules=tuple(names[id(m)] for m, _, _ in units),
         registered_methods=tuple((names[id(m)], methods) for m, methods, _ in units if methods),
     )

@@ -49,12 +49,22 @@ def test_predictor_zero_frame_branch_is_explicit():
         validate_speech_collective_plan([batch(frames=0)], "waveform")
 
 
-class DirectLayer(nn.Linear):
+class DirectMLP(nn.Linear):
     def reference_forward(self, x):
-        return self.reference_forward_with_hidden(x)[0]
+        return self(x)
 
-    def reference_forward_with_hidden(self, x):
-        return self(x), x
+
+class DirectLayer(nn.Module):
+    def __init__(self, width):
+        super().__init__()
+        self.input_layernorm = nn.LayerNorm(width)
+        self.self_attn = nn.Linear(width, width)
+        self.post_attention_layernorm = nn.LayerNorm(width)
+        self.mlp = DirectMLP(width, width)
+
+    def reference_forward(self, x):
+        residual = x + self.self_attn(self.input_layernorm(x))
+        return residual + self.mlp.reference_forward(self.post_attention_layernorm(residual))
 
 
 class Thinker(nn.Module):
@@ -66,7 +76,7 @@ class Thinker(nn.Module):
             nn.LayerNorm(4),
             nn.Linear(4, 8),
         )
-        self.layers = nn.ModuleDict({"0": DirectLayer(4, 4)})
+        self.layers = nn.ModuleDict({"0": DirectLayer(4)})
         self.visual, self.audio_tower = nn.Linear(4, 4), nn.Linear(4, 4)
 
     def forward_prolog(self, ids):
@@ -131,7 +141,11 @@ def test_bottom_up_units_preserve_single_direct_entry_and_repeated_edges():
     before = {name: id(value) for name, value in model.named_parameters()}
     units = _shard_units(model)
     table = {id(module): methods for module, methods, _ in units}
-    assert table[id(model.thinker.layers["0"])] == ("reference_forward_with_hidden",)
+    layer = model.thinker.layers["0"]
+    assert id(layer) not in table
+    for child in (layer.input_layernorm, layer.self_attn, layer.post_attention_layernorm):
+        assert table[id(child)] == ()
+    assert table[id(layer.mlp)] == ("reference_forward",)
     assert table[id(model.talker.code_predictor)] == ("teacher_force",)
     predictor = model.talker.code_predictor.model
     for unit in (*predictor.layers, predictor.norm, predictor):
