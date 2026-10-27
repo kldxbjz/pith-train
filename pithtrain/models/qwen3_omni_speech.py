@@ -401,13 +401,19 @@ def prepare_talker_condition(
     )
 
 
-def codec_embeddings(talker, codes):
-    """Sum the first and all residual codebook embeddings, as the Talker does."""
+def _codec_embedding_values(talker, codes):
+    """Keep shared BF16 outputs for the next-frame and residual-head branches."""
     embeddings = talker.code_predictor.get_input_embeddings()
     if codes.shape[-1] != len(embeddings) + 1:
         raise ValueError("Codec group count differs from the residual predictor")
     values = [talker.get_input_embeddings()(codes[..., 0])]
     values.extend(embedding(codes[..., index + 1]) for index, embedding in enumerate(embeddings))
+    return values
+
+
+def codec_embeddings(talker, codes):
+    """Sum the first and all residual codebook embeddings, as the Talker does."""
+    values = _codec_embedding_values(talker, codes)
     # Match HF's single reduction over all codebooks. Sequential BF16 additions
     # round after every group and change the next frame's autoregressive input.
     return torch.stack(values, dim=-2).sum(dim=-2)
@@ -466,7 +472,8 @@ def speech_teacher_force(talker, condition, codes, code_lengths, *, codebook_mas
     if ((codes[valid] < 0) | (codes[valid] >= codec_vocab)).any():
         raise ValueError("Active codec ids are outside the RVQ codebook")
     safe_codes = codes.masked_fill(~valid.unsqueeze(-1), 0)
-    previous = codec_embeddings(talker, safe_codes) + _trailing(condition, frames)
+    embedded = _codec_embedding_values(talker, safe_codes)
+    previous = torch.stack(embedded, dim=-2).sum(dim=-2) + _trailing(condition, frames)
     inputs = torch.cat((condition.inputs_embeds, previous), dim=1)
     # EOS positions are active; subsequent padded inputs are never used as targets.
     attention = torch.cat((condition.attention_mask, valid.to(torch.long)), dim=1)
@@ -488,8 +495,9 @@ def speech_teacher_force(talker, condition, codes, code_lengths, *, codebook_mas
     if frames:
         residual = talker.code_predictor.teacher_force(
             result.last_hidden_state[:, start : start + frames],
-            talker.get_input_embeddings()(safe_codes[..., 0]),
+            embedded[0],
             safe_codes[..., 1:],
+            residual_embeddings=embedded[1:],
         ).logits
     else:
         # Keep the shape contract for all-EOS batches without calling a zero-batch transformer.

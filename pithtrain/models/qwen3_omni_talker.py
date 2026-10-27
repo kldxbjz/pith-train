@@ -468,13 +468,17 @@ class Qwen3OmniMoeTalkerCodePredictorModelForConditionalGeneration(nn.Module):
             self.lm_head[generation_steps](hidden), hidden, generation_steps + 1
         )
 
-    def teacher_force(self, hidden_states, first_code_embeddings, residual_codes):
+    def teacher_force(
+        self, hidden_states, first_code_embeddings, residual_codes, *, residual_embeddings=None
+    ):
         """Predict all residual groups without shifting the time axis.
 
         Inputs: hidden/first embedding [B,T,H], integer residual targets [B,T,G-1].
         Outputs: logits [B,T,G-1,Vr], embedding sum [B,T,H]. Residual target j
         becomes the input for j+1 only; the last embedding contributes to the
-        next-time codec sum, preserving its genuine differentiable use.
+        next-time codec sum, preserving its genuine differentiable use. The
+        speech recurrence passes its existing embeddings so both branches join
+        before the BF16 embedding backward, rather than at FP32 master weights.
         """
         groups = len(self.lm_head)
         if hidden_states.ndim != 3 or first_code_embeddings.shape != hidden_states.shape:
@@ -487,10 +491,19 @@ class Qwen3OmniMoeTalkerCodePredictorModelForConditionalGeneration(nn.Module):
             residual_codes.min() < 0 or residual_codes.max() >= self.config.vocab_size
         ):
             raise ValueError("Residual target outside predictor vocabulary")
-        embedded = [
-            embedding(residual_codes[..., i])
-            for i, embedding in enumerate(self.model.codec_embedding)
-        ]
+        embedded = residual_embeddings
+        if embedded is None:
+            embedded = [
+                embedding(residual_codes[..., i])
+                for i, embedding in enumerate(self.model.codec_embedding)
+            ]
+        elif len(embedded) != groups or any(
+            value.shape != hidden_states.shape
+            or value.dtype != first_code_embeddings.dtype
+            or value.device != first_code_embeddings.device
+            for value in embedded
+        ):
+            raise ValueError("Residual embeddings must share the first-code [B,T,H] layout")
         sequence = torch.stack([hidden_states, first_code_embeddings, *embedded[:-1]], dim=2)
         batch, time, length, width = sequence.shape
         flat = sequence.reshape(batch * time, length, width)

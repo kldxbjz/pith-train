@@ -129,7 +129,8 @@ def independent_hf(model, prepared, codes, lengths):
     tail = torch.cat(
         (prepared.trailing_text_hidden, prepared.tts_pad_embed.expand(-1, frames, -1)), 1
     )[:, :frames]
-    inputs = torch.cat((prepared.inputs_embeds, torch.stack(embedded).sum(0) + tail), 1)
+    # Official codebook-axis reduction, independently built from HF tables.
+    inputs = torch.cat((prepared.inputs_embeds, torch.stack(embedded, -2).sum(-2) + tail), 1)
     positions = torch.arange(inputs.shape[1]).view(1, 1, -1).expand(3, batch, -1)
     attention = torch.cat((prepared.attention_mask, valid.long()), 1)
     hidden = model.model(
@@ -184,6 +185,59 @@ def test_teacher_forcing_all_logits_gradients_and_masked_lengths():
         numerator = (parameter.grad.double() - other.grad.double()).square().sum()
         denominator = parameter.grad.double().square().sum() + other.grad.double().square().sum()
         assert numerator / denominator.clamp_min(1e-30) < 1e-8, name
+
+
+def test_bf16_codec_embeddings_share_both_autoregressive_gradient_branches():
+    native, hf = pair()
+    torch.manual_seed(33)
+    prefix = torch.randn(1, 5, 24).bfloat16()
+    tail = torch.randn(1, 2, 24).bfloat16()
+    pad = torch.randn(1, 1, 24).bfloat16()
+    codes = torch.randint(0, 23, (1, 4, 16))
+    lengths = torch.tensor([4])
+    ids = torch.zeros(1, 5, dtype=torch.long)
+
+    class Recurrence(nn.Module):
+        def __init__(self, model, reference):
+            super().__init__()
+            self.model, self.reference = model, reference
+
+        def forward(self, hidden):
+            prepared = TalkerCondition(
+                hidden,
+                ids,
+                torch.ones_like(ids),
+                torch.arange(5).view(1, 1, -1).expand(3, 1, -1),
+                tail,
+                pad,
+            )
+            if self.reference:
+                return independent_hf(self.model, prepared, codes, lengths)
+            result = speech_teacher_force(self.model, prepared, codes, lengths)
+            return result.first_logits, result.residual_logits
+
+    outputs = []
+    for model, reference in ((native, False), (hf, True)):
+        recurrence = Recurrence(model, reference)
+        parameters = {name: p.bfloat16() for name, p in recurrence.named_parameters()}
+        hidden = prefix.detach().clone().requires_grad_()
+        first, residual = torch.func.functional_call(
+            recurrence, (parameters, dict(recurrence.named_buffers())), (hidden,), strict=True
+        )
+        labels = torch.cat((codes[..., 0], codes.new_full((1, 1), 31)), 1)
+        loss = F.cross_entropy(first.float().flatten(0, 1), labels.flatten(), reduction="sum")
+        loss += F.cross_entropy(
+            residual.float().flatten(0, 2), codes[..., 1:].flatten(), reduction="sum"
+        )
+        loss.backward()
+        outputs.append((first, residual, hidden.grad))
+    for actual, expected in zip(*outputs):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for name, parameter in native.named_parameters():
+        expected = hf.get_parameter(name)
+        assert (parameter.grad is None) == (expected.grad is None), name
+        if parameter.grad is not None:
+            torch.testing.assert_close(parameter.grad, expected.grad, rtol=0, atol=0, msg=name)
 
 
 def test_current_first_code_does_not_leak_and_residual_order_is_causal():
