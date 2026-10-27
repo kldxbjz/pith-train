@@ -252,6 +252,8 @@ class TrainingCfg(SlottedDefault):
 
     This independent numerical setting lets baseline and strict-resume runs use
     identical compute policies. Strict resume also enables it implicitly.
+    Summed CE uses PyTorch FP32 arithmetic with extra temporary vocabulary
+    memory; ordinary training keeps the in-place fused CE kernel.
     CUDA launches require CUBLAS_WORKSPACE_CONFIG=:4096:8 or :16:8 before Python.
     """
 

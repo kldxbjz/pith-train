@@ -107,6 +107,22 @@ class CrossEntropy(torch.autograd.Function):
         n_non_ignore = (target != ignore_index).sum(dtype=torch.int64).view(1)
         n_non_ignore.clamp_(min=1)
 
+        if reduction == "sum" and torch.are_deterministic_algorithms_enabled():
+            # Strict training uses PyTorch's log-softmax arithmetic. The fused
+            # exp/sum path is mathematically equivalent, but a BF16 rounding
+            # boundary can change a near-zero downstream gradient's sign.
+            # Keep the destructive API and saved-gradient dtype unchanged;
+            # this opt-in path needs additional transient FP32 vocabulary memory.
+            with torch.enable_grad():
+                logits = inp.detach().float().requires_grad_()
+                loss = torch.nn.functional.cross_entropy(
+                    logits, target, ignore_index=ignore_index, reduction="sum"
+                )
+                gradient = torch.autograd.grad(loss, logits)[0]
+            inp.copy_(gradient)
+            ctx.save_for_backward(inp.detach())
+            return loss.detach()
+
         loss_1d = torch.zeros(n_rows, dtype=torch.float32, device=inp.device)
         BLOCK_SIZE = min(65536 // 2, triton.next_power_of_2(n_cols))
 
@@ -150,7 +166,10 @@ def cross_entropy(
     Overwrites ``inp`` with pre-computed gradients during the forward pass,
     eliminating the need for a separate activation tensor.  All arithmetic
     is performed in FP32; gradients are stored in the original dtype of
-    ``inp``.
+    ``inp``. With PyTorch deterministic algorithms enabled, sum reduction
+    uses PyTorch FP32 cross-entropy arithmetic before the same gradient store.
+    This strict compatibility path allocates temporary FP32 vocabulary tensors;
+    ordinary training and the legacy mean-reduction path retain the fused kernel.
 
     Parameters
     ----------

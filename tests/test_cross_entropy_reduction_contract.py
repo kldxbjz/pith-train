@@ -127,3 +127,35 @@ def test_real_objective_requests_sum_before_low_precision_gradient_storage(dtype
     torch.testing.assert_close(loss, reference, rtol=0, atol=0)
     torch.testing.assert_close(detached, reference, rtol=0, atol=0)
     torch.testing.assert_close(actual.grad, expected.grad.to(dtype), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("all_ignored", [False, True])
+def test_strict_sum_preserves_destructive_api_and_reference_rounding(dtype, all_ignored):
+    ce, kernel = wrapper()
+    generator = torch.Generator().manual_seed(37)
+    values = torch.randn((7, 3072), generator=generator).to(dtype)
+    labels = torch.randint(3072, (7,), generator=generator)
+    labels[1::3] = -100
+    if all_ignored:
+        labels.fill_(-100)
+    expected = values.detach().float().clone().requires_grad_()
+    expected_loss = F.cross_entropy(expected, labels, reduction="sum")
+    expected_loss.backward()
+    prior = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        torch.use_deterministic_algorithms(True)
+        actual = values.clone().requires_grad_()
+        loss = ce(actual, labels, reduction="sum")
+        # The public destructive API and BF16 gradient storage remain intact.
+        torch.testing.assert_close(actual.detach(), expected.grad.to(dtype), rtol=0, atol=0)
+        loss.backward()
+        torch.testing.assert_close(loss, expected_loss, rtol=0, atol=0)
+        torch.testing.assert_close(actual.grad, expected.grad.to(dtype), rtol=0, atol=0)
+        assert kernel.reductions == []
+        torch.use_deterministic_algorithms(False)
+        ce(values.clone(), labels, reduction="sum")
+        assert kernel.reductions == ["sum"]
+    finally:
+        torch.use_deterministic_algorithms(prior, warn_only=warn_only)
