@@ -21,11 +21,17 @@ SOURCE = ROOT / "pithtrain/models/qwen3_omni_talker_pipeline.py"
 
 
 def method_namespace(ep=1):
-    return load_definitions(
+    namespace = load_definitions(
         "pithtrain/models/qwen3_omni_moe.py",
         ("_combine_expert_order",),
         dict(torch=torch, nn=nn, distributed=SimpleNamespace(ep_size=ep)),
     )
+    namespace.update(
+        load_definitions(
+            "pithtrain/models/qwen3_omni_talker_pipeline.py", ("_TalkerMoeInputs",), namespace
+        )
+    )
+    return namespace
 
 
 def extract_class_methods(name, methods, namespace):
@@ -85,10 +91,22 @@ def test_talker_stage1_computes_shared_expert_before_dispatch_without_folding_re
         def forward(self, hidden, rotary, cu):
             return self.proj(hidden)
 
+    class SharedMLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate = nn.Linear(8, 12)
+            self.up = nn.Linear(8, 12)
+            self.down = nn.Linear(12, 8)
+
+        def forward(self, value, up_value=None):
+            other = value if up_value is None else up_value
+            return self.down(torch.nn.functional.silu(self.gate(value)) * self.up(other))
+
     class MLP(nn.Module):
         def __init__(self):
             super().__init__()
-            self.shared_expert = nn.Linear(8, 8)
+            self.num_experts_per_tok = 2
+            self.shared_expert = SharedMLP()
             self.shared_expert_gate = nn.Linear(8, 1, bias=False)
             self.router = nn.Linear(8, 3, bias=False)
 
@@ -118,12 +136,13 @@ def test_talker_stage1_computes_shared_expert_before_dispatch_without_folding_re
     normalized = reference.post_attention_layernorm(residual)
     shared = reference.mlp.shared_forward(normalized)
     idx, probs, _ = reference.mlp.gate(normalized, None)
-    torch.testing.assert_close(output, normalized, rtol=1e-5, atol=1e-6)
+    expected_slots = normalized.reshape(-1, 1, 8).expand(-1, 2, -1)
+    torch.testing.assert_close(output, expected_slots, rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(packed, torch.cat((residual, shared), -1), rtol=1e-5, atol=1e-6)
     assert torch.equal(indexes, idx)
     (output.square().sum() + packed.square().sum() + weights.square().sum()).backward()
     (
-        normalized.square().sum()
+        expected_slots.square().sum()
         + residual.square().sum()
         + shared.square().sum()
         + probs.square().sum()

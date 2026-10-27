@@ -18,8 +18,34 @@ from pithtrain.models.qwen3_omni_moe import (
     Qwen3OmniMoeThinkerTextSparseMoeBlock,
     _combine_expert_order,
 )
+from pithtrain.modules.load_balance import MoELoadBalanceLossTracker, replay_indices
+from pithtrain.operators.ep_dispatch import prepare_dispatch
 from pithtrain.operators.linear import BF16Linear
 from pithtrain.pipeline.dualpipev import layer_partition
+
+
+class _TalkerMoeInputs(torch.autograd.Function):
+    """Preserve HF's BF16 input-derivative order across staged expert transport."""
+
+    @staticmethod
+    def forward(ctx, hidden, k):
+        return (
+            hidden.view_as(hidden),
+            hidden.view_as(hidden),
+            hidden.view_as(hidden),
+            hidden.view_as(hidden),
+            hidden[:, None].expand(-1, k, -1),
+        )
+
+    @staticmethod
+    def backward(ctx, shared_gate, shared_up, shared_linear, router, experts):
+        result = shared_linear
+        # The selected slots are sorted by increasing expert ID in stage1.
+        for slot in range(experts.shape[1] - 1, -1, -1):
+            result = result + experts[:, slot]
+        for branch in (router, shared_up, shared_gate):
+            result = result + branch
+        return result, None
 
 
 class Qwen3OmniMoeTalkerPipelineMLP(nn.Module):
@@ -30,8 +56,11 @@ class Qwen3OmniMoeTalkerPipelineMLP(nn.Module):
         self.up_proj = training.Linear(config.hidden_size, width, bias=False)
         self.down_proj = training.Linear(width, config.hidden_size, bias=False)
 
-    def forward(self, value):
-        return self.down_proj(torch.nn.functional.silu(self.gate_proj(value)) * self.up_proj(value))
+    def forward(self, value, up_value=None):
+        up_value = value if up_value is None else up_value
+        return self.down_proj(
+            torch.nn.functional.silu(self.gate_proj(value)) * self.up_proj(up_value)
+        )
 
 
 class Qwen3OmniMoeTalkerPipelineMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
@@ -62,10 +91,10 @@ class Qwen3OmniMoeTalkerPipelineDecoderLayer(Qwen3OmniMoeThinkerTextDecoderLayer
             config.hidden_size, config.rms_norm_eps
         )
 
-    def _forward_shared_expert(self, hidden_states):
+    def _forward_shared_expert(self, hidden_states, up_states=None):
         # Keep the MLP's two input-gradient branches visible to the shared gate.
         # A compiled boundary groups their BF16 sum before the gate's input VJP.
-        return self.mlp.shared_expert(hidden_states)
+        return self.mlp.shared_expert(hidden_states, up_states)
 
     def forward_stage1_compute(
         self, hidden_states, rotary_posemb, cu_seqlens=None, replay_idx=None
@@ -77,13 +106,36 @@ class Qwen3OmniMoeTalkerPipelineDecoderLayer(Qwen3OmniMoeThinkerTextDecoderLayer
         # Keep HF's norm and router boundaries: fusing the FP32 Q-norm
         # reduction changed a BF16 value and later top-k decisions in G2.
         # FA4/GEMMs remain native kernels; stage5 stays compiled.
-        shared = self._forward_shared_expert(hidden_states)
-        # Preserve HF's MLP-first construction and BF16 gate-backward roundings.
-        shared = self.mlp.shared_expert_gate(hidden_states).sigmoid() * shared
-        routing = self.mlp.gate(hidden_states, replay_idx)
-        # Carry both tensors through the existing residual channel. Folding
-        # shared into residual here would change HF's BF16 addition order.
-        return hidden_states, torch.cat((residual, shared), -1), *routing
+        gate_x, up_x, shared_x, router_x, expert_slots = _TalkerMoeInputs.apply(
+            hidden_states.reshape(-1, hidden_states.shape[-1]), self.mlp.num_experts_per_tok
+        )
+        shared = self._forward_shared_expert(gate_x, up_x)
+        shared = self.mlp.shared_expert_gate(shared_x).sigmoid() * shared
+        routing = self.mlp.gate(router_x, replay_idx)
+        # Preserve the existing residual channel and forward BF16 addition order.
+        return expert_slots, torch.cat((residual, shared.view_as(residual)), -1), *routing
+
+    def forward_stage1(self, hidden_states, rotary_posemb, cu_seqlens=None):
+        replay_idx = replay_indices(self.mlp.gate, hidden_states, self.mlp.num_experts_per_tok)
+        slots, residual, indices, weights, lb_loss = self.forward_stage1_compute(
+            hidden_states, rotary_posemb, cu_seqlens, replay_idx
+        )
+        if lb_loss is not None:
+            MoELoadBalanceLossTracker.add(lb_loss)
+        indices, order = indices.sort(dim=-1)
+        weights = weights.gather(-1, order)
+        tokens, routing = prepare_dispatch(
+            slots,
+            indices,
+            weights,
+            self.mlp.num_experts,
+            distributed.ep_size,
+            self.mlp.experts_per_rank,
+            distributed.ep_group,
+            deterministic=self.mlp.deterministic_token_layout,
+            deduplicate=False,
+        )
+        return tokens, residual, routing
 
     @torch.compile(fullgraph=True, options={"emulate_precision_casts": True})
     def forward_stage5(self, moe_outs, moe_local_idxs, topk_weight, residual):
