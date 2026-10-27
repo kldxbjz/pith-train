@@ -63,7 +63,7 @@ def actual_native_layer_class():
         for node in ast.parse(helper_path.read_text()).body
         if isinstance(node, ast.FunctionDef) and node.name == "inject_deepstack"
     )
-    namespace = {"torch": torch, "Qwen3OmniMoeThinkerTextDecoderLayer": HFBase}
+    namespace = {"torch": torch, "Qwen3OmniMoeThinkerMediaDecoderLayer": HFBase}
     module = ast.Module(body=[helper, layer], type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
     return namespace[layer.name]
@@ -164,7 +164,9 @@ def assert_gradients(actual, expected, name):
 def test_actual_speech_extraction_hf_hidden_tuple_and_all_gradients(selected):
     native, hf, head, deepstack, mask = pair()
     ids = torch.tensor([[1, 2, 3, 4]])
-    actual = thinker_speech_forward(native, ids, {}, selected)
+    actual = thinker_speech_forward(
+        native, ids, {"image_grid_thw": torch.tensor([[1, 1, 1]])}, selected
+    )
     expected = hf(
         input_ids=ids,
         visual_pos_masks=mask,
@@ -230,3 +232,42 @@ def test_existing_payload_forward_and_gradients_are_unchanged(index):
     expected_grads = torch.autograd.grad(expected.square().sum(), variables)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
         torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-7)
+
+
+def test_bf16_speech_branches_share_hf_hidden_gradient_boundaries():
+    native, hf, head, _, _ = pair()
+    # No vision: keep the real packed native adapter, but no DeepStack addition
+    # exists in HF. The extra packed/sliced edges must not regroup BF16 VJPs.
+    native.deepstack = nn.ParameterList([nn.Parameter(torch.empty(0, 24)) for _ in range(2)])
+    native.visual_mask.zero_()
+    native, hf, head = native.bfloat16(), hf.bfloat16(), head.bfloat16()
+    ids = torch.tensor([[1, 2, 3, 4]])
+    actual = thinker_speech_forward(native, ids, {}, 2)
+    expected = hf(input_ids=ids, output_hidden_states=True, use_cache=False)
+    logits = head(expected.last_hidden_state)
+    for left, right in (
+        (actual.logits, logits),
+        (actual.hidden_states, expected.hidden_states[2]),
+        (actual.embeddings, expected.hidden_states[0]),
+    ):
+        torch.testing.assert_close(left, right, rtol=0, atol=0)
+    actual.hidden_states.retain_grad()
+    actual.embeddings.retain_grad()
+    expected.hidden_states[2].retain_grad()
+    expected.hidden_states[0].retain_grad()
+
+    def objective(text, hidden, embeddings):
+        return (
+            text.float().square().sum()
+            + 0.17 * hidden.float().square().sum()
+            + 0.13 * embeddings.float().square().sum()
+        )
+
+    objective(actual.logits, actual.hidden_states, actual.embeddings).backward()
+    objective(logits, expected.hidden_states[2], expected.hidden_states[0]).backward()
+    torch.testing.assert_close(
+        actual.hidden_states.grad, expected.hidden_states[2].grad, rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        actual.embeddings.grad, expected.hidden_states[0].grad, rtol=0, atol=0
+    )

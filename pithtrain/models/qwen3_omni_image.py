@@ -50,9 +50,17 @@ class Qwen3OmniMoeThinkerImageDecoderLayer(Qwen3OmniMoeThinkerMediaDecoderLayer)
             hidden, lanes, self.idx, self.text_hidden_size, self.deepstack_count
         )
 
-    def reference_forward_with_hidden(self, payload, rotary_posemb, cu_seqlens=None):
-        """Return both the transported payload and HF's pre-DeepStack hidden state."""
-        hidden, lanes = payload[..., : self.text_hidden_size], payload[..., self.text_hidden_size :]
+    def reference_forward_with_hidden(
+        self, payload, rotary_posemb, cu_seqlens=None, *, hidden_states=None
+    ):
+        """Return the transported payload and HF's pre-DeepStack hidden state.
+
+        Complete speech may reuse the same hidden tensor across its text and
+        codec branches. Re-slicing the packed payload groups their BF16 input
+        gradients differently from HF. Pipeline callers retain the packed path.
+        """
+        hidden = payload[..., : self.text_hidden_size] if hidden_states is None else hidden_states
+        lanes = payload[..., self.text_hidden_size :]
         hidden = super().reference_forward(hidden, rotary_posemb, cu_seqlens)
         injected = inject_deepstack(
             hidden, lanes, self.idx, self.text_hidden_size, self.deepstack_count

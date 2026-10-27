@@ -237,20 +237,30 @@ def thinker_speech_forward(thinker, input_ids, model_context, accept_hidden_laye
     width = getattr(thinker, "text_hidden_size", thinker.hidden_size)
     payload = thinker.forward_prolog(input_ids, model_context)
     embeddings = payload[..., :width]
+    current_hidden = embeddings
+    context = model_context or {}
+    has_vision = any(context.get(key) is not None for key in ("image_grid_thw", "video_grid_thw"))
     hidden = embeddings if accept_hidden_layer == 0 else None
     rotary = thinker.forward_posemb(input_ids.shape[1], model_context=model_context)
     for index, layer in enumerate(layers, 1):
         if hasattr(layer, "reference_forward_with_hidden"):
-            payload, layer_hidden = layer.reference_forward_with_hidden(payload, rotary)
+            payload, layer_hidden = layer.reference_forward_with_hidden(
+                payload, rotary, hidden_states=current_hidden
+            )
+            # A real DeepStack injection creates a new tensor in HF too. For
+            # absent/exhausted vision lanes keep the alias, including the
+            # selected hidden state shared with the speech projection.
+            injected = has_vision and layer.idx < layer.deepstack_count
+            current_hidden = payload[..., :width] if injected else layer_hidden
         else:
-            payload = layer.reference_forward(payload, rotary)
-            layer_hidden = payload[..., :width]
+            payload = layer.reference_forward(current_hidden, rotary)
+            layer_hidden = current_hidden = payload[..., :width]
         if index == accept_hidden_layer:
             hidden = layer_hidden
     # HF's last recorded hidden state is after the final norm.
     if accept_hidden_layer == len(layers):
-        hidden = thinker.norm(payload[..., :width])
-    return ThinkerSpeechOutput(thinker.forward_epilog(payload), embeddings, hidden)
+        hidden = thinker.norm(current_hidden)
+    return ThinkerSpeechOutput(thinker.forward_epilog(current_hidden), embeddings, hidden)
 
 
 def prepare_talker_condition(
