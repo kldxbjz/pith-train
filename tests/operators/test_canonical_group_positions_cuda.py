@@ -25,7 +25,7 @@ def test_canonical_positions_match_independent_stable_sort(rows, groups):
 
 
 @pytest.mark.parametrize("rows,groups", [(1, 4), (257, 8), (1025, 4)])
-def test_default_scatter_matches_stable_values_padding_and_backward(rows, groups):
+def test_canonical_scatter_matches_stable_values_padding_and_backward(rows, groups):
     from pithtrain.operators.token_scatter import scatter_for_grouped_gemm
 
     generator = torch.Generator(device="cuda").manual_seed(37)
@@ -33,7 +33,7 @@ def test_default_scatter_matches_stable_values_padding_and_backward(rows, groups
     x = torch.randn(rows, 128, device="cuda", dtype=torch.bfloat16, generator=generator)
     x.requires_grad_()
     expected = scatter_for_grouped_gemm(x, ids, groups, deterministic=True)
-    actual = scatter_for_grouped_gemm(x, ids, groups, deterministic=False)
+    actual = scatter_for_grouped_gemm(x, ids, groups, deterministic=False, canonical=True)
     for a, b in zip(actual, expected, strict=True):
         assert torch.equal(a, b) if isinstance(a, torch.Tensor) else a == b
     dy = torch.randn_like(actual[0])

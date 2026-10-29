@@ -113,3 +113,24 @@ def test_reference_is_stable_and_production_uses_the_explicit_layout_policy():
             "True" if function == "reference_forward" else "self.mlp.deterministic_token_layout"
         )
         assert ast.unparse(policies[0]) == expected
+
+
+def test_canonical_fused_row_policy_is_confined_to_talker():
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[2]
+    for filename, name, expected in (
+        ("qwen3_omni_moe.py", "Qwen3OmniMoeThinkerTextDecoderLayer", False),
+        ("qwen3_omni_talker_pipeline.py", "Qwen3OmniMoeTalkerPipelineDecoderLayer", True),
+    ):
+        tree = ast.parse((root / "pithtrain/models" / filename).read_text())
+        layer = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name)
+        policy = [
+            n.value
+            for n in layer.body
+            if isinstance(n, ast.Assign)
+            and any(isinstance(t, ast.Name) and t.id == "canonical_expert_rows" for t in n.targets)
+        ]
+        assert len(policy) == 1 and isinstance(policy[0], ast.Constant)
+        assert policy[0].value is expected

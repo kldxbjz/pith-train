@@ -240,6 +240,8 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
 
 
 class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
+    canonical_expert_rows = False
+
     def __init__(self, config, layer_id):
         super().__init__()
         self.idx = layer_id
@@ -319,6 +321,7 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
             expert_idxs,
             self.mlp.experts_per_rank,
             deterministic=self.mlp.deterministic_token_layout,
+            canonical=self.canonical_expert_rows,
         )
         return padded_index_gather(self.mlp.experts(tokens, offs, ks, sizes), reverse)
 

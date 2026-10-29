@@ -78,6 +78,9 @@ class Qwen3OmniMoeTalkerPipelineMoeBlock(Qwen3OmniMoeThinkerTextSparseMoeBlock):
 
 
 class Qwen3OmniMoeTalkerPipelineDecoderLayer(Qwen3OmniMoeThinkerTextDecoderLayer):
+    # Independent Talker slots need reproducible BF16 grouped-wgrad row order.
+    canonical_expert_rows = True
+
     def __init__(self, config, layer_id):
         nn.Module.__init__(self)
         self.idx = layer_id
