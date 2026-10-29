@@ -10,6 +10,7 @@
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import libdevice
 
 
 @triton.jit
@@ -89,6 +90,41 @@ def cross_entropy_fwd(
     tl.store(loss_ptr + row * loss_stride, loss)
 
 
+# Match PyTorch SoftMax.cu register accumulation for summed small-codebook CE.
+# One fused kernel still stores gradients in the original activation dtype;
+# no temporary vocabulary tensor or deterministic-policy switch is introduced.
+@triton.jit
+def cross_entropy_register_sum(
+    X, STRIDE, Y, LOSS, IGNORE: tl.constexpr, V: tl.constexpr, REGS: tl.constexpr
+):
+    row = tl.program_id(0)
+    thread = tl.arange(0, 1024)
+    maximum = tl.full((1024,), float("-inf"), tl.float32)
+    for register in tl.static_range(REGS):
+        col = thread + register * 1024
+        value = tl.load(X + row * STRIDE + col, col < V, float("-inf")).to(tl.float32)
+        maximum = tl.maximum(maximum, value)
+    maximum = tl.max(maximum, 0)
+    partial = tl.full((1024,), 0.0, tl.float32)
+    for register in tl.static_range(REGS):
+        col = thread + register * 1024
+        value = tl.load(X + row * STRIDE + col, col < V, float("-inf")).to(tl.float32)
+        partial = partial + libdevice.exp(value - maximum)
+    normalizer = libdevice.log(tl.sum(partial, 0))
+    target = tl.load(Y + row)
+    target_value = tl.load(X + row * STRIDE + target, target != IGNORE, 0.0).to(tl.float32)
+    loss = -(target_value - maximum - normalizer)
+    tl.store(LOSS + row, tl.where(target == IGNORE, 0.0, loss))
+    # Complete the scalar target read before any warp overwrites its logit.
+    tl.debug_barrier()
+    for register in tl.static_range(REGS):
+        col = thread + register * 1024
+        value = tl.load(X + row * STRIDE + col, col < V, float("-inf")).to(tl.float32)
+        log_probability = (value - maximum) - normalizer
+        gradient = libdevice.exp(log_probability) - tl.where(col == target, 1.0, 0.0)
+        tl.store(X + row * STRIDE + col, tl.where(target == IGNORE, 0.0, gradient), col < V)
+
+
 class CrossEntropy(torch.autograd.Function):
     """
     Fused cross-entropy that overwrites the logit tensor with gradients
@@ -126,20 +162,36 @@ class CrossEntropy(torch.autograd.Function):
         loss_1d = torch.zeros(n_rows, dtype=torch.float32, device=inp.device)
         BLOCK_SIZE = min(65536 // 2, triton.next_power_of_2(n_cols))
 
-        cross_entropy_fwd[(n_rows,)](
-            X_ptr=inp,
-            X_stride=inp.stride(-2),
-            Y_ptr=target,
-            Y_stride=target.stride(-1),
-            loss_ptr=loss_1d,
-            loss_stride=loss_1d.stride(-1),
-            n_cols=n_cols,
-            n_non_ignore_ptr=n_non_ignore,
-            ignore_idx=ignore_index,
-            BLOCK_SIZE=BLOCK_SIZE,
-            REDUCTION=reduction,
-            num_warps=32,
-        )
+        if reduction == "sum" and 2048 < n_cols <= 9216:
+            # This is the register-based FP32 log-softmax range in PyTorch.
+            # A generic vector reduction sums a thread's registers in another
+            # order and can move a BF16 gradient across a rounding boundary.
+            cross_entropy_register_sum[(n_rows,)](
+                X=inp,
+                STRIDE=inp.stride(-2),
+                Y=target,
+                LOSS=loss_1d,
+                IGNORE=ignore_index,
+                V=n_cols,
+                REGS=triton.cdiv(n_cols, 1024),
+                num_warps=32,
+                enable_fp_fusion=False,
+            )
+        else:
+            cross_entropy_fwd[(n_rows,)](
+                X_ptr=inp,
+                X_stride=inp.stride(-2),
+                Y_ptr=target,
+                Y_stride=target.stride(-1),
+                loss_ptr=loss_1d,
+                loss_stride=loss_1d.stride(-1),
+                n_cols=n_cols,
+                n_non_ignore_ptr=n_non_ignore,
+                ignore_idx=ignore_index,
+                BLOCK_SIZE=BLOCK_SIZE,
+                REDUCTION=reduction,
+                num_warps=32,
+            )
 
         loss = loss_1d.sum()
         if reduction == "mean":

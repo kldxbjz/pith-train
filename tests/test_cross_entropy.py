@@ -8,7 +8,7 @@ from pithtrain.operators.cross_entropy import cross_entropy
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("vocab", [32, 32768, 65536, 152064])
+@pytest.mark.parametrize("vocab", [32, 2048, 2049, 3072, 9216, 9217, 32768, 65536, 152064])
 @pytest.mark.parametrize("reduction", ["mean", "sum"])
 def test_cross_entropy_target_gradient(dtype, vocab, reduction):
     generator = torch.Generator(device="cuda").manual_seed(37)
@@ -43,8 +43,9 @@ def test_cross_entropy_target_gradient(dtype, vocab, reduction):
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("reduction", ["mean", "sum"])
-def test_cross_entropy_all_ignored(dtype, reduction):
-    inputs = torch.randn((4, 152064), device="cuda", dtype=dtype, requires_grad=True)
+@pytest.mark.parametrize("vocab", [3072, 152064])
+def test_cross_entropy_all_ignored(dtype, reduction, vocab):
+    inputs = torch.randn((4, vocab), device="cuda", dtype=dtype, requires_grad=True)
     labels = torch.full((4,), -100, device="cuda", dtype=torch.int64)
     loss = cross_entropy(inputs, labels, reduction=reduction)
     assert loss.item() == 0
@@ -53,10 +54,11 @@ def test_cross_entropy_all_ignored(dtype, reduction):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_sum_gradient_is_independent_of_valid_token_count(dtype):
+@pytest.mark.parametrize("vocab", [257, 3072])
+def test_sum_gradient_is_independent_of_valid_token_count(dtype, vocab):
     # An identical row's sum gradient cannot depend on how many other rows are
     # labeled. BF16 mean storage followed by count multiplication violates this.
-    values = torch.linspace(-2, 2, 257, device="cuda", dtype=dtype).repeat(257, 1)
+    values = torch.linspace(-2, 2, vocab, device="cuda", dtype=dtype).repeat(257, 1)
     first = None
     for count in (1, 3, 62, 257):
         labels = torch.full((257,), -100, device="cuda", dtype=torch.int64)
@@ -83,3 +85,20 @@ def test_default_mean_matches_explicit_mean(dtype):
     expected.backward()
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     torch.testing.assert_close(default.grad, explicit.grad, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_register_sum_preserves_custom_ignore_index(dtype):
+    generator = torch.Generator(device="cuda").manual_seed(113)
+    values = torch.randn((7, 3072), device="cuda", generator=generator, dtype=dtype)
+    labels = torch.tensor([0, 17, 3071, 256, 17, 1024, 2048], device="cuda")
+    expected = values.float().requires_grad_()
+    reference = F.cross_entropy(expected, labels, ignore_index=17, reduction="sum")
+    reference.backward()
+    actual = values.clone().requires_grad_()
+    loss = cross_entropy(actual, labels, ignore_index=17, reduction="sum")
+    loss.backward()
+    torch.testing.assert_close(loss, reference.detach(), rtol=1e-5, atol=1e-5)
+    rtol, atol = (1e-5, 1e-6) if dtype == torch.float32 else (1e-2, 1e-4)
+    torch.testing.assert_close(actual.grad, expected.grad.to(dtype), rtol=rtol, atol=atol)
+    assert actual.grad[labels == 17].count_nonzero() == 0

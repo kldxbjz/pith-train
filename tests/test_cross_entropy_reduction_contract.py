@@ -51,6 +51,25 @@ class TorchKernel:
         return launch
 
 
+class TorchRegisterKernel:
+    """Same independent Torch oracle, adapted to the fused register ABI."""
+
+    def __init__(self, kernel):
+        self.kernel = kernel
+
+    def __getitem__(self, grid):
+        def launch(**kwargs):
+            return self.kernel[grid](
+                X_ptr=kwargs["X"],
+                Y_ptr=kwargs["Y"],
+                loss_ptr=kwargs["LOSS"],
+                ignore_idx=kwargs["IGNORE"],
+                REDUCTION="sum",
+            )
+
+        return launch
+
+
 def wrapper():
     kernel = TorchKernel()
     namespace = load_nodes(
@@ -58,8 +77,12 @@ def wrapper():
         {"CrossEntropy", "cross_entropy"},
         dict(
             torch=torch,
-            triton=SimpleNamespace(next_power_of_2=lambda n: 1 << (n - 1).bit_length()),
+            triton=SimpleNamespace(
+                next_power_of_2=lambda n: 1 << (n - 1).bit_length(),
+                cdiv=lambda n, d: (n + d - 1) // d,
+            ),
             cross_entropy_fwd=kernel,
+            cross_entropy_register_sum=TorchRegisterKernel(kernel),
         ),
     )
     return namespace["cross_entropy"], kernel
