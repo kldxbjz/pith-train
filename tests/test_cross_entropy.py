@@ -92,10 +92,11 @@ def test_register_sum_preserves_custom_ignore_index(dtype):
     generator = torch.Generator(device="cuda").manual_seed(113)
     values = torch.randn((7, 3072), device="cuda", generator=generator, dtype=dtype)
     labels = torch.tensor([0, 17, 3071, 256, 17, 1024, 2048], device="cuda")
-    expected = values.float().requires_grad_()
+    expected = values.detach().float().requires_grad_()
     reference = F.cross_entropy(expected, labels, ignore_index=17, reduction="sum")
     reference.backward()
-    actual = values.clone().requires_grad_()
+    actual = values.detach().clone().requires_grad_()
+    assert expected.is_leaf and actual.is_leaf
     loss = cross_entropy(actual, labels, ignore_index=17, reduction="sum")
     loss.backward()
     torch.testing.assert_close(loss, reference.detach(), rtol=1e-5, atol=1e-5)
