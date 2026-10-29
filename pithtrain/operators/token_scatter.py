@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 
 from pithtrain.contexts import training
+from pithtrain.operators.canonical_group_positions import ROW_BLOCK, canonical_group_positions
 from pithtrain.operators.linear import ARCH_MAJOR
 from pithtrain.operators.stable_scatter import stable_group_order
 
@@ -77,12 +78,11 @@ def _scatter_for_grouped_gemm_kernel(
     input_tokens_ptr,  # [m, hidden_size]
     expert_idxs_ptr,  # [m] int64
     grouped_mm_offs_ptr,  # [num_groups] int32, padded cumulative offsets
-    group_counters_ptr,  # [num_groups] int64, zero-initialized (for atomic positioning)
     actual_counts_ptr,  # [num_groups] int64, actual counts from prep kernel
     output_tokens_ptr,  # [m_padded, hidden_size]
     reverse_shuffle_idxs_ptr,  # [m] int64
-    sorted_rows_ptr,  # [m] stable expert sort; used only with DETERMINISTIC
-    unpadded_starts_ptr,  # [num_groups] cumulative actual counts, exclusive
+    sorted_rows_ptr,  # stable row order, or per-input-row block-local ordinal
+    unpadded_starts_ptr,  # stable group starts, or [num_groups, blocks] prefix
     hidden_size,
     stride_src_m,  # input_tokens.stride(0)
     stride_dst_m,  # output_tokens.stride(0)
@@ -92,6 +92,8 @@ def _scatter_for_grouped_gemm_kernel(
     NUM_H_BLOCKS: tl.constexpr,
     GEMM_ALLOC_ALIGNMENT: tl.constexpr,
     DETERMINISTIC: tl.constexpr,
+    NUM_ROW_BLOCKS: tl.constexpr,
+    ROW_BLOCK_SIZE: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
 
@@ -102,7 +104,10 @@ def _scatter_for_grouped_gemm_kernel(
     else:
         input_row = pid
         expert_id = tl.load(expert_idxs_ptr + input_row)
-        pos_in_group = tl.atomic_add(group_counters_ptr + expert_id, 1)
+        pos_in_group = tl.load(sorted_rows_ptr + input_row)
+        pos_in_group += tl.load(
+            unpadded_starts_ptr + expert_id * NUM_ROW_BLOCKS + input_row // ROW_BLOCK_SIZE
+        )
     safe_idx = tl.maximum(expert_id - 1, 0)
     base_offset = tl.load(grouped_mm_offs_ptr + safe_idx, mask=expert_id > 0, other=0)
     global_pos = pos_in_group + base_offset.to(tl.int64)
@@ -215,10 +220,9 @@ class ScatterForGroupedGemm(torch.autograd.Function):
         reverse_shuffle_idxs = torch.empty((m,), device=device, dtype=torch.int64)
         grouped_mm_offs = torch.empty((num_groups,), device=device, dtype=torch.int32)
         ks_tensor = torch.empty((num_groups,), device=device, dtype=torch.int32)
-        all_zeros = torch.zeros((num_groups * 2 + 1,), device=device, dtype=torch.int64)
+        all_zeros = torch.zeros((num_groups + 1,), device=device, dtype=torch.int64)
         group_counts_1 = all_zeros[:num_groups]
-        group_counts_2 = all_zeros[num_groups : num_groups * 2]
-        completion_counter = all_zeros[num_groups * 2 :]
+        completion_counter = all_zeros[num_groups:]
 
         # The prep kernel masks its load of expert_idxs with m, the row count of input_tokens,
         # not with the length of expert_idxs. A shorter one is read out of bounds and the
@@ -245,8 +249,9 @@ class ScatterForGroupedGemm(torch.autograd.Function):
         if deterministic:
             sorted_rows, unpadded_starts = stable_group_order(expert_idxs, group_counts_1)
         else:
-            # Ignored by the compile-time false kernel branch; no extra allocations.
-            sorted_rows, unpadded_starts = expert_idxs, group_counts_1
+            # Keep the fused scatter, but assign rows by integer block prefixes.
+            # Atomic ticket order otherwise changes BF16 grouped-wgrad sums.
+            sorted_rows, unpadded_starts = canonical_group_positions(expert_idxs, num_groups)
 
         # Async D-to-H: ks_tensor is done after the prep kernel; copy it on
         # a separate stream so the memcpy overlaps with the scatter kernel.
@@ -260,7 +265,6 @@ class ScatterForGroupedGemm(torch.autograd.Function):
             input_tokens,
             expert_idxs,
             grouped_mm_offs,
-            group_counts_2,
             group_counts_1,  # actual counts from prep kernel
             output_tokens,
             reverse_shuffle_idxs,
@@ -275,6 +279,8 @@ class ScatterForGroupedGemm(torch.autograd.Function):
             NUM_H_BLOCKS=NUM_H_BLOCKS,
             GEMM_ALLOC_ALIGNMENT=_GEMM_ALLOC_ALIGNMENT,
             DETERMINISTIC=deterministic,
+            NUM_ROW_BLOCKS=triton.cdiv(m, ROW_BLOCK),
+            ROW_BLOCK_SIZE=ROW_BLOCK,
         )
 
         # Narrow to actual padded size (removes over-allocated tail).

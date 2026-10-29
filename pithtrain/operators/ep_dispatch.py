@@ -31,6 +31,11 @@ import triton
 import triton.language as tl
 
 from pithtrain.models.interface import AllToAllSplits, RoutingInfo
+from pithtrain.operators.canonical_group_positions import (
+    ROW_BLOCK,
+    canonical_group_positions,
+    scatter_canonical_order,
+)
 from pithtrain.operators.stable_scatter import stable_dedup_prepare_dispatch
 from pithtrain.operators.token_scatter import get_pinned_buffer, padded_index_gather
 
@@ -274,6 +279,8 @@ def fused_dedup_prepare_dispatch(
     num_experts: int,
     ep_size: int,
     experts_per_rank: int,
+    *,
+    independent_slots: bool = False,
 ) -> tuple[
     torch.Tensor,  # tokens_per_ep_rank: (ep_size,) int64
     torch.Tensor,  # dedup_tokens_per_gpu: (ep_size,) int64
@@ -381,6 +388,19 @@ def fused_dedup_prepare_dispatch(
         EP_SIZE=ep_size,
         EXPERTS_PER_RANK=experts_per_rank,
     )
+
+    if independent_slots:
+        # Talker's slots have independent backward lanes. Fix their order with
+        # fused integer ranks; dedup token/expand buffers are not consumed here.
+        flat_ids = topk_ids.reshape(-1)
+        ranks, prefix = canonical_group_positions(flat_ids, num_experts)
+        idxs = torch.empty_like(flat_ids)
+        blocks = triton.cdiv(m * k, ROW_BLOCK)
+        scatter_canonical_order[(blocks,)](
+            flat_ids, ranks, prefix, expert_starts, idxs, m * k, blocks, ROW_BLOCK
+        )
+        empty = torch.empty(0, dtype=torch.int64, device=device)
+        return tokens_per_ep_rank, dedup_tokens_per_gpu, empty, idxs, empty, send_meta
 
     dispatch_token_idxs = torch.empty(m * ep_size, dtype=torch.int64, device=device)
     dedup_local_pos = torch.empty(m * ep_size, dtype=torch.int64, device=device)
@@ -614,7 +634,11 @@ def prepare_dispatch(
         expand_idx,
         send_meta,  # (ep_size, experts_per_rank + 1) interleaved: [tpe_0..., dedup_0, ...]
     ) = (stable_dedup_prepare_dispatch if deterministic else fused_dedup_prepare_dispatch)(
-        topk_ids, num_experts, ep_size, experts_per_rank
+        topk_ids,
+        num_experts,
+        ep_size,
+        experts_per_rank,
+        **({"independent_slots": True} if not deterministic and not deduplicate else {}),
     )
 
     # -- Metadata all-to-all (piggyback dedup counts alongside per-expert token counts) --

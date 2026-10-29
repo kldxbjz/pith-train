@@ -86,24 +86,30 @@ def test_stable_ep_metadata_reconstructs_original_routes(rows, ep_size, experts,
         assert torch.equal(again, original)
 
 
-def test_omni_production_routing_requests_stable_layout():
+def test_reference_is_stable_and_production_uses_the_explicit_layout_policy():
     import ast
     from pathlib import Path
 
     source = Path(__file__).resolve().parents[2] / "pithtrain/models/qwen3_omni_moe.py"
     tree = ast.parse(source.read_text())
-    calls = [
-        node
-        for node in ast.walk(tree)
+    calls = {
+        (function.name, node.func.id): node
+        for function in ast.walk(tree)
+        if isinstance(function, ast.FunctionDef)
+        for node in ast.walk(function)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)
         and node.func.id in {"prepare_dispatch", "scatter_for_grouped_gemm"}
-    ]
-    assert len(calls) == 3
-    for call in calls:
-        assert any(
-            keyword.arg == "deterministic"
-            and isinstance(keyword.value, ast.Constant)
-            and keyword.value.value is True
-            for keyword in call.keywords
+    }
+    assert set(calls) == {
+        ("reference_forward", "scatter_for_grouped_gemm"),
+        ("forward_stage1", "prepare_dispatch"),
+        ("forward_stage3", "scatter_for_grouped_gemm"),
+    }
+    for (function, _), call in calls.items():
+        policies = [keyword.value for keyword in call.keywords if keyword.arg == "deterministic"]
+        assert len(policies) == 1
+        expected = (
+            "True" if function == "reference_forward" else "self.mlp.deterministic_token_layout"
         )
+        assert ast.unparse(policies[0]) == expected
